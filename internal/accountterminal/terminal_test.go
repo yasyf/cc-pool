@@ -565,6 +565,7 @@ func TestTerminalCancellationKillsAndReapsDescendant(t *testing.T) {
 	deadline := time.Now().Add(terminalTestTimeout)
 	var pid int
 	for time.Now().Before(deadline) {
+		// #nosec G304 -- pidPath is a test-owned file under t.TempDir.
 		raw, err := os.ReadFile(pidPath)
 		if err == nil {
 			pid, err = strconv.Atoi(string(raw))

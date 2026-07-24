@@ -419,6 +419,7 @@ func (m *Manager) Start(startup context.Context, spec TerminalSpec) (*Terminal, 
 	args := make([]string, 0, len(spec.Args)+4)
 	args = append(args, "-c", terminalWrapper, "daemonkit-terminal", spec.Path)
 	args = append(args, spec.Args...)
+	// #nosec G204 -- the fixed shell executes a fixed wrapper; Path and Args remain positional data.
 	cmd := exec.Command("/bin/sh", args...)
 	cmd.Dir = spec.Dir
 	cmd.Env = spec.Env
@@ -1138,12 +1139,12 @@ func (t *Terminal) detachLocked(id uint64, cause error) bool {
 }
 
 func (t *Terminal) run(ctx context.Context, waited <-chan error) {
-	defer t.cancel()
 	var outcome TerminalOutcome
 	var resultErr error
 	defer func() {
-		t.manager.release(t.sessionID, resultErr)
+		t.cancel()
 		close(t.done)
+		t.manager.release(t.sessionID, resultErr)
 	}()
 	canceled := false
 	select {

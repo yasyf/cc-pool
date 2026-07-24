@@ -1,3 +1,4 @@
+// Package accountterminal owns cc-pool's interactive account-login PTY protocol.
 package accountterminal
 
 import (
@@ -56,7 +57,7 @@ func RunTerminalClient(ctx context.Context, config TerminalClientConfig) error {
 	if err != nil {
 		return fmt.Errorf("account terminal: wrap terminal stdin: %w", err)
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 
 	var previous *term.State
 	if term.IsTerminal(int(config.Stdin.Fd())) {
