@@ -875,16 +875,27 @@ func TestAccountMutationReceiptIntentSurvivesDerivedLabelPublication(t *testing.
 	}
 }
 
-func TestPresentationQuarantinedReloginRebindsAndReplaysAsRelogin(t *testing.T) {
+func TestPresentationQuarantinedReloginRepairsPathBeforeOrdinaryLogin(t *testing.T) {
 	s, fake, account := newAccountMutationTestServer(t, true)
-	targetPath := seedAccountPresentationQuarantine(t, s, account)
-	var preparations atomic.Int64
-	s.provisionPresentationIdentity = func(
+	s.sessionLeases = &testSessionLeaseManager{}
+	bound, err := s.m.Store.AccountPresentation(account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetPath := "/Users/test/Library/CloudStorage/CCPoolStatus-moved-acct-01"
+	observed := bound.Identity
+	observed.PublicPath = targetPath
+	if err := s.m.Store.ObserveAccountPresentation(account, observed); !errors.Is(err, store.ErrAccountPresentationQuarantined) {
+		t.Fatalf("seed presentation quarantine: %v", err)
+	}
+	var preparations, terminalCalls atomic.Int64
+	s.prepareAccount = func(
 		_ context.Context,
-		account store.Account,
-	) (store.FileProviderPresentationIdentity, error) {
+		got store.Account,
+		_ tenantfs.PreparationLease,
+	) (catalogproto.TenantPreparationProof, error) {
 		preparations.Add(1)
-		return expectedPresentationIdentity(account)
+		return daemonTestPreparationProof(got, targetPath), nil
 	}
 	s.accountMutationTerminal = accountMutationTerminalRunnerFunc(func(
 		ctx context.Context,
@@ -894,18 +905,25 @@ func TestPresentationQuarantinedReloginRebindsAndReplaysAsRelogin(t *testing.T) 
 		_ <-chan wire.Chunk,
 		_ func(context.Context, []byte) error,
 	) error {
-		if mutation.Kind != store.AccountMutationPresentationRebind ||
-			mutation.AccountGeneration != account.Generation+1 || mutation.ConfigDir != targetPath {
-			t.Fatalf("terminal mutation = %+v", mutation)
+		terminalCalls.Add(1)
+		if mutation.Kind != store.AccountMutationRelogin ||
+			mutation.AccountGeneration != account.Generation ||
+			mutation.ConfigDir != account.ConfigDir ||
+			mutation.KeychainService != account.KeychainService {
+			t.Fatalf("ordinary relogin mutation = %+v", mutation)
+		}
+		if current, ok := fake.Get(account.KeychainService, account.KeychainAccount); !ok ||
+			current.ClaudeAiOauth.AccessToken != "old-access" {
+			t.Fatalf("credential changed before ordinary login: %+v", current)
 		}
 		credential := &creds.Credential{}
-		credential.ClaudeAiOauth.AccessToken = "rebound-access"
-		credential.ClaudeAiOauth.RefreshToken = "rebound-refresh"
+		credential.ClaudeAiOauth.AccessToken = "relogin-access"
+		credential.ClaudeAiOauth.RefreshToken = "relogin-refresh"
 		credential.ClaudeAiOauth.ExpiresAt = time.Now().Add(2 * time.Hour).UnixMilli()
 		fake.Put(mutation.KeychainService, mutation.KeychainAccount, credential)
 		return s.m.WriteIdentity(
 			ctx, mutation.AccountID, mutation.ConfigDir,
-			[]byte(`{"accountUuid":"rebound-uuid","emailAddress":"rebound@example.com"}`),
+			[]byte(`{"accountUuid":"relogin-uuid","emailAddress":"relogin@example.com"}`),
 		)
 	})
 	request := AccountMutationRequest{
@@ -913,13 +931,34 @@ func TestPresentationQuarantinedReloginRebindsAndReplaysAsRelogin(t *testing.T) 
 	}
 	begin, err := runAccountMutationTest(t, s, request, nil)
 	if err != nil || begin.Kind != AccountMutationRelogin || begin.State != AccountMutationAwaitingInput ||
-		begin.ConfigDir != targetPath || begin.Fence.AccountGeneration != account.Generation+1 {
-		t.Fatalf("rebind begin = %+v err=%v", begin, err)
+		begin.ConfigDir != account.ConfigDir || begin.Fence.AccountGeneration != account.Generation {
+		t.Fatalf("ordinary relogin begin = %+v err=%v", begin, err)
 	}
-	active, err := s.m.Store.AccountMutation(store.AccountMutationID(begin.OperationID))
-	if err != nil || active.Kind != store.AccountMutationPresentationRebind ||
-		active.PresentationIdentity.PublicPath != targetPath {
-		t.Fatalf("internal rebind = %+v err=%v", active, err)
+	if preparations.Load() != 1 || terminalCalls.Load() != 0 {
+		t.Fatalf("repair side effects: preparations=%d terminals=%d", preparations.Load(), terminalCalls.Load())
+	}
+	repaired, err := s.m.Store.GetAccount(account.ID)
+	if err != nil || repaired.InstanceID != account.InstanceID || repaired.Generation != account.Generation ||
+		repaired.ConfigDir != account.ConfigDir || repaired.KeychainService != account.KeychainService ||
+		repaired.AccountUUID != account.AccountUUID {
+		t.Fatalf("path repair changed account identity: %+v err=%v", repaired, err)
+	}
+	presentation, err := s.m.Store.AccountPresentation(account.ID)
+	if err != nil || presentation.Identity.PublicPath != targetPath {
+		t.Fatalf("repaired presentation = %+v err=%v", presentation, err)
+	}
+	if _, err := s.m.Store.AccountPresentationQuarantine(account.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("presentation quarantine survived repair: %v", err)
+	}
+	if target, err := os.Readlink(account.ConfigDir); err != nil || target != targetPath {
+		t.Fatalf("stable config target = %q, %v; want %q", target, err, targetPath)
+	}
+	if current, ok := fake.Get(account.KeychainService, account.KeychainAccount); !ok ||
+		current.ClaudeAiOauth.AccessToken != "old-access" {
+		t.Fatalf("repair moved credential: %+v", current)
+	}
+	if _, ok := fake.Get(creds.ServiceName(targetPath), account.KeychainAccount); ok {
+		t.Fatal("repair created a presentation-derived credential slot")
 	}
 	request.Action = AccountMutationProvideInput
 	request.Fence = begin.Fence
@@ -928,95 +967,17 @@ func TestPresentationQuarantinedReloginRebindsAndReplaysAsRelogin(t *testing.T) 
 	close(input)
 	completed, err := runAccountMutationTest(t, s, request, input)
 	if err != nil || !completed.Completed || completed.Kind != AccountMutationRelogin ||
-		completed.State != AccountMutationCompleted || completed.ConfigDir != targetPath {
-		t.Fatalf("completed rebind = %+v err=%v", completed, err)
+		completed.State != AccountMutationCompleted || completed.ConfigDir != account.ConfigDir {
+		t.Fatalf("completed relogin = %+v err=%v", completed, err)
 	}
-	if preparations.Load() != 1 {
-		t.Fatalf("presentation provisions = %d, want one", preparations.Load())
+	if terminalCalls.Load() != 1 {
+		t.Fatalf("ordinary relogin terminals = %d, want one", terminalCalls.Load())
 	}
 	updated, err := s.m.Store.GetAccount(account.ID)
-	if err != nil || updated.Generation != account.Generation+1 || updated.ConfigDir != targetPath {
-		t.Fatalf("rebound account = %+v err=%v", updated, err)
+	if err != nil || updated.Generation != account.Generation || updated.ConfigDir != account.ConfigDir ||
+		updated.KeychainService != account.KeychainService || updated.AccountUUID != "relogin-uuid" {
+		t.Fatalf("ordinary relogin result = %+v err=%v", updated, err)
 	}
-	if _, ok := fake.Get(account.KeychainService, account.KeychainAccount); ok {
-		t.Fatal("old Keychain owner survived committed rebind")
-	}
-	if _, ok := fake.Get(updated.KeychainService, updated.KeychainAccount); !ok {
-		t.Fatal("new Keychain owner missing after committed rebind")
-	}
-	if _, err := s.m.Store.AccountPresentationQuarantine(account.ID); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("committed rebind retained presentation quarantine: %v", err)
-	}
-	request.Action = AccountMutationStartOrAttach
-	request.Fence = AccountMutationFence{}
-	replayed, err := runAccountMutationTest(t, s, request, nil)
-	if err != nil || replayed.OperationID != begin.OperationID || replayed.Kind != AccountMutationRelogin ||
-		replayed.State != AccountMutationApplying || replayed.Completed {
-		t.Fatalf("rebind replay = %+v err=%v", replayed, err)
-	}
-}
-
-func TestPresentationRebindFailureRetainsJournalAndQuarantine(t *testing.T) {
-	s, fake, account := newAccountMutationTestServer(t, true)
-	seedAccountPresentationQuarantine(t, s, account)
-	s.accountMutationTerminal = accountMutationTerminalRunnerFunc(func(
-		_ context.Context,
-		mutation store.AccountMutation,
-		_ accountterminal.TerminalInput,
-		_ accountterminal.TerminalSize,
-		_ <-chan wire.Chunk,
-		_ func(context.Context, []byte) error,
-	) error {
-		fake.Put(mutation.KeychainService, mutation.KeychainAccount, &creds.Credential{})
-		return errors.New("terminal failed after target write")
-	})
-	request := AccountMutationRequest{
-		Kind: AccountMutationRelogin, Action: AccountMutationStartOrAttach, AccountID: account.ID,
-	}
-	begin, err := runAccountMutationTest(t, s, request, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	request.Action = AccountMutationProvideInput
-	request.Fence = begin.Fence
-	input := make(chan wire.Chunk, 1)
-	input <- accountMutationInputChunk(t, []byte("\n"))
-	close(input)
-	if _, err := runAccountMutationTest(t, s, request, input); err == nil {
-		t.Fatal("invalid rebind target was admitted")
-	}
-	active, err := s.m.Store.AccountMutation(store.AccountMutationID(begin.OperationID))
-	if err != nil || active.Kind != store.AccountMutationPresentationRebind ||
-		active.State != store.AccountMutationApplying {
-		t.Fatalf("failed rebind journal = %+v err=%v", active, err)
-	}
-	if _, err := s.m.Store.AccountPresentationQuarantine(account.ID); err != nil {
-		t.Fatalf("failed rebind cleared presentation quarantine: %v", err)
-	}
-	if _, ok := fake.Get(account.KeychainService, account.KeychainAccount); !ok {
-		t.Fatal("failed rebind removed old Keychain owner")
-	}
-}
-
-func seedAccountPresentationQuarantine(
-	t *testing.T,
-	s *Server,
-	account store.Account,
-) string {
-	t.Helper()
-	targetAccount := account
-	targetAccount.Generation++
-	targetAccount.ConfigDir = pool.FileProviderConfigDir(account.ID)
-	target, err := expectedPresentationIdentity(targetAccount)
-	if err != nil {
-		t.Fatal(err)
-	}
-	observed := target
-	observed.Generation = account.Generation
-	if err := s.m.Store.ObserveAccountPresentation(account, observed); !errors.Is(err, store.ErrAccountPresentationQuarantined) {
-		t.Fatalf("seed presentation quarantine: %v", err)
-	}
-	return target.PublicPath
 }
 
 func newAccountMutationTestServer(

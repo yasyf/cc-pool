@@ -14,6 +14,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/wire"
 )
@@ -645,9 +646,6 @@ func (s *Server) finishOrQuarantineAccountMutation(
 	if current.Kind == store.AccountMutationAdd && current.State == store.AccountMutationCompensating {
 		return AccountMutationResult{}, errors.Join(finishErr, store.ErrAccountMutationRecoveryRequired)
 	}
-	if current.Kind == store.AccountMutationPresentationRebind {
-		return AccountMutationResult{}, errors.Join(finishErr, store.ErrAccountMutationRecoveryRequired)
-	}
 	state, err := s.m.CredentialExternalState(ctx, accountMutationAccount(current))
 	if err != nil {
 		return AccountMutationResult{}, errors.Join(finishErr, err)
@@ -734,6 +732,17 @@ func (s *Server) startOrAttachAccountMutation(
 	if !errors.Is(err, sql.ErrNoRows) {
 		return store.AccountMutation{}, nil, err
 	}
+	var repairedAccount *store.Account
+	if kind == store.AccountMutationRelogin {
+		account, _, err := s.accountMutationSubject(request)
+		if err != nil {
+			return store.AccountMutation{}, nil, err
+		}
+		if err := s.reconcileReloginPresentation(ctx, account); err != nil {
+			return store.AccountMutation{}, nil, err
+		}
+		repairedAccount = &account
+	}
 	if kind != store.AccountMutationAdd {
 		if s.cl == nil {
 			return store.AccountMutation{}, nil, errors.New("account mutation claims are required")
@@ -748,37 +757,24 @@ func (s *Server) startOrAttachAccountMutation(
 	if err != nil {
 		return store.AccountMutation{}, nil, err
 	}
+	if repairedAccount != nil &&
+		(account.InstanceID != repairedAccount.InstanceID || account.Generation != repairedAccount.Generation) {
+		return store.AccountMutation{}, nil, store.ErrAccountGenerationChanged
+	}
 	committed := false
 	defer func() {
 		if !committed && release != nil {
 			_ = release()
 		}
 	}()
-	if kind == store.AccountMutationRelogin {
-		if _, quarantineErr := s.m.Store.AccountPresentationQuarantine(account.ID); quarantineErr == nil {
-			kind = store.AccountMutationPresentationRebind
-		} else if !errors.Is(quarantineErr, sql.ErrNoRows) {
-			return store.AccountMutation{}, nil, quarantineErr
-		}
-	}
 	intent := accountMutationIntentDigest(kind, account.ID, request.Label)
 	var operationID store.AccountMutationID
 	var locator, expected store.CredentialDigest
-	var previousLocator, previousCredential store.CredentialDigest
-	var previousCredentialState store.CredentialSlotState
 	switch kind {
 	case store.AccountMutationAdd:
 		operationID, err = store.NewPendingAddMutationID(
 			account.ID, account.InstanceID, account.Generation, intent,
 		)
-	case store.AccountMutationPresentationRebind:
-		previousLocator, previousCredentialState, previousCredential, err = s.m.AccountPresentationRebindSourceEvidence(ctx, account)
-		if err == nil {
-			operationID, err = store.NewPresentationRebindMutationID(
-				account.ID, account.InstanceID, account.Generation+1,
-				previousLocator, previousCredentialState, previousCredential, intent,
-			)
-		}
 	default:
 		expectedState, stateErr := s.m.CredentialExternalState(ctx, account)
 		if stateErr != nil {
@@ -802,23 +798,12 @@ func (s *Server) startOrAttachAccountMutation(
 	if err != nil {
 		return store.AccountMutation{}, nil, err
 	}
-	accountGeneration := account.Generation
-	if kind == store.AccountMutationPresentationRebind {
-		accountGeneration++
-	}
 	beginRequest := store.BeginAccountMutationRequest{
 		OperationID: operationID, AccountID: account.ID, Kind: kind,
-		AccountInstanceID: account.InstanceID, AccountGeneration: accountGeneration,
+		AccountInstanceID: account.InstanceID, AccountGeneration: account.Generation,
 		IntentDigest: intent, Label: request.Label, AccountUUID: account.AccountUUID, Owner: owner,
 	}
-	if kind == store.AccountMutationPresentationRebind {
-		beginRequest.PreviousConfigDir = account.ConfigDir
-		beginRequest.PreviousKeychainService = account.KeychainService
-		beginRequest.PreviousKeychainAccount = account.KeychainAccount
-		beginRequest.PreviousLocatorDigest = previousLocator
-		beginRequest.PreviousCredentialState = previousCredentialState
-		beginRequest.PreviousCredentialDigest = previousCredential
-	} else if kind != store.AccountMutationAdd {
+	if kind != store.AccountMutationAdd {
 		beginRequest.LocatorDigest = locator
 		beginRequest.ExpectedCredentialDigest = expected
 		beginRequest.ConfigDir = account.ConfigDir
@@ -899,14 +884,8 @@ func (s *Server) bindAccountMutationPresentation(
 func (s *Server) unacknowledgedAccountMutationReceipt(
 	request AccountMutationRequest,
 ) (store.AccountMutationReceipt, error) {
-	receipt, err := s.m.Store.UnacknowledgedAccountMutationReceipt(
-		store.AccountMutationKind(request.Kind), request.AccountID,
-	)
-	if err == nil || !errors.Is(err, sql.ErrNoRows) || request.Kind != AccountMutationRelogin {
-		return receipt, err
-	}
 	return s.m.Store.UnacknowledgedAccountMutationReceipt(
-		store.AccountMutationPresentationRebind, request.AccountID,
+		store.AccountMutationKind(request.Kind), request.AccountID,
 	)
 }
 
@@ -963,8 +942,7 @@ func accountMutationKindMatchesRequest(
 	kind store.AccountMutationKind,
 	request AccountMutationKind,
 ) bool {
-	return kind == store.AccountMutationKind(request) ||
-		(request == AccountMutationRelogin && kind == store.AccountMutationPresentationRebind)
+	return kind == store.AccountMutationKind(request)
 }
 
 func validateAccountMutationActiveRequest(
@@ -1013,41 +991,64 @@ func (s *Server) accountMutationSubject(
 	return account, func() error { return s.m.Store.ReleaseAccountIndex(reservation) }, nil
 }
 
+func (s *Server) reconcileReloginPresentation(ctx context.Context, account store.Account) (err error) {
+	if _, err := s.m.Store.AccountPresentationQuarantine(account.ID); errors.Is(err, sql.ErrNoRows) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	digest := sha256.Sum256([]byte(fmt.Sprintf(
+		"cc-pool:relogin-presentation:%s:%d", account.InstanceID, account.Generation,
+	)))
+	lease := tenantfs.PreparationLease{
+		ID: fmt.Sprintf("%x", digest[:16]), ExpiresAt: time.Now().Add(provisionalSelectionTTL),
+	}
+	proof, err := s.prepareTenant(ctx, account, lease)
+	if err != nil {
+		return fmt.Errorf("prepare quarantined relogin presentation: %w", err)
+	}
+	defer func() {
+		err = errors.Join(err, s.releaseProvisionalPreparation(ctx, proof))
+	}()
+	identity, err := projectPreparationIdentity(proof)
+	if err != nil {
+		return err
+	}
+	if _, err := s.m.ReconcileAccountPresentation(ctx, account, identity); err != nil {
+		return fmt.Errorf("reconcile quarantined relogin presentation: %w", err)
+	}
+	return nil
+}
+
 func (s *Server) finishAccountMutation(
 	ctx context.Context,
 	mutation store.AccountMutation,
 ) (AccountMutationResult, error) {
 	if mutation.State == store.AccountMutationApplying {
 		account := accountMutationAccount(mutation)
-		var written store.CredentialDigest
-		var err error
-		if mutation.Kind == store.AccountMutationPresentationRebind {
-			written, err = s.m.VerifyAccountPresentationRebindCredential(ctx, mutation)
-		} else {
-			var state store.CredentialExternalState
+		state, err := s.m.CredentialExternalState(ctx, account)
+		if err != nil {
+			return AccountMutationResult{}, err
+		}
+		written, err := state.Digest()
+		if err == nil && written == mutation.ExpectedCredentialDigest {
+			err = errors.New("login exited without changing the credential")
+		}
+		var credential *creds.Credential
+		if err == nil {
+			credential, _, err = s.m.ReadCredential(ctx, account)
+		}
+		if err == nil && (!credential.HasRefreshToken() || credential.Expired()) {
+			err = errors.New("login left no usable credential")
+		}
+		if err == nil && mutation.Kind == store.AccountMutationRelogin {
+			err = s.m.AdoptRotatedToken(ctx, account)
+		}
+		if err == nil {
 			state, err = s.m.CredentialExternalState(ctx, account)
-			if err == nil {
-				written, err = state.Digest()
-			}
-			if err == nil && written == mutation.ExpectedCredentialDigest {
-				err = errors.New("login exited without changing the credential")
-			}
-			var credential *creds.Credential
-			if err == nil {
-				credential, _, err = s.m.ReadCredential(ctx, account)
-			}
-			if err == nil && (!credential.HasRefreshToken() || credential.Expired()) {
-				err = errors.New("login left no usable credential")
-			}
-			if err == nil && mutation.Kind == store.AccountMutationRelogin {
-				err = s.m.AdoptRotatedToken(ctx, account)
-			}
-			if err == nil {
-				state, err = s.m.CredentialExternalState(ctx, account)
-			}
-			if err == nil {
-				written, err = state.Digest()
-			}
+		}
+		if err == nil {
+			written, err = state.Digest()
 		}
 		if err != nil {
 			return AccountMutationResult{}, err
@@ -1085,30 +1086,6 @@ func (s *Server) finishAccountMutation(
 			return AccountMutationResult{}, err
 		}
 	}
-	if mutation.Kind == store.AccountMutationPresentationRebind &&
-		mutation.State == store.AccountMutationPublishing {
-		fence, _, err := s.m.Store.PublishAccountPresentationRebind(mutation.Fence())
-		if err != nil {
-			return AccountMutationResult{}, err
-		}
-		mutation, err = s.m.Store.AccountMutation(fence.OperationID)
-		if err != nil {
-			return AccountMutationResult{}, err
-		}
-	}
-	if mutation.Kind == store.AccountMutationPresentationRebind &&
-		mutation.State == store.AccountMutationRebindPublished {
-		receipt, err := s.m.FinalizeAccountPresentationRebind(
-			ctx, mutation, time.Now().Add(accountMutationReceiptTTL),
-		)
-		if err != nil {
-			return AccountMutationResult{}, err
-		}
-		if err := s.prepareCommittedAccountMutation(ctx, receipt); err != nil {
-			return AccountMutationResult{}, err
-		}
-		return accountMutationReceiptResult(receipt), nil
-	}
 	if mutation.State != store.AccountMutationPublishing {
 		return AccountMutationResult{}, fmt.Errorf("account mutation cannot finish from %s", mutation.State)
 	}
@@ -1136,9 +1113,7 @@ func (s *Server) prepareCommittedAccountMutation(
 	ctx context.Context,
 	receipt store.AccountMutationReceipt,
 ) error {
-	if receipt.Terminal != store.AccountMutationCommitted ||
-		(receipt.Kind != store.AccountMutationAdd &&
-			receipt.Kind != store.AccountMutationPresentationRebind) {
+	if receipt.Terminal != store.AccountMutationCommitted || receipt.Kind != store.AccountMutationAdd {
 		return nil
 	}
 	account, err := s.m.Store.GetAccount(receipt.AccountID)
@@ -1176,9 +1151,6 @@ func (s *Server) resolveSupersededAccountMutation(
 	ctx context.Context,
 	current store.AccountMutation,
 ) (AccountMutationResult, error) {
-	if current.Kind == store.AccountMutationPresentationRebind {
-		return AccountMutationResult{}, store.ErrAccountMutationRecoveryRequired
-	}
 	if current.Kind != store.AccountMutationAdd {
 		state, err := s.m.CredentialExternalState(ctx, accountMutationAccount(current))
 		if err != nil {
@@ -1321,9 +1293,7 @@ func (s *Server) recoverAccountMutation(
 	ctx context.Context,
 	mutation store.AccountMutation,
 ) error {
-	if (mutation.Kind == store.AccountMutationAdd ||
-		mutation.Kind == store.AccountMutationPresentationRebind) &&
-		mutation.State == store.AccountMutationAwaitingPresentation {
+	if mutation.Kind == store.AccountMutationAdd && mutation.State == store.AccountMutationAwaitingPresentation {
 		_, err := s.bindAccountMutationPresentation(ctx, mutation)
 		return err
 	}
@@ -1347,8 +1317,7 @@ func (s *Server) recoverAccountMutation(
 		}
 		_, err = s.finishOrQuarantineAccountMutation(ctx, mutation)
 		return err
-	case store.AccountMutationApplied, store.AccountMutationPublishing,
-		store.AccountMutationRebindPublished:
+	case store.AccountMutationApplied, store.AccountMutationPublishing:
 		_, err := s.finishOrQuarantineAccountMutation(ctx, mutation)
 		return err
 	case store.AccountMutationCompensating:
@@ -1469,9 +1438,6 @@ func accountMutationReceiptResult(receipt store.AccountMutationReceipt) AccountM
 }
 
 func wireAccountMutationKind(kind store.AccountMutationKind) AccountMutationKind {
-	if kind == store.AccountMutationPresentationRebind {
-		return AccountMutationRelogin
-	}
 	return AccountMutationKind(kind)
 }
 
