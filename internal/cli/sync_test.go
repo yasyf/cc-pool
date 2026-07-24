@@ -419,12 +419,14 @@ func TestStatusRendersMesh(t *testing.T) {
 
 	rf := hostsync.NewRegistryFile(pool.SyncDir())
 	if err := rf.Update(context.Background(), func(reg hostsync.Registry) error {
+		stamp := cregistry.UnixMicros(time.Now())
 		reg.Add("u-1", hostsync.AccountValue{
 			UUID:  "u-1",
 			Label: "Work",
 			Chain: hostsync.ChainStamp{ExpiresAt: 1700000000000, Hash: "h1", Origin: "hosta"},
-		}, cregistry.UnixMicros(time.Now()))
-		reg.Remove("u-9", cregistry.UnixMicros(time.Now()))
+		}, stamp)
+		reg.Add("u-9", hostsync.AccountValue{UUID: "u-9"}, stamp)
+		reg.Remove("u-9", stamp+1)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
