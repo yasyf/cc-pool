@@ -171,11 +171,19 @@ func (*fleetLifecycleRuntime) ReplaceTenant(
 }
 
 func (*fleetLifecycleRuntime) RemoveTenant(
-	context.Context,
-	tenantfs.Account,
-	uint64,
+	_ context.Context,
+	account tenantfs.Account,
+	expected uint64,
 ) (mountproto.RemoveTenantResponse, error) {
-	return mountproto.RemoveTenantResponse{}, errors.New("unexpected remove")
+	id, err := account.TenantID()
+	if err != nil {
+		return mountproto.RemoveTenantResponse{}, err
+	}
+	return mountproto.RemoveTenantResponse{
+		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
+		TenantID: mountproto.TenantID(id), Generation: expected,
+		FileProviderAbsent: true,
+	}, nil
 }
 
 func (*fleetLifecycleRuntime) TenantState(
