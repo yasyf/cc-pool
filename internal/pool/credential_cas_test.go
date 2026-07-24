@@ -3,9 +3,11 @@ package pool
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -54,6 +56,120 @@ func TestCredentialCASKeychainWrite(t *testing.T) {
 		t.Fatalf("credential after CAS = %+v, %v", got, err)
 	}
 	assertCredentialCASLocksGone(t, account.ConfigDir)
+}
+
+func TestCredentialCASWritesAndVerifiesReorderedJSONCanonically(t *testing.T) {
+	account, stores := newCredentialCASFixture(t)
+	expected, err := observeCredentialCASState(t.Context(), stores[creds.SourceKeychain])
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := credentialCASTestRequest(t, account, creds.SourceKeychain, expected, credentialCASCredential("reordered"))
+	request.Credential = []byte(`{"claudeAiOauth":{"expiresAt":1800000000000,"refreshToken":"refresh-reordered","accessToken":"access-reordered"}}`)
+	response := runCredentialCASTestWorker(t, request)
+	if response.ErrorCode != "" {
+		t.Fatalf("credential CAS response = %+v", response)
+	}
+	canonical, err := credentialCASCredential("reordered").Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCredentialCASCanonicalWrite(t, response, canonical)
+}
+
+func TestCredentialCASOmitsExplicitEmptyOptionalFieldCanonically(t *testing.T) {
+	account, stores := newCredentialCASFixture(t)
+	expected, err := observeCredentialCASState(t.Context(), stores[creds.SourceKeychain])
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := credentialCASTestRequest(t, account, creds.SourceKeychain, expected, credentialCASCredential("empty-optional"))
+	request.Credential = []byte(`{"claudeAiOauth":{"accessToken":"access-empty-optional","refreshToken":"","expiresAt":1800000000000}}`)
+	response := runCredentialCASTestWorker(t, request)
+	if response.ErrorCode != "" {
+		t.Fatalf("credential CAS response = %+v", response)
+	}
+	canonicalCredential := credentialCASCredential("empty-optional")
+	canonicalCredential.ClaudeAiOauth.RefreshToken = ""
+	canonical, err := canonicalCredential.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCredentialCASCanonicalWrite(t, response, canonical)
+}
+
+func TestCredentialCASRejectsUnknownCredentialFieldsBeforeWrite(t *testing.T) {
+	account, stores := newCredentialCASFixture(t)
+	expected, err := observeCredentialCASState(t.Context(), stores[creds.SourceKeychain])
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := credentialCASTestRequest(t, account, creds.SourceKeychain, expected, credentialCASCredential("unknown"))
+	request.Credential = []byte(`{"claudeAiOauth":{"accessToken":"access-unknown","expiresAt":1800000000000,"unknown":true}}`)
+	if _, err := runCredentialCASTestWorkerResult(t.Context(), request); err == nil {
+		t.Fatal("credential CAS accepted an unknown inner field")
+	}
+	if _, err := os.Stat(os.Getenv("CCP_CAS_KEYCHAIN_ITEM")); !errors.Is(err, os.ErrNotExist) { //nolint:gosec // G703: fixture path is test-owned.
+		t.Fatalf("credential CAS wrote rejected payload: %v", err)
+	}
+	assertCredentialCASLocksGone(t, account.ConfigDir)
+}
+
+func TestCredentialCASLostResponseResumeKeepsCanonicalDigest(t *testing.T) {
+	account, stores := newCredentialCASFixture(t)
+	expected, err := observeCredentialCASState(t.Context(), stores[creds.SourceKeychain])
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := credentialCASTestRequest(t, account, creds.SourceKeychain, expected, credentialCASCredential("resume"))
+	request.Credential = []byte(`{"claudeAiOauth":{"expiresAt":1800000000000,"refreshToken":"","accessToken":"access-resume"}}`)
+	var input bytes.Buffer
+	if err := json.NewEncoder(&input).Encode(request); err != nil {
+		t.Fatal(err)
+	}
+	if err := RunCredentialCASWorker(t.Context(), &input, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	observed, err := observeCredentialCASState(t.Context(), stores[creds.SourceKeychain])
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Expected = observed
+	response := runCredentialCASTestWorker(t, request)
+	if response.ErrorCode != "" {
+		t.Fatalf("credential CAS resume response = %+v", response)
+	}
+	canonicalCredential := credentialCASCredential("resume")
+	canonicalCredential.ClaudeAiOauth.RefreshToken = ""
+	canonical, err := canonicalCredential.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCredentialCASCanonicalWrite(t, response, canonical)
+	wantDigest := store.CredentialDigest(sha256.Sum256(canonical))
+	if observed.Keychain.Digest == nil || *observed.Keychain.Digest != wantDigest ||
+		response.After.Keychain.Digest == nil || *response.After.Keychain.Digest != wantDigest {
+		t.Fatalf("canonical digest changed across lost response: before=%+v after=%+v", observed, response.After)
+	}
+}
+
+func assertCredentialCASCanonicalWrite(
+	t *testing.T,
+	response CredentialCASResponse,
+	canonical []byte,
+) {
+	t.Helper()
+	written, err := os.ReadFile(os.Getenv("CCP_CAS_KEYCHAIN_ITEM")) //nolint:gosec // G703: fixture path is test-owned.
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(written, canonical) {
+		t.Fatalf("credential bytes = %s, want %s", written, canonical)
+	}
+	wantDigest := store.CredentialDigest(sha256.Sum256(canonical))
+	if response.After.Keychain.Digest == nil || *response.After.Keychain.Digest != wantDigest {
+		t.Fatalf("credential digest = %+v, want %x", response.After.Keychain.Digest, wantDigest)
+	}
 }
 
 func TestCredentialCASDeletesOnlyAnExactReadableTarget(t *testing.T) {

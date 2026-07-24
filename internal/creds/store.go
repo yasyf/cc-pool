@@ -107,6 +107,19 @@ func (k KeychainItem) Write(ctx context.Context, cred *Credential) error {
 	return Write(ctx, k.Runner, k.Service, k.Account, cred)
 }
 
+// WriteCanonical writes a credential produced by
+// CanonicalizeCredentialForWrite without rendering it again.
+func (k KeychainItem) WriteCanonical(ctx context.Context, credential CanonicalCredential) error {
+	if len(credential.blob) == 0 {
+		return errors.New("canonical credential is empty")
+	}
+	account := k.Account
+	if account == "" {
+		account = AccountLabel()
+	}
+	return writeRaw(ctx, k.Runner, k.Service, account, credential.blob)
+}
+
 // Delete removes the item; missing is not an error.
 func (k KeychainItem) Delete(ctx context.Context) error {
 	return Delete(ctx, k.Runner, k.Service, k.Account)

@@ -1,9 +1,11 @@
 package creds
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 )
 
@@ -37,6 +39,12 @@ type OAuth struct {
 //	{"claudeAiOauth": { ...OAuth... }}
 type Credential struct {
 	ClaudeAiOauth OAuth `json:"claudeAiOauth"`
+}
+
+// CanonicalCredential is one strictly decoded credential rendered through
+// Credential.Marshal and ready for an exact Keychain write.
+type CanonicalCredential struct {
+	blob []byte
 }
 
 // Expiry returns the access-token expiry as a time.Time.
@@ -86,6 +94,33 @@ func (c *Credential) Marshal() ([]byte, error) {
 		return nil, fmt.Errorf("marshal credential: %w", err)
 	}
 	return b, nil
+}
+
+// CanonicalizeCredentialForWrite strictly decodes payload, validates its
+// writable shape, and renders its single canonical representation.
+func CanonicalizeCredentialForWrite(payload []byte) (CanonicalCredential, error) {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	var credential Credential
+	if err := decoder.Decode(&credential); err != nil {
+		return CanonicalCredential{}, fmt.Errorf("parse credential blob: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return CanonicalCredential{}, errors.New("parse credential blob: multiple JSON values")
+	}
+	if err := credential.validateForWrite(); err != nil {
+		return CanonicalCredential{}, err
+	}
+	blob, err := credential.Marshal()
+	if err != nil {
+		return CanonicalCredential{}, err
+	}
+	return CanonicalCredential{blob: blob}, nil
+}
+
+// Bytes returns a copy of the exact canonical credential bytes.
+func (c CanonicalCredential) Bytes() []byte {
+	return bytes.Clone(c.blob)
 }
 
 func (c *Credential) validateForWrite() error {

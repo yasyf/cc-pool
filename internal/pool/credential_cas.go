@@ -188,6 +188,13 @@ func RunCredentialCASWorker(
 	if err := validateCredentialCASRequest(request); err != nil {
 		return err
 	}
+	var canonicalCredential creds.CanonicalCredential
+	if len(request.Credential) != 0 {
+		canonicalCredential, err = creds.CanonicalizeCredentialForWrite(request.Credential)
+		if err != nil {
+			return fmt.Errorf("credential CAS payload is invalid: %w", err)
+		}
+	}
 	lease, err := acquireCredentialRefreshLocks(ctx, request.AccountID, request.ConfigDir)
 	if err != nil {
 		return err
@@ -213,11 +220,8 @@ func RunCredentialCASWorker(
 	if request.Delete {
 		return deleteCredentialCAS(ctx, output, credentialStore, before)
 	}
-	var credential creds.Credential
-	if err := json.Unmarshal(request.Credential, &credential); err != nil {
-		return errors.New("credential CAS payload is invalid")
-	}
-	if err := credentialStore.Write(ctx, &credential); err != nil {
+	canonicalBytes := canonicalCredential.Bytes()
+	if err := credentialStore.WriteCanonical(ctx, canonicalCredential); err != nil {
 		return WriteCredentialCASResponse(output, CredentialCASResponse{
 			Before: before, After: before, ErrorCode: "io", Error: err.Error(),
 		})
@@ -228,7 +232,7 @@ func RunCredentialCASWorker(
 			Before: before, ErrorCode: "io", Error: err.Error(),
 		})
 	}
-	wantDigest := store.CredentialDigest(sha256.Sum256(request.Credential))
+	wantDigest := store.CredentialDigest(sha256.Sum256(canonicalBytes))
 	written := afterWrite.Keychain
 	if written.State != store.CredentialSlotPresent || written.Digest == nil ||
 		*written.Digest != wantDigest {
@@ -367,7 +371,7 @@ func deleteCredentialCAS(
 func credentialCASStore(
 	request CredentialCASRequest,
 	runner creds.TaskRunner,
-) creds.Store {
+) creds.KeychainItem {
 	return creds.KeychainItem{
 		Service: request.KeychainService, Account: request.KeychainAccount, Runner: runner,
 	}
