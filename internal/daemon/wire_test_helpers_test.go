@@ -24,13 +24,16 @@ func serveHandlerOnSocket(t *testing.T, serverState *Server) string {
 	server := &wire.Server{WireBuild: WireBuild, Ladder: ladder, MaxSessions: 2}
 	for _, operation := range []Op{OpSelect, OpSelectCommit, OpSelectAbort, OpStatus} {
 		operation := operation
-		server.RegisterConcurrent(wire.Op(operation), func(ctx context.Context, request wire.Request) (any, error) {
-			var payload Request
-			if err := decodeStrict(request.Payload, &payload); err != nil {
-				return nil, err
-			}
-			payload.Op = operation
-			return serverState.dispatch(ctx, payload), nil
+		server.Register(wire.HandlerSpec{
+			Op: wire.Op(operation), Concurrent: true,
+			Handler: func(ctx context.Context, request wire.Request) (any, error) {
+				var payload Request
+				if err := decodeStrict(request.Payload, &payload); err != nil {
+					return nil, err
+				}
+				payload.Op = operation
+				return serverState.dispatch(ctx, payload), nil
+			},
 		})
 	}
 	startTestWireRuntime(t, socket, "test-runtime", server, buildTestProtectedClassifier{}, []wire.ObservationRoute{

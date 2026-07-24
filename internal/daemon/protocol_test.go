@@ -350,9 +350,12 @@ func serveBuildTestServer(
 		WireBuild: build, Ladder: ladder, MaxSessions: 2,
 	}
 	for _, op := range []Op{OpStatus} {
-		server.RegisterConcurrent(wire.Op(op), func(context.Context, wire.Request) (any, error) {
-			calls.Add(1)
-			return Response{OK: true, Version: build}, nil
+		server.Register(wire.HandlerSpec{
+			Op: wire.Op(op), Concurrent: true,
+			Handler: func(context.Context, wire.Request) (any, error) {
+				calls.Add(1)
+				return Response{OK: true, Version: build}, nil
+			},
 		})
 	}
 	startTestWireRuntime(t, socket, build, server, buildTestProtectedClassifier{}, []wire.ObservationRoute{
