@@ -423,6 +423,57 @@ func validTenantAcknowledgement(
 		acknowledgement.Presentations == catalog.PresentFileProvider
 }
 
+func (c *tenantCoordinator) retireReservedAccount(
+	ctx context.Context,
+	reservation store.PendingAccountReservation,
+) (pool.PendingAddRetirementProof, error) {
+	configDir, err := pool.AccountConfigDir(reservation.InstanceID)
+	if err != nil {
+		return pool.PendingAddRetirementProof{}, err
+	}
+	account := store.Account{
+		ID: reservation.ID, InstanceID: reservation.InstanceID,
+		Generation: reservation.Generation, ConfigDir: configDir,
+	}
+	identity, err := expectedPresentationIdentity(account)
+	if err != nil {
+		return pool.PendingAddRetirementProof{}, err
+	}
+	if err := store.ValidateReservedPresentationIdentity(reservation, identity); err != nil {
+		return pool.PendingAddRetirementProof{}, err
+	}
+	tenantAccount := pool.TenantAccount(account)
+	tenantID, err := tenantAccount.TenantID()
+	if err != nil {
+		return pool.PendingAddRetirementProof{}, err
+	}
+	release, err := c.acquireTenantLane(ctx, tenantID)
+	if err != nil {
+		return pool.PendingAddRetirementProof{}, err
+	}
+	defer release()
+	state, present, err := c.tenantState(ctx, tenantAccount)
+	if err != nil {
+		return pool.PendingAddRetirementProof{}, fmt.Errorf("inspect reserved FuseKit tenant before retirement: %w", err)
+	}
+	if present && state.State.Generation != catalog.Generation(reservation.Generation) {
+		return pool.PendingAddRetirementProof{}, errors.New("reserved FuseKit tenant generation drifted")
+	}
+	retired, err := c.runtime.RetireTenant(ctx, tenantAccount, reservation.Generation)
+	if err != nil {
+		return pool.PendingAddRetirementProof{}, fmt.Errorf("retire reserved FuseKit tenant: %w", err)
+	}
+	if retired.Tenant != tenantID || retired.Generation != catalog.Generation(reservation.Generation) ||
+		!retired.FileProviderAbsent {
+		return pool.PendingAddRetirementProof{}, errors.New("retire reserved FuseKit tenant: invalid proof")
+	}
+	c.forgetTenant(tenantID)
+	return pool.PendingAddRetirementProof{
+		AccountID: reservation.ID, AccountInstanceID: reservation.InstanceID,
+		AccountGeneration: reservation.Generation, PublicPath: identity.PublicPath,
+	}, nil
+}
+
 func (c *tenantCoordinator) finishRemoval(ctx context.Context, removal store.AccountRemoval) error {
 	account, err := c.server.m.Store.GetAccount(removal.AccountID)
 	if errors.Is(err, store.ErrAccountNotFound) && removal.DeleteCredential {

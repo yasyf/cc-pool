@@ -53,16 +53,23 @@ type CredentialWritePublicationBuilder func(
 ) ([]byte, error)
 
 type credentialOperationCodec[T any] struct {
-	target     store.CredentialTarget
-	intent     *store.CredentialDigest
-	resultCode func(T, error) store.CredentialResultCategory
-	replay     func(context.Context, *Manager, store.Account, store.CredentialOperationReceipt) (T, error)
+	target           store.CredentialTarget
+	intent           *store.CredentialDigest
+	tokenChainDigest credentialTokenChainDigestFunc
+	resultCode       func(T, error) store.CredentialResultCategory
+	replay           func(context.Context, *Manager, store.Account, store.CredentialOperationReceipt) (T, error)
 }
 
 type credentialObservationFunc func(
 	context.Context,
 	store.Account,
 ) (store.CredentialExternalState, error)
+
+type credentialTokenChainDigestFunc func(
+	context.Context,
+	*Manager,
+	store.Account,
+) (*store.CredentialDigest, error)
 
 type credentialOperationBoundary struct {
 	manager            *Manager
@@ -611,7 +618,7 @@ func applyCredentialOperation[T any](
 		credentialSettlementTimeout,
 	)
 	defer settleCancel()
-	after, observeErr := manager.credentialObservation(settleCtx, account)
+	after, observeErr := observe(settleCtx, account)
 	if observeErr != nil {
 		return result, errors.Join(operationErr, observeErr)
 	}
@@ -646,7 +653,7 @@ func applyCredentialOperation[T any](
 		}
 		return result, manager.Store.AcknowledgeCredentialOperation(receipt.Token)
 	}
-	actual, verifyErr := manager.credentialObservation(settleCtx, account)
+	actual, verifyErr := observe(settleCtx, account)
 	if verifyErr != nil {
 		return result, errors.Join(operationErr, verifyErr)
 	}
@@ -696,8 +703,18 @@ func applyCredentialOperation[T any](
 	}
 	var quarantineTokenChainDigest *store.CredentialDigest
 	if status == store.CredentialTerminalQuarantined {
-		stable, digest, stableErr := manager.credentialTokenChainStateAtObservation(
-			settleCtx, account,
+		readTokenChain := codec.tokenChainDigest
+		if readTokenChain == nil {
+			readTokenChain = func(
+				ctx context.Context,
+				manager *Manager,
+				account store.Account,
+			) (*store.CredentialDigest, error) {
+				return manager.credentialTokenChainStateDigest(ctx, account)
+			}
+		}
+		stable, digest, stableErr := manager.credentialTokenChainStateAtObservationUsing(
+			settleCtx, account, observe, readTokenChain,
 		)
 		if stableErr == nil {
 			if !sameStoreObservation(outcome, stable) {
@@ -1081,6 +1098,15 @@ func (m *Manager) removeCredentialForAccountRemovalAt(
 	}
 	codec := unitCredentialOperationCodec(store.CredentialTargetKeychain)
 	codec.intent = &intent
+	codec.tokenChainDigest = func(
+		ctx context.Context,
+		manager *Manager,
+		account store.Account,
+	) (*store.CredentialDigest, error) {
+		return manager.credentialTokenChainStateDigestAt(
+			ctx, account, expectedPublicPath,
+		)
+	}
 	if receipt != nil {
 		_, err := replayCredentialOperation(ctx, m, account, codec, *receipt)
 		return err
@@ -1817,16 +1843,36 @@ func (m *Manager) credentialTokenChainStateAtObservation(
 	ctx context.Context,
 	account store.Account,
 ) (store.CredentialExternalState, *store.CredentialDigest, error) {
+	return m.credentialTokenChainStateAtObservationUsing(
+		ctx,
+		account,
+		m.credentialObservation,
+		func(
+			ctx context.Context,
+			manager *Manager,
+			account store.Account,
+		) (*store.CredentialDigest, error) {
+			return manager.credentialTokenChainStateDigest(ctx, account)
+		},
+	)
+}
+
+func (m *Manager) credentialTokenChainStateAtObservationUsing(
+	ctx context.Context,
+	account store.Account,
+	observe credentialObservationFunc,
+	readTokenChain credentialTokenChainDigestFunc,
+) (store.CredentialExternalState, *store.CredentialDigest, error) {
 	for range 3 {
-		before, err := m.credentialObservation(ctx, account)
+		before, err := observe(ctx, account)
 		if err != nil {
 			return store.CredentialExternalState{}, nil, err
 		}
-		digest, err := m.credentialTokenChainStateDigest(ctx, account)
+		digest, err := readTokenChain(ctx, m, account)
 		if err != nil {
 			return store.CredentialExternalState{}, nil, err
 		}
-		after, err := m.credentialObservation(ctx, account)
+		after, err := observe(ctx, account)
 		if err != nil {
 			return store.CredentialExternalState{}, nil, err
 		}

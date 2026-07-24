@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -124,6 +125,10 @@ type fixtureAccountPreparer struct {
 		store.PendingAccountReservation,
 		string,
 	) (store.FileProviderPresentationIdentity, error)
+	abort func(
+		context.Context,
+		store.PendingAccountReservation,
+	) (pool.PendingAddRetirementProof, error)
 }
 
 func (prepare fixtureAccountPreparer) PrepareReservedAccount(
@@ -132,6 +137,20 @@ func (prepare fixtureAccountPreparer) PrepareReservedAccount(
 	label string,
 ) (store.FileProviderPresentationIdentity, error) {
 	return prepare.prepare(ctx, reservation, label)
+}
+
+func (prepare fixtureAccountPreparer) AbortReservedAccount(
+	ctx context.Context,
+	reservation store.PendingAccountReservation,
+) (pool.PendingAddRetirementProof, error) {
+	if prepare.abort != nil {
+		return prepare.abort(ctx, reservation)
+	}
+	return pool.PendingAddRetirementProof{
+		AccountID: reservation.ID, AccountInstanceID: reservation.InstanceID,
+		AccountGeneration: reservation.Generation,
+		PublicPath:        materializeFileProviderPublicPath(reservation.ID),
+	}, nil
 }
 
 func (r *fixtureAccountRemover) BeginAccountRemoval(id int, deleteCredential bool) (AccountRemoval, error) {
@@ -164,13 +183,10 @@ func (r *fixtureAccountRemover) callsSnapshot() []int {
 }
 
 func (p fixtureAccountRemoval) Finish(ctx context.Context) error {
-	if err := os.RemoveAll(materializePresentationPath(p.removal.AccountID)); err != nil {
-		return err
-	}
 	return p.remover.m.FinishAccountRemoval(ctx, p.removal)
 }
 
-func materializePresentationPath(id int) string {
+func materializeFileProviderPublicPath(id int) string {
 	home, err := pool.Home()
 	if err != nil {
 		panic(err)
@@ -271,7 +287,7 @@ func newMaterializeService(t *testing.T) (*Service, *pool.Manager, *credstest.Fa
 			reservation store.PendingAccountReservation,
 			_ string,
 		) (store.FileProviderPresentationIdentity, error) {
-			path := materializePresentationPath(reservation.ID)
+			path := materializeFileProviderPublicPath(reservation.ID)
 			if err := os.MkdirAll(path, 0o700); err != nil {
 				return store.FileProviderPresentationIdentity{}, err
 			}
@@ -334,7 +350,7 @@ func TestMaterializeHappyPath(t *testing.T) {
 		t.Fatalf("result = %+v, want uuid u-happy / acct 1", res)
 	}
 
-	configDir := materializePresentationPath(1)
+	configDir := materializeFileProviderPublicPath(1)
 	backingDir := pool.AccountBackingDir(1)
 	if _, err := os.Stat(backingDir); err != nil {
 		t.Fatalf("account backing not created: %v", err)
@@ -475,6 +491,40 @@ func TestMaterializeAbandonsOnlyProvenUntouchedPromotion(t *testing.T) {
 	if err := os.WriteFile(pool.ClaudeJSONPath(), []byte(`{}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	preparer := s.Preparer.(fixtureAccountPreparer)
+	prepare := preparer.prepare
+	var retired store.PendingAccountReservation
+	var marker string
+	preparer.prepare = func(
+		ctx context.Context,
+		reservation store.PendingAccountReservation,
+		label string,
+	) (store.FileProviderPresentationIdentity, error) {
+		proof, err := prepare(ctx, reservation, label)
+		if err != nil {
+			return store.FileProviderPresentationIdentity{}, err
+		}
+		marker = filepath.Join(proof.PublicPath, "presentation-survives")
+		if err := os.WriteFile(marker, []byte("public"), 0o600); err != nil {
+			return store.FileProviderPresentationIdentity{}, err
+		}
+		return proof, nil
+	}
+	preparer.abort = func(
+		ctx context.Context,
+		reservation store.PendingAccountReservation,
+	) (pool.PendingAddRetirementProof, error) {
+		if err := ctx.Err(); err != nil {
+			return pool.PendingAddRetirementProof{}, err
+		}
+		retired = reservation
+		return pool.PendingAddRetirementProof{
+			AccountID: reservation.ID, AccountInstanceID: reservation.InstanceID,
+			AccountGeneration: reservation.Generation,
+			PublicPath:        materializeFileProviderPublicPath(reservation.ID),
+		}, nil
+	}
+	s.Preparer = preparer
 	s.promoteSyncedAdd = func(
 		context.Context, *pool.PendingAdd, string, string,
 	) (*store.Account, error) {
@@ -491,8 +541,105 @@ func TestMaterializeAbandonsOnlyProvenUntouchedPromotion(t *testing.T) {
 	if _, err := manager.Store.GetAccount(1); !errors.Is(err, store.ErrAccountNotFound) {
 		t.Fatalf("account after proven pre-commit failure = %v", err)
 	}
-	if _, err := os.Stat(pool.AccountBackingDir(1)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("uncommitted backing survived safe abandon: %v", err)
+	if _, statErr := os.Stat(pool.AccountBackingDir(1)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("uncommitted backing survived safe abandon: stat=%v materialize=%v", statErr, err)
+	}
+	if retired.ID != 1 {
+		t.Fatalf("retired reservation = %+v, want acct-01", retired)
+	}
+	configDir, err := pool.AccountConfigDir(retired.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(configDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stable link survived proven retirement: %v", err)
+	}
+	if got, err := os.ReadFile(marker); err != nil || string(got) != "public" {
+		t.Fatalf("public target after cleanup = %q err=%v", got, err)
+	}
+	reused, err := manager.ReserveAdd()
+	if err != nil || reused.ID != retired.ID {
+		t.Fatalf("reservation after exact cleanup = %+v err=%v", reused, err)
+	}
+}
+
+func TestMaterializeCancellationRetiresReservationWithLiveCleanupContext(t *testing.T) {
+	s, manager, _, _ := newMaterializeService(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	var retired store.PendingAccountReservation
+	s.Preparer = fixtureAccountPreparer{
+		prepare: func(
+			context.Context,
+			store.PendingAccountReservation,
+			string,
+		) (store.FileProviderPresentationIdentity, error) {
+			cancel()
+			return store.FileProviderPresentationIdentity{}, context.Canceled
+		},
+		abort: func(
+			cleanup context.Context,
+			reservation store.PendingAccountReservation,
+		) (pool.PendingAddRetirementProof, error) {
+			if err := cleanup.Err(); err != nil {
+				return pool.PendingAddRetirementProof{}, fmt.Errorf("cleanup inherited cancellation: %w", err)
+			}
+			retired = reservation
+			return pool.PendingAddRetirementProof{
+				AccountID: reservation.ID, AccountInstanceID: reservation.InstanceID,
+				AccountGeneration: reservation.Generation,
+				PublicPath:        materializeFileProviderPublicPath(reservation.ID),
+			}, nil
+		},
+	}
+	_, err := s.Materialize(
+		ctx,
+		materializeVal("u-canceled", "cancel@example.com", json.RawMessage(`{"accountUuid":"u-canceled"}`)),
+		freshEnvelope("at-canceled"), materializeManifest,
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled materialize = %v", err)
+	}
+	if retired.ID != 1 {
+		t.Fatalf("retired reservation = %+v, want acct-01", retired)
+	}
+	reused, reserveErr := manager.ReserveAdd()
+	if reserveErr != nil || reused.ID != retired.ID {
+		t.Fatalf("reservation after canceled retirement = %+v err=%v", reused, reserveErr)
+	}
+}
+
+func TestMaterializeRetainsReservationWhenRetirementIsAmbiguous(t *testing.T) {
+	s, manager, _, _ := newMaterializeService(t)
+	s.Preparer = fixtureAccountPreparer{
+		prepare: func(
+			context.Context,
+			store.PendingAccountReservation,
+			string,
+		) (store.FileProviderPresentationIdentity, error) {
+			return store.FileProviderPresentationIdentity{}, errors.New("partial provisioning")
+		},
+		abort: func(
+			context.Context,
+			store.PendingAccountReservation,
+		) (pool.PendingAddRetirementProof, error) {
+			return pool.PendingAddRetirementProof{}, errors.New("retirement unavailable")
+		},
+	}
+	_, err := s.Materialize(
+		t.Context(),
+		materializeVal("u-retained", "retained@example.com", json.RawMessage(`{"accountUuid":"u-retained"}`)),
+		freshEnvelope("at-retained"), materializeManifest,
+	)
+	if err == nil || !strings.Contains(err.Error(), "retirement unavailable") {
+		t.Fatalf("ambiguous retirement = %v", err)
+	}
+	indexes, indexErr := manager.Store.PendingAddIndexes()
+	if indexErr != nil || !reflect.DeepEqual(indexes, []int{1}) {
+		t.Fatalf("retained reservation indexes = %v err=%v", indexes, indexErr)
+	}
+	next, reserveErr := manager.ReserveAdd()
+	if reserveErr != nil || next.ID != 2 {
+		t.Fatalf("reservation after ambiguous retirement = %+v err=%v", next, reserveErr)
 	}
 }
 
@@ -531,7 +678,7 @@ func TestMaterializeNeverAbandonsAmbiguousPromotion(t *testing.T) {
 func TestMaterializeRejectsExistingExternalUUIDBeforeMutation(t *testing.T) {
 	s, manager, _, _ := newMaterializeService(t)
 	existing := admitHostsyncTestAccount(t, manager, store.Account{
-		ID: 9, ConfigDir: materializePresentationPath(9),
+		ID: 9, ConfigDir: materializeFileProviderPublicPath(9),
 		KeychainService: "existing-service", KeychainAccount: "existing-account",
 		AccountUUID: "duplicate",
 	})
@@ -617,7 +764,7 @@ func TestMaterializeSeedNoSourceBootstraps(t *testing.T) {
 		t.Fatalf("result = %+v, want a completed acct 1", res)
 	}
 
-	configDir := materializePresentationPath(1)
+	configDir := materializeFileProviderPublicPath(1)
 	id, err := m.AccountIdentity(t.Context(), 1, configDir)
 	if err != nil {
 		t.Fatalf("AccountIdentity: %v", err)
@@ -664,7 +811,7 @@ func TestMaterializeKeychainUnavailableFailsClosed(t *testing.T) {
 		t.Fatalf("result = %+v, want durable awaiting-origin acct 1", res)
 	}
 
-	configDir := materializePresentationPath(1)
+	configDir := materializeFileProviderPublicPath(1)
 	if _, ok := fk.Get(creds.ServiceName(configDir), creds.AccountLabel()); ok {
 		t.Fatal("keychain item present after failed install")
 	}
@@ -720,45 +867,46 @@ func TestMaterializeRejectsUnavailableOrInvalidDeliveryBeforeMutation(t *testing
 	}
 }
 
-// TestMaterializeNeverOverwritesRetainedCredential pins the interrupted-add
-// guard: a kept dir whose slot retains a usable credential (from a prior
-// ReleaseAdd) aborts before writing identity or installing delivery material — the retained
-// credential and identity survive intact and the reservation is released.
-func TestMaterializeNeverOverwritesRetainedCredential(t *testing.T) {
+// TestMaterializeNeverReusesRetainedCredentialReservation pins interrupted-add
+// retention: a pending instance keeps its numeric reservation, stable link,
+// credential, and backing while a peer materializes into the next slot.
+func TestMaterializeNeverReusesRetainedCredentialReservation(t *testing.T) {
 	s, m, fk, rec := newMaterializeService(t)
 	if err := os.WriteFile(pool.ClaudeJSONPath(), []byte(`{}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	// A kept dir from an interrupted `ccp add`: its own identity + owned credential.
-	keptDir := materializePresentationPath(1)
-	keptBacking := pool.AccountBackingDir(1)
-	if err := os.MkdirAll(keptBacking, 0o700); err != nil {
+	reservation, err := m.ReserveAdd()
+	if err != nil {
 		t.Fatal(err)
 	}
+	publicPath := materializeFileProviderPublicPath(1)
+	if err := os.MkdirAll(publicPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := m.PrepareReservedAdd(t.Context(), reservation, publicPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keptBacking := pool.AccountBackingDir(pending.Reservation.ID)
 	const keptIdentity = `{"oauthAccount":{"accountUuid":"u-kept","emailAddress":"kept@example.com"}}`
 	if err := os.WriteFile(filepath.Join(keptBacking, ".claude.json"), []byte(keptIdentity), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	retained := cred("at-kept", "rt-kept")
 	retained.ClaudeAiOauth.ExpiresAt = time.Now().Add(2 * time.Hour).UnixMilli()
-	fk.Put(creds.ServiceName(keptDir), "claude-login-label", retained)
+	fk.Put(pending.KeychainService, "claude-login-label", retained)
 
 	oauthAccount := json.RawMessage(`{"accountUuid":"u-peer","emailAddress":"peer@example.com"}`)
 	res, err := s.Materialize(context.Background(), materializeVal("u-peer", "peer@example.com", oauthAccount), freshEnvelope("unused-delivery"), materializeManifest)
-	if err == nil || !strings.Contains(err.Error(), "retains a credential") {
-		t.Fatalf("err = %v, want the retained-credential abort", err)
-	}
-	if res != (MaterializeResult{}) {
-		t.Fatalf("result = %+v, want zero on abort", res)
+	if err != nil || res.AccountID != 2 {
+		t.Fatalf("materialize beside retained reservation = %+v err=%v", res, err)
 	}
 
-	// Retained credential intact, identity untouched (WriteIdentity never ran).
-	got, ok := fk.Get(creds.ServiceName(keptDir), "claude-login-label")
+	got, ok := fk.Get(pending.KeychainService, "claude-login-label")
 	if !ok || got.ClaudeAiOauth.RefreshToken != "rt-kept" {
 		t.Fatalf("retained credential = %+v ok=%v, want rt-kept intact", got, ok)
 	}
-	// #nosec G304 -- keptDir is a test-controlled temporary account directory.
 	raw, err := os.ReadFile(filepath.Join(keptBacking, ".claude.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -766,23 +914,15 @@ func TestMaterializeNeverOverwritesRetainedCredential(t *testing.T) {
 	if string(raw) != keptIdentity {
 		t.Fatalf("kept identity mutated: %s", raw)
 	}
-	// Reservation released, no row, no nudge.
-	n, rerr := m.Store.ReserveAccountIndex(mustMutationOwner(t, m))
-	if rerr != nil {
-		t.Fatal(rerr)
+	if target, err := os.Readlink(pending.ConfigDir); err != nil || target != pending.PublicPath {
+		t.Fatalf("retained stable link = %q err=%v", target, err)
 	}
-	if n.ID != 1 {
-		t.Fatalf("next reserved index = %d, want the released 1", n.ID)
+	indexes, err := m.Store.PendingAddIndexes()
+	if err != nil || len(indexes) != 1 || indexes[0] != pending.Reservation.ID {
+		t.Fatalf("retained reservation indexes = %v err=%v", indexes, err)
 	}
-	accounts, lerr := m.Store.ListAccounts()
-	if lerr != nil {
-		t.Fatal(lerr)
-	}
-	if len(accounts) != 0 {
-		t.Fatalf("accounts = %+v, want none", accounts)
-	}
-	if len(rec.calls) != 0 {
-		t.Fatalf("nudge calls = %v, want none", rec.calls)
+	if len(rec.calls) != 1 {
+		t.Fatalf("nudge calls = %v, want one peer materialization", rec.calls)
 	}
 }
 

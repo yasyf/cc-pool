@@ -73,7 +73,9 @@ func testCredentialCAS(manager *Manager) credentialCASFunc {
 		expected store.CredentialExternalState,
 		mutation credentialCASMutation,
 	) (credentialCASProof, error) {
-		before, err := manager.credentialObservation(ctx, account)
+		before, err := manager.credentialObservationAt(
+			ctx, account, mutation.ExpectedPublicPath,
+		)
 		if err != nil {
 			return credentialCASProof{}, err
 		}
@@ -82,7 +84,11 @@ func testCredentialCAS(manager *Manager) credentialCASFunc {
 			return proof, errCredentialCASConflict
 		}
 		if mutation.Refresh {
-			previous, err := manager.Creds.Store(account, creds.SourceKeychain).Read(ctx)
+			target, err := manager.credentialStore(account, mutation.ExpectedPublicPath)
+			if err != nil {
+				return proof, err
+			}
+			previous, err := target.Read(ctx)
 			if err != nil {
 				return proof, err
 			}
@@ -98,24 +104,33 @@ func testCredentialCAS(manager *Manager) credentialCASFunc {
 				next.ClaudeAiOauth.RefreshToken = response.RefreshToken
 			}
 			next.ClaudeAiOauth.ExpiresAt = response.Expiry(time.Now()).UnixMilli()
-			if err := manager.Creds.Store(account, creds.SourceKeychain).Write(ctx, &next); err != nil {
+			if err := target.Write(ctx, &next); err != nil {
 				return proof, err
 			}
 			proof.Credential = &next
 		} else if mutation.Delete {
-			if err := manager.Creds.Store(account, creds.SourceKeychain).Delete(ctx); err != nil {
+			target, err := manager.credentialStore(account, mutation.ExpectedPublicPath)
+			if err != nil {
+				return proof, err
+			}
+			if err := target.Delete(ctx); err != nil {
 				return proof, err
 			}
 		} else {
 			if mutation.Credential == nil {
 				return proof, errors.New("test credential CAS mutation is empty")
 			}
-			target := manager.Creds.Store(account, creds.SourceKeychain)
+			target, err := manager.credentialStore(account, mutation.ExpectedPublicPath)
+			if err != nil {
+				return proof, err
+			}
 			if err := target.Write(ctx, mutation.Credential); err != nil {
 				return proof, err
 			}
 		}
-		after, err := manager.credentialObservation(ctx, account)
+		after, err := manager.credentialObservationAt(
+			ctx, account, mutation.ExpectedPublicPath,
+		)
 		proof.After = after
 		if err != nil {
 			return proof, err
