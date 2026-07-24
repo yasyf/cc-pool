@@ -41,6 +41,36 @@ func RetargetAccountConfigDir(instanceID, previousVerifiedPublicPath, verifiedPu
 	return replaceAccountConfigDir(instanceID, previousVerifiedPublicPath, verifiedPublicPath, true)
 }
 
+// RepairAccountConfigDir converges a missing, previous, or already-updated link after restart.
+func RepairAccountConfigDir(instanceID, previousVerifiedPublicPath, verifiedPublicPath string) error {
+	linkPath, err := AccountConfigDir(instanceID)
+	if err != nil {
+		return err
+	}
+	info, err := os.Lstat(linkPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return EnsureAccountConfigDir(instanceID, verifiedPublicPath)
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return fmt.Errorf("%w: %s is not a symlink", ErrAccountConfigLinkConflict, linkPath)
+	}
+	current, err := readExactAccountConfigTarget(linkPath)
+	if err != nil {
+		return err
+	}
+	switch current {
+	case verifiedPublicPath:
+		return nil
+	case previousVerifiedPublicPath:
+		return RetargetAccountConfigDir(instanceID, previousVerifiedPublicPath, verifiedPublicPath)
+	default:
+		return fmt.Errorf("%w: %s targets %q", ErrAccountConfigLinkConflict, linkPath, current)
+	}
+}
+
 // RemoveAccountConfigDir removes one exact stable execution link after presentation retirement.
 func RemoveAccountConfigDir(instanceID, verifiedPublicPath string) error {
 	linkPath, err := AccountConfigDir(instanceID)

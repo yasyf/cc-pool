@@ -55,6 +55,17 @@ func commitPoolTestAccount(
 	reservation store.PendingAccountReservation,
 	owner proc.Record,
 ) store.Account {
+	return commitPoolTestAccountAtPresentation(t, st, requested, reservation, owner, "")
+}
+
+func commitPoolTestAccountAtPresentation(
+	t *testing.T,
+	st *store.Store,
+	requested store.Account,
+	reservation store.PendingAccountReservation,
+	owner proc.Record,
+	publicPath string,
+) store.Account {
 	t.Helper()
 	configDir := requested.ConfigDir
 	if configDir == "" {
@@ -101,7 +112,10 @@ func commitPoolTestAccount(
 	if !begin.Created || begin.Active == nil {
 		t.Fatalf("admit test account: begin = %+v", begin)
 	}
-	proof := poolTestPresentationProof(reservation, configDir)
+	if publicPath == "" {
+		publicPath = configDir
+	}
+	proof := poolTestPresentationProof(reservation, publicPath)
 	fence, err := st.BindAccountMutationPresentation(
 		begin.Active.Fence(),
 		proof,
