@@ -18,29 +18,23 @@ import (
 	"github.com/yasyf/daemonkit/service"
 	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
-	"github.com/yasyf/fusekit/holder"
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/mountservice"
 	"github.com/yasyf/fusekit/transportproto"
 	"github.com/yasyf/fusekit/trustroles"
 )
 
-const (
-	readinessPoll = holderbridge.DeploymentPollInterval
-)
+const readinessPoll = holderbridge.DeploymentPollInterval
 
 type productHooks struct {
-	buildID          string
-	policyDigest     deployment.SHA256
-	servicePlan      func(deployment.Operation) (service.Plan, error)
-	target           func(deployment.Operation) (runtimeTarget, error)
-	servicePlanBuild func(deployment.Operation, string) (service.Plan, error)
-	targetBuild      func(deployment.Operation, string) (runtimeTarget, error)
-	verifyInstalled  func(deployment.Operation) error
-	observe          func(context.Context, string) (mountproto.RuntimeHealthResponse, error)
-	identities       func(string) ([]proc.Identity, error)
-	proveApp         func(context.Context, string) error
-	stopRuntime      func(context.Context, deployment.RuntimeStopper, service.StopRuntimeRequest) (runtimeStopProof, error)
+	buildID      string
+	policyDigest deployment.SHA256
+	servicePlan  func(installedGeneration, string) (service.Plan, error)
+	target       func(installedGeneration, string) (runtimeTarget, error)
+	observe      func(context.Context, string) (mountproto.RuntimeHealthResponse, error)
+	identities   func(string) ([]proc.Identity, error)
+	proveApp     func(context.Context, string) error
+	stopRuntime  func(context.Context, deployment.RuntimeStopper, service.StopRuntimeRequest) (runtimeStopProof, error)
 }
 
 func newProductHooks(buildID string, policyDigest deployment.SHA256) productHooks {
@@ -66,11 +60,8 @@ func newProductHooks(buildID string, policyDigest deployment.SHA256) productHook
 			}, nil
 		},
 	}
-	hooks.servicePlanBuild = hooks.servicePlanForBuild
-	hooks.targetBuild = hooks.runtimeTargetForBuild
-	hooks.verifyInstalled = hooks.verifyInstalledRuntimePlan
-	hooks.servicePlan = hooks.servicePlanForOperation
-	hooks.target = hooks.runtimeTargetForOperation
+	hooks.servicePlan = hooks.defaultServicePlanForBuild
+	hooks.target = hooks.defaultRuntimeTargetForBuild
 	return hooks
 }
 
@@ -91,44 +82,43 @@ type runtimeStopProof struct {
 func (h productHooks) runtimeQuiesce(
 	ctx context.Context,
 	stopper deployment.RuntimeStopper,
-	operation deployment.RuntimeQuiesceOperation,
-) (deployment.RuntimeProof, error) {
-	deployOperation := deployment.Operation{ID: operation.ID, Generation: operation.Generation, Role: operation.Role}
-	target, err := h.target(deployOperation)
+	operation deactivationOperation,
+) (runtimeProof, error) {
+	generation := operation.activation.generation
+	target, err := h.runtimeTargetForBuild(generation, operation.activation.readiness.runtimeBuild)
 	if err != nil {
-		return deployment.RuntimeProof{}, err
+		return runtimeProof{}, err
 	}
 	health, observeErr := h.observe(ctx, target.socket)
 	if observeErr != nil {
 		identities, inventoryErr := h.identities(target.executable)
 		if inventoryErr != nil {
-			return deployment.RuntimeProof{}, fmt.Errorf(
+			return runtimeProof{}, fmt.Errorf(
 				"CCPoolStatus: prove prior runtime absence: %w",
 				errors.Join(observeErr, inventoryErr),
 			)
 		}
 		if len(identities) != 0 {
-			return deployment.RuntimeProof{}, fmt.Errorf(
+			return runtimeProof{}, fmt.Errorf(
 				"CCPoolStatus: prior runtime endpoint is unavailable while %d exact process(es) remain: %w",
 				len(identities), observeErr,
 			)
 		}
-		return deployment.RuntimeProof{
-			Role: operation.Role, Absent: true,
-			Digest: h.proofDigest(
-				"runtime-absent", deployOperation, h.buildID, target.executable,
-			),
+		return runtimeProof{
+			absent: true,
+			digest: h.evidenceDigest("runtime-absent", operation.id, generation, operation.activation.plan.Digest(),
+				h.buildID, target.executable),
 		}, nil
 	}
 	if err := validateRuntimeTarget(health); err != nil {
-		return deployment.RuntimeProof{}, err
+		return runtimeProof{}, err
 	}
 	processGeneration, err := proc.ParseOwnerGeneration(health.ProcessGeneration)
 	if err != nil {
-		return deployment.RuntimeProof{}, fmt.Errorf("CCPoolStatus: parse prior runtime generation: %w", err)
+		return runtimeProof{}, fmt.Errorf("CCPoolStatus: parse prior runtime generation: %w", err)
 	}
 	result, err := h.stopRuntime(ctx, stopper, service.StopRuntimeRequest{
-		OperationID: operation.ID,
+		OperationID: operation.id,
 		RuntimeClientConfig: wire.RuntimeClientConfig{
 			Client: wire.ClientConfig{
 				Dial: wire.UnixDialer(target.socket), WireBuild: transportproto.WireBuild,
@@ -139,70 +129,41 @@ func (h productHooks) runtimeQuiesce(
 		ExpectedRuntimeBuild: health.RuntimeBuild, ControlRole: trustroles.StopController,
 	})
 	if err != nil {
-		return deployment.RuntimeProof{}, fmt.Errorf("CCPoolStatus: settle prior runtime: %w", err)
+		return runtimeProof{}, fmt.Errorf("CCPoolStatus: settle prior runtime: %w", err)
 	}
-	if result.operationID != operation.ID || result.target.RuntimeBuild != health.RuntimeBuild ||
+	if result.operationID != operation.id || result.target.RuntimeBuild != health.RuntimeBuild ||
 		result.target.ProcessGeneration != processGeneration || result.processRecord == (proc.RecordDigest{}) ||
 		result.settlement != service.StopSettlementGone || result.digest == (service.StopReceiptDigest{}) {
-		return deployment.RuntimeProof{}, errors.New("CCPoolStatus: stop result does not match the observed runtime generation")
+		return runtimeProof{}, errors.New("CCPoolStatus: stop result does not match the observed runtime generation")
 	}
-	return deployment.RuntimeProof{
-		Role: operation.Role, ProcessGeneration: processGeneration,
-		Digest: h.proofDigest(
-			"runtime-quiesced", deployOperation, h.buildID, health.RuntimeBuild, health.ProcessGeneration,
-			hex.EncodeToString(result.processRecord[:]), hex.EncodeToString(result.digest[:]),
+	return runtimeProof{
+		absent: true, processGeneration: processGeneration,
+		digest: h.evidenceDigest(
+			"runtime-quiesced", operation.id, generation, operation.activation.plan.Digest(), h.buildID,
+			health.RuntimeBuild, health.ProcessGeneration, hex.EncodeToString(result.processRecord[:]),
+			hex.EncodeToString(result.digest[:]),
 		),
 	}, nil
 }
 
-func (h productHooks) postInstallProof(ctx context.Context, operation deployment.Operation) (deployment.Proof, error) {
-	return h.applicationProof(ctx, "post-install", operation)
-}
-
-func (h productHooks) priorAppRestoreProof(ctx context.Context, operation deployment.Operation) (deployment.Proof, error) {
-	return h.applicationProof(ctx, "prior-restored", operation)
-}
-
-func (h productHooks) applicationProof(
-	ctx context.Context,
-	kind string,
-	operation deployment.Operation,
-) (deployment.Proof, error) {
-	if err := h.verifyInstalled(operation); err != nil {
-		return deployment.Proof{}, fmt.Errorf("CCPoolStatus: verify installed runtime plan: %w", err)
-	}
-	if err := h.proveApp(ctx, operation.Generation.Path); err != nil {
-		return deployment.Proof{}, err
-	}
-	return deployment.Proof{
-		Role: operation.Role, PlanDigest: operation.PlanDigest,
-		Digest: h.proofDigest(kind, operation, fileProviderExtensionPath(operation.Generation.Path)),
-	}, nil
-}
-
-func (h productHooks) buildPlan(_ context.Context, operation deployment.Operation) (service.Plan, error) {
-	return h.servicePlan(operation)
-}
-
-func (h productHooks) readiness(
-	ctx context.Context,
-	operation deployment.Operation,
-	got service.Plan,
-) (deployment.Proof, error) {
-	buildID, err := exactPlanBuildID(operation, got)
+func (h productHooks) readiness(ctx context.Context, operation installedOperation) (runtimeReadiness, error) {
+	buildID, err := exactPlanBuildID(operation.generation, operation.plan)
 	if err != nil {
-		return deployment.Proof{}, err
+		return runtimeReadiness{}, err
 	}
-	want, err := h.servicePlanBuild(operation, buildID)
+	want, err := h.servicePlanForBuild(operation.generation, buildID)
 	if err != nil {
-		return deployment.Proof{}, err
+		return runtimeReadiness{}, err
 	}
-	if got.Digest() != want.Digest() || !reflect.DeepEqual(got.Agents(), want.Agents()) {
-		return deployment.Proof{}, errors.New("CCPoolStatus: readiness plan is not the exact helper plan")
+	if operation.plan.Digest() != want.Digest() || !reflect.DeepEqual(operation.plan.Agents(), want.Agents()) {
+		return runtimeReadiness{}, errors.New("CCPoolStatus: readiness plan is not the exact helper plan")
 	}
-	target, err := h.targetBuild(operation, buildID)
+	if err := h.proveApp(ctx, operation.generation.path); err != nil {
+		return runtimeReadiness{}, err
+	}
+	target, err := h.runtimeTargetForBuild(operation.generation, buildID)
 	if err != nil {
-		return deployment.Proof{}, err
+		return runtimeReadiness{}, err
 	}
 	readyCtx, cancel := context.WithTimeout(ctx, holderbridge.ReadinessContract().ObservationTimeout())
 	defer cancel()
@@ -212,10 +173,17 @@ func (h productHooks) readiness(
 		if observeErr == nil {
 			validateErr := validateRuntimeReadiness(target, health)
 			if validateErr == nil {
-				return deployment.Proof{Role: operation.Role, PlanDigest: operation.PlanDigest, Digest: h.proofDigest(
-					"runtime-ready", operation, got.Digest().String(), health.ProcessGeneration,
-					health.ActivationGeneration,
-				)}, nil
+				generation, parseErr := proc.ParseOwnerGeneration(health.ProcessGeneration)
+				if parseErr != nil {
+					return runtimeReadiness{}, fmt.Errorf("CCPoolStatus: parse ready runtime generation: %w", parseErr)
+				}
+				return runtimeReadiness{
+					runtimeBuild: health.RuntimeBuild, processGeneration: generation,
+					digest: h.evidenceDigest(
+						"runtime-ready", operation.id, operation.generation, operation.plan.Digest(),
+						health.ProcessGeneration, health.ActivationGeneration,
+					),
+				}, nil
 			}
 			lastErr = validateErr
 		} else {
@@ -223,8 +191,8 @@ func (h productHooks) readiness(
 		}
 		select {
 		case <-readyCtx.Done():
-			return deployment.Proof{}, fmt.Errorf(
-				"CCPoolStatus: wait for deployment readiness: %w",
+			return runtimeReadiness{}, fmt.Errorf(
+				"CCPoolStatus: wait for exact runtime readiness: %w",
 				errors.Join(readyCtx.Err(), lastErr),
 			)
 		case <-time.After(readinessPoll):
@@ -232,35 +200,24 @@ func (h productHooks) readiness(
 	}
 }
 
-func (h productHooks) planForBuild(operation deployment.Operation, buildID string) (holder.DeploymentPlan, error) {
-	return holderbridge.NewDeploymentPlan(operation.Generation.Path, pool.FuseKitRuntimeDir(), buildID)
+func (h productHooks) servicePlanForBuild(generation installedGeneration, buildID string) (service.Plan, error) {
+	return h.servicePlan(generation, buildID)
 }
 
-func (h productHooks) servicePlanForOperation(operation deployment.Operation) (service.Plan, error) {
-	return h.servicePlanBuild(operation, h.buildID)
-}
-
-func (h productHooks) servicePlanForBuild(operation deployment.Operation, buildID string) (service.Plan, error) {
-	plan, err := h.planForBuild(operation, buildID)
+func (h productHooks) defaultServicePlanForBuild(generation installedGeneration, buildID string) (service.Plan, error) {
+	plan, err := holderbridge.NewDeploymentPlan(generation.path, pool.FuseKitRuntimeDir(), buildID)
 	if err != nil {
 		return service.Plan{}, err
 	}
 	return service.NewPlan([]service.Agent{plan.Agent()})
 }
 
-func (h productHooks) runtimeTargetForOperation(operation deployment.Operation) (runtimeTarget, error) {
-	return h.targetBuild(operation, h.buildID)
+func (h productHooks) runtimeTargetForBuild(generation installedGeneration, buildID string) (runtimeTarget, error) {
+	return h.target(generation, buildID)
 }
 
-func (h productHooks) verifyInstalledRuntimePlan(operation deployment.Operation) error {
-	_, err := holderbridge.NewDeploymentPlan(
-		operation.Generation.Path, pool.FuseKitRuntimeDir(), h.buildID,
-	)
-	return err
-}
-
-func (h productHooks) runtimeTargetForBuild(operation deployment.Operation, buildID string) (runtimeTarget, error) {
-	plan, err := h.planForBuild(operation, buildID)
+func (h productHooks) defaultRuntimeTargetForBuild(generation installedGeneration, buildID string) (runtimeTarget, error) {
+	plan, err := holderbridge.NewDeploymentPlan(generation.path, pool.FuseKitRuntimeDir(), buildID)
 	if err != nil {
 		return runtimeTarget{}, err
 	}
@@ -269,14 +226,14 @@ func (h productHooks) runtimeTargetForBuild(operation deployment.Operation, buil
 	}, nil
 }
 
-func exactPlanBuildID(operation deployment.Operation, plan service.Plan) (string, error) {
+func exactPlanBuildID(generation installedGeneration, plan service.Plan) (string, error) {
 	agents := plan.Agents()
 	if len(agents) != 1 {
 		return "", errors.New("CCPoolStatus: readiness plan must contain exactly one helper agent")
 	}
 	agent := agents[0]
 	buildID := agent.Env["FUSEKIT_BUILD_ID"]
-	if agent.Program != holderExecutablePath(operation.Generation.Path) || buildID == "" {
+	if agent.Program != holderExecutablePath(generation.path) || buildID == "" {
 		return "", errors.New("CCPoolStatus: readiness plan does not target the exact helper generation")
 	}
 	return buildID, nil
@@ -284,10 +241,6 @@ func exactPlanBuildID(operation deployment.Operation, plan service.Plan) (string
 
 func holderExecutablePath(appPath string) string {
 	return filepath.Join(appPath, "Contents", "MacOS", holderbridge.ExecutableName)
-}
-
-func fileProviderExtensionPath(appPath string) string {
-	return filepath.Join(appPath, "Contents", "PlugIns", "CCPoolFileProvider.appex")
 }
 
 func observeRuntimeHealth(
@@ -328,16 +281,19 @@ func validateRuntimeReadiness(target runtimeTarget, health mountproto.RuntimeHea
 	return nil
 }
 
-func (h productHooks) proofDigest(kind string, operation deployment.Operation, details ...string) deployment.SHA256 {
+func (h productHooks) evidenceDigest(
+	kind, operationID string,
+	generation installedGeneration,
+	planDigest service.PlanDigest,
+	details ...string,
+) deployment.SHA256 {
 	digest := sha256.New()
-	values := make([]string, 0, 15+len(details))
+	values := make([]string, 0, 17+len(details))
 	values = append(values,
-		holderbridge.DeploymentProofIdentity, kind, operation.ID, string(operation.Role), operation.PlanDigest.String(),
-		operation.Generation.Path, operation.Generation.Release.Version,
-		operation.Generation.Release.URL, operation.Generation.Release.SHA256.String(),
-		operation.Generation.DesignatedRequirement, operation.Generation.CDHash,
-		operation.Generation.BundleDigest.String(), operation.Generation.Device, operation.Generation.Inode,
-		h.policyDigest.String(),
+		holderbridge.DeploymentEvidenceIdentity, kind, operationID, planDigest.String(),
+		generation.path, generation.version, generation.teamID, generation.signingIdentifier,
+		generation.designatedRequirement, generation.cdHash, generation.bundleDigest.String(),
+		generation.entitlementsDigest.String(), generation.device, generation.inode, h.policyDigest.String(),
 	)
 	values = append(values, details...)
 	for _, value := range values {

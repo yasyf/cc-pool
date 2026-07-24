@@ -15,7 +15,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/deployment"
 )
 
 const (
@@ -47,29 +46,18 @@ func (commandRunner) Output(ctx context.Context, name string, arguments ...strin
 	return output, nil
 }
 
-func release() (deployment.Release, error) {
+func statusAppVersion() (string, error) {
 	if version.StatusAppVersion == "" || strings.TrimSpace(version.StatusAppVersion) != version.StatusAppVersion {
-		return deployment.Release{}, errors.New("CCPoolStatus: release bundle version is not exact")
+		return "", errors.New("CCPoolStatus: release bundle version is not exact")
 	}
 	releasePrefix := "v" + version.StatusAppVersion
 	if version.Version != releasePrefix && !strings.HasPrefix(version.Version, releasePrefix+"-") {
-		return deployment.Release{}, fmt.Errorf(
+		return "", fmt.Errorf(
 			"CCPoolStatus: application version %q does not match release %q",
 			version.StatusAppVersion, version.Version,
 		)
 	}
-	digest, err := deployment.ParseSHA256(version.StatusAppSHA256)
-	if err != nil {
-		return deployment.Release{}, fmt.Errorf("CCPoolStatus: parse release digest: %w", err)
-	}
-	return deployment.Release{
-		Version: version.StatusAppVersion,
-		URL: fmt.Sprintf(
-			"https://github.com/yasyf/cc-pool/releases/download/%s/cc-pool-status-%s-darwin.zip",
-			version.Version, version.Version,
-		),
-		SHA256: digest,
-	}, nil
+	return version.StatusAppVersion, nil
 }
 
 func proveElection(ctx context.Context, appPath string, commands runner) error {

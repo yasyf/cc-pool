@@ -22,8 +22,8 @@ import (
 const (
 	consumerBuildDomain      = "cc-pool.deployment-callbacks.v1@sha256:"
 	deploymentPolicyIdentity = "cc-pool.deployment-callbacks.v1"
-	// DeploymentProofIdentity is the v1 product-proof digest domain.
-	DeploymentProofIdentity = "cc-pool.deployment-proof.v1"
+	// DeploymentEvidenceIdentity is the v1 product-evidence digest domain.
+	DeploymentEvidenceIdentity = "cc-pool.deployment-evidence.v1"
 	// DeploymentServiceLabel is the exact status app launch-agent label.
 	DeploymentServiceLabel = BundleID + ".fusekit"
 	// DeploymentElectionTimeout is the exact File Provider election deadline.
@@ -43,7 +43,7 @@ type deploymentPolicy struct {
 	Application  deploymentApplicationPolicy  `json:"application"`
 	FileProvider deploymentFileProviderPolicy `json:"file_provider"`
 	Protocols    deploymentProtocolPolicy     `json:"protocols"`
-	Proofs       deploymentProofPolicy        `json:"proofs"`
+	Activation   deploymentActivationPolicy   `json:"activation"`
 	Runtime      deploymentRuntimePolicy      `json:"runtime"`
 	Service      deploymentServicePolicy      `json:"service"`
 }
@@ -156,18 +156,15 @@ type deploymentServicePolicy struct {
 	Quiesce                        deploymentQuiescePolicy `json:"quiesce"`
 }
 
-type deploymentProofPolicy struct {
-	Identity                   string               `json:"identity"`
-	PostInstallRole            deployment.ProofRole `json:"post_install_role"`
-	CandidateReadyRole         deployment.ProofRole `json:"candidate_ready_role"`
-	PriorRestoreRole           deployment.ProofRole `json:"prior_restore_role"`
-	PriorReadyRole             deployment.ProofRole `json:"prior_ready_role"`
-	PriorRuntimeRole           deployment.ProofRole `json:"prior_runtime_role"`
-	RollbackRuntimeRole        deployment.ProofRole `json:"rollback_runtime_role"`
-	RequireReturnedRoleMatch   bool                 `json:"require_returned_role_match"`
-	RequireReadinessPlanDigest bool                 `json:"require_readiness_plan_digest"`
-	BindGenerationCDHash       bool                 `json:"bind_generation_cdhash"`
-	BindGenerationBundleDigest bool                 `json:"bind_generation_bundle_digest"`
+type deploymentActivationPolicy struct {
+	Identity                          string `json:"identity"`
+	RequireInstalledAttestation       bool   `json:"require_installed_attestation"`
+	RequireExactServicePlan           bool   `json:"require_exact_service_plan"`
+	RequireReadinessRuntimeBuild      bool   `json:"require_readiness_runtime_build"`
+	RequireReadinessProcessGeneration bool   `json:"require_readiness_process_generation"`
+	BindGenerationCDHash              bool   `json:"bind_generation_cdhash"`
+	BindGenerationBundleDigest        bool   `json:"bind_generation_bundle_digest"`
+	BindGenerationEntitlementsDigest  bool   `json:"bind_generation_entitlements_digest"`
 }
 
 type deploymentQuiescePolicy struct {
@@ -263,13 +260,11 @@ func deploymentPolicyJSON() ([]byte, error) {
 			MountProtocol: mountproto.Version, RuntimeProtocol: mountproto.RuntimeProtocolVersion,
 			WireProtocol: transportproto.Version, WireBuild: transportproto.WireBuild,
 		},
-		Proofs: deploymentProofPolicy{
-			Identity:        DeploymentProofIdentity,
-			PostInstallRole: deployment.ProofPostInstall, CandidateReadyRole: deployment.ProofCandidateReady,
-			PriorRestoreRole: deployment.ProofPriorRestore, PriorReadyRole: deployment.ProofPriorReady,
-			PriorRuntimeRole: deployment.ProofPriorRuntime, RollbackRuntimeRole: deployment.ProofRollbackRuntime,
-			RequireReturnedRoleMatch: true, RequireReadinessPlanDigest: true,
-			BindGenerationCDHash: true, BindGenerationBundleDigest: true,
+		Activation: deploymentActivationPolicy{
+			Identity: DeploymentEvidenceIdentity, RequireInstalledAttestation: true,
+			RequireExactServicePlan: true, RequireReadinessRuntimeBuild: true,
+			RequireReadinessProcessGeneration: true, BindGenerationCDHash: true,
+			BindGenerationBundleDigest: true, BindGenerationEntitlementsDigest: true,
 		},
 		Runtime: deploymentRuntimePolicy{
 			State: deploymentRuntimeStatePolicy{
