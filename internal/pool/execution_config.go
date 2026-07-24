@@ -114,6 +114,13 @@ func ValidateAccountConfigDir(instanceID, expectedPublicPath string) error {
 		return err
 	}
 	parent := filepath.Dir(linkPath)
+	stateDir := StateDir()
+	if filepath.Dir(parent) != stateDir {
+		return fmt.Errorf("%w: account config parent is outside the state directory", ErrAccountConfigLinkConflict)
+	}
+	if err := validateRealPrivateDirectory(stateDir); err != nil {
+		return fmt.Errorf("account state directory: %w", err)
+	}
 	if err := validateRealPrivateDirectory(parent); err != nil {
 		return fmt.Errorf("account config parent: %w", err)
 	}
@@ -133,6 +140,9 @@ func ValidateAccountConfigDir(instanceID, expectedPublicPath string) error {
 			"%w: %s targets %q, expected %q",
 			ErrAccountConfigLinkConflict, linkPath, current, expectedPublicPath,
 		)
+	}
+	if err := validatePublicPathUnderHome(expectedPublicPath); err != nil {
+		return err
 	}
 	if err := validateRealPrivateDirectory(expectedPublicPath); err != nil {
 		return fmt.Errorf("account public target: %w", err)
@@ -235,12 +245,38 @@ func validateRealPrivateDirectory(path string) error {
 	if err != nil {
 		return err
 	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 {
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 {
 		return errors.New("path must be a real private directory")
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || int(stat.Uid) != os.Geteuid() {
 		return errors.New("path has the wrong owner")
+	}
+	return nil
+}
+
+func validatePublicPathUnderHome(path string) error {
+	home, err := Home()
+	if err != nil {
+		return err
+	}
+	relative, err := filepath.Rel(home, path)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+		return fmt.Errorf("%w: account public target is outside the user home", ErrAccountConfigLinkConflict)
+	}
+	current := home
+	for _, component := range strings.Split(relative, string(os.PathSeparator)) {
+		if component == "" || component == "." || component == ".." {
+			return fmt.Errorf("%w: account public target is not exact", ErrAccountConfigLinkConflict)
+		}
+		current = filepath.Join(current, component)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: account public target crosses a non-directory or symlink", ErrAccountConfigLinkConflict)
+		}
 	}
 	return nil
 }
