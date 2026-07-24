@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -33,8 +34,15 @@ func (credentialCASTestTaskRunner) Run(ctx context.Context, task worker.CommandR
 	if len(task.Args) != 1 || task.Args[0] != casWorkerArgument {
 		return worker.CommandResult{}, errors.New("unexpected credential CAS test task")
 	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return worker.CommandResult{}, err
+	}
+	if len(task.Env) != 1 || task.Env[0] != "HOME="+home {
+		return worker.CommandResult{}, fmt.Errorf("credential CAS worker environment is not exact: %v", task.Env)
+	}
 	var output bytes.Buffer
-	err := RunCredentialCASWorker(ctx, bytes.NewReader(task.Stdin), &output)
+	err = RunCredentialCASWorker(ctx, bytes.NewReader(task.Stdin), &output)
 	return worker.CommandResult{Stdout: output.Bytes()}, err
 }
 
@@ -493,8 +501,9 @@ func newCredentialCASFixture(
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USER", "credential-cas-test")
-	t.Setenv("CLAUDE_POOL_SECURITY_BIN", writeCredentialCASFakeSecurity(t))
-	t.Setenv("CCP_CAS_KEYCHAIN_ITEM", filepath.Join(t.TempDir(), "keychain-item"))
+	itemPath := filepath.Join(t.TempDir(), "keychain-item")
+	t.Setenv("CCP_CAS_KEYCHAIN_ITEM", itemPath)
+	t.Setenv("CLAUDE_POOL_SECURITY_BIN", writeCredentialCASFakeSecurity(t, itemPath))
 	account := store.Account{
 		ID: 1, ConfigDir: testFileProviderConfigDir(1), KeychainService: creds.ServiceName(testFileProviderConfigDir(1)),
 		KeychainAccount: "credential-cas-test",
@@ -580,12 +589,10 @@ func assertCredentialCASLocksGone(t *testing.T, configDir string) {
 	}
 }
 
-func writeCredentialCASFakeSecurity(t *testing.T) string {
+func writeCredentialCASFakeSecurity(t *testing.T, itemPath string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "security")
-	script := `#!/bin/sh
-set -eu
-item="$CCP_CAS_KEYCHAIN_ITEM"
+	script := "#!/bin/sh\nset -eu\nitem=" + strconv.Quote(itemPath) + `
 command="$1"
 shift
 case "$command" in
@@ -608,9 +615,6 @@ case "$command" in
     printf '%s' "$hex" | xxd -r -p > "$item"
     ;;
   delete-generic-password)
-    if [ -n "${CCP_CAS_KEYCHAIN_DELETE_FAIL:-}" ] && [ -f "$CCP_CAS_KEYCHAIN_DELETE_FAIL" ]; then
-      exit 70
-    fi
     rm -f "$item"
     ;;
   *) exit 64 ;;

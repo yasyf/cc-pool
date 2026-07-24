@@ -45,8 +45,10 @@ var usernameRE = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 
 const fallbackAccount = "claude-code-user"
 
-const maxSecurityOutput = 1 << 20
-const keychainTaskTimeout = 30 * time.Second
+const (
+	maxSecurityOutput   = 1 << 20
+	keychainTaskTimeout = 30 * time.Second
+)
 
 type boundedBuffer struct {
 	bytes.Buffer
@@ -191,9 +193,13 @@ func runKeychainTask(
 	if runner == nil {
 		return errors.New("credential keychain worker runner is required")
 	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("resolve credential keychain home: %w", err)
+	}
 	result, err := runner.Run(ctx, worker.CommandRequest{
 		Path: securityExecutable(), Dir: workerexec.TempDir(), Args: args,
-		TotalTimeout: keychainTaskTimeout,
+		Env: []string{"HOME=" + home}, TotalTimeout: keychainTaskTimeout,
 	})
 	if stdout != nil {
 		_, _ = stdout.Write(result.Stdout)

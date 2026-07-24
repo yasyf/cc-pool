@@ -109,9 +109,13 @@ func (m *Manager) runCredentialCAS(
 		ctx, cancel = context.WithTimeout(ctx, credentialCASWorkerTimeout)
 		defer cancel()
 	}
+	home, err := Home()
+	if err != nil {
+		return credentialCASProof{}, fmt.Errorf("resolve credential CAS worker home: %w", err)
+	}
 	result, runErr := m.taskRunner.Run(ctx, worker.CommandRequest{
 		Path: m.workerExecutable, Dir: workerexec.TempDir(), Args: []string{casWorkerArgument},
-		Stdin: input.Bytes(), TotalTimeout: credentialCASWorkerTimeout,
+		Env: []string{"HOME=" + home}, Stdin: input.Bytes(), TotalTimeout: credentialCASWorkerTimeout,
 	})
 	if runErr != nil {
 		return credentialCASProof{}, fmt.Errorf("credential CAS worker: %w: %s", runErr, string(result.Stderr))
