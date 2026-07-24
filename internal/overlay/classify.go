@@ -65,17 +65,7 @@ var PrivatePatterns = []string{"*.lock"}
 //     Kept per-account so lock creation and removal target the same private source.
 //   - any case-sensitive PrivatePatterns glob match (e.g. *.lock).
 func PrivateEntry(name string) bool {
-	if ExcludedEntries[name] ||
-		name == ".claude.json" || strings.HasPrefix(name, ".claude.json.") ||
-		strings.HasPrefix(name, "settings.json.tmp.") ||
-		name == ".credentials.json" || strings.HasPrefix(name, ".credentials.json.") ||
-		strings.HasPrefix(name, ".last-update-result") ||
-		name == "remote-settings.json" || strings.HasPrefix(name, "remote-settings.json.") ||
-		name == "mcp-needs-auth-cache.json" || strings.HasPrefix(name, "mcp-needs-auth-cache.json.") ||
-		name == "stats-cache.json" || strings.HasPrefix(name, "stats-cache.json.") ||
-		name == "policy-limits.json" || strings.HasPrefix(name, "policy-limits.json.") ||
-		strings.HasPrefix(name, ".storage-write.lock") ||
-		strings.HasPrefix(name, ".oauth_refresh.lock") {
+	if ExcludedEntries[name] || hasPrefix(name, PrivateSourcePrefixes, false) {
 		return true
 	}
 	for _, p := range PrivatePatterns {
@@ -106,12 +96,12 @@ func SharedTopLevel(name string) bool {
 	return true
 }
 
-// PrivatePrefixes are top-level name prefixes routed to the per-account source,
+// PrivateSourcePrefixes are top-level name prefixes routed to the per-account source,
 // matched by HasPrefix so each covers its exact name and every atomic-write temp/lock sibling
 // — keeping claude's tmp→rename commit (.claude.json.tmp.XXXX → .claude.json) on
 // one filesystem. MUST stay in sync with PrivateEntry's file-family arms: together
 // they are the one private-name policy.
-var PrivatePrefixes = []string{
+var PrivateSourcePrefixes = []string{
 	".claude.json",
 	"settings.json.tmp.",
 	".credentials.json",
@@ -124,8 +114,30 @@ var PrivatePrefixes = []string{
 	".oauth_refresh.lock",
 }
 
+// PrivateStagingPrefixes are the exact top-level atomic-write families that
+// File Provider creates outside the public namespace until promotion.
+var PrivateStagingPrefixes = []string{
+	".claude.json.tmp.",
+	"settings.json.tmp.",
+	".credentials.json.tmp.",
+	".last-update-result.json.tmp.",
+	"remote-settings.json.tmp.",
+	"mcp-needs-auth-cache.json.tmp.",
+	"stats-cache.json.tmp.",
+	"policy-limits.json.tmp.",
+}
+
+// PrivateLockPrefixes are private source locks, never File Provider staging.
+var PrivateLockPrefixes = []string{".storage-write.lock", ".oauth_refresh.lock"}
+
+// PrivateStagingEntry reports whether a top-level name belongs to an exact
+// atomic-write staging family. Matching folds ASCII letters only.
+func PrivateStagingEntry(name string) bool {
+	return hasPrefix(name, PrivateStagingPrefixes, true)
+}
+
 // carveOutPrivate bars a name from shared projection beyond PrivateEntry:
-// bare PrivatePrefixes matches, case
+// bare PrivateSourcePrefixes matches, case
 // variants (the default APFS base is case-insensitive, so ".Credentials.json" IS
 // the live credential file), and case-insensitive PrivatePatterns matches (so
 // SESSION.LOCK never crosses tenants). Barring is always safe: an uncertain name
@@ -135,10 +147,8 @@ func carveOutPrivate(name string) bool {
 	if ExcludedEntries[lower] {
 		return true
 	}
-	for _, p := range PrivatePrefixes {
-		if len(name) >= len(p) && strings.EqualFold(name[:len(p)], p) {
-			return true
-		}
+	if hasPrefix(name, PrivateSourcePrefixes, true) {
+		return true
 	}
 	for _, p := range PrivatePatterns {
 		if ok, _ := path.Match(p, lower); ok {
@@ -146,4 +156,33 @@ func carveOutPrivate(name string) bool {
 		}
 	}
 	return false
+}
+
+func hasPrefix(value string, prefixes []string, foldASCII bool) bool {
+	for _, prefix := range prefixes {
+		if (!foldASCII && strings.HasPrefix(value, prefix)) ||
+			(foldASCII && hasASCIIFoldPrefix(value, prefix)) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasASCIIFoldPrefix(value, prefix string) bool {
+	if len(value) < len(prefix) {
+		return false
+	}
+	for index := range len(prefix) {
+		left, right := value[index], prefix[index]
+		if left >= 'A' && left <= 'Z' {
+			left += 'a' - 'A'
+		}
+		if right >= 'A' && right <= 'Z' {
+			right += 'a' - 'A'
+		}
+		if left != right {
+			return false
+		}
+	}
+	return true
 }

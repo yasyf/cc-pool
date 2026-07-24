@@ -2,6 +2,8 @@ package overlay
 
 import (
 	"path"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -98,5 +100,38 @@ func TestCacheFileClassification(t *testing.T) {
 				t.Errorf("SharedTopLevel(%q) = %v, want %v", tc.name, got, tc.wantShared)
 			}
 		})
+	}
+}
+
+func TestPrivateStagingFamiliesAreExactTopLevelAtomicTemporaryPrefixes(t *testing.T) {
+	want := []string{
+		".claude.json.tmp.",
+		"settings.json.tmp.",
+		".credentials.json.tmp.",
+		".last-update-result.json.tmp.",
+		"remote-settings.json.tmp.",
+		"mcp-needs-auth-cache.json.tmp.",
+		"stats-cache.json.tmp.",
+		"policy-limits.json.tmp.",
+	}
+	if !slices.Equal(PrivateStagingPrefixes, want) {
+		t.Fatalf("PrivateStagingPrefixes = %v, want %v", PrivateStagingPrefixes, want)
+	}
+	for _, prefix := range want {
+		if !PrivateStagingEntry(prefix+"A1B2") || !PrivateStagingEntry(strings.ToUpper(prefix)+"A1B2") {
+			t.Errorf("private staging prefix %q did not match exact ASCII case-insensitive family", prefix)
+		}
+		if PrivateStagingEntry(strings.TrimSuffix(prefix, ".")) {
+			t.Errorf("private staging prefix %q matched without the terminal separator", prefix)
+		}
+	}
+	for _, name := range []string{
+		".claude.json", "settings.json", ".credentials.json", ".last-update-result.json",
+		"remote-settings.json", "mcp-needs-auth-cache.json", "stats-cache.json", "policy-limits.json",
+		".storage-write.lock", ".oauth_refresh.lock",
+	} {
+		if PrivateStagingEntry(name) {
+			t.Errorf("PrivateStagingEntry(%q) = true, want namespace or lock", name)
+		}
 	}
 }
