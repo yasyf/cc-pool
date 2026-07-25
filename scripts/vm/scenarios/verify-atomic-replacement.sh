@@ -13,7 +13,7 @@ catalog_tests="$(acceptance_stage_test_binary github.com/yasyf/fusekit/catalog f
 sourceauthority_tests="$(acceptance_stage_test_binary github.com/yasyf/fusekit/sourceauthority fusekit-replacement-source-tests)"
 log_start="$(vm_ssh date -u '+%Y-%m-%d %H:%M:%S')" || die "could not timestamp replacement log window"
 
-# FuseKit v1.13.3 splits catalog commit atomicity from source locator reconciliation.
+# FuseKit v1.14.0 splits catalog commit atomicity from source locator reconciliation.
 vm_phase replacement-transaction
 acceptance_run_tests \
   "$catalog_tests" \

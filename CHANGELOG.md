@@ -37,7 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The signed `CCPoolStatus.app` embeds the FuseKit runtime and installs from the
   same Homebrew formula at `~/Applications/CCPoolStatus.app`; there is no
   standalone holder or cask.
-- The final runtime stack pins daemonkit `v0.17.4` and FuseKit `v1.13.3`
+- The final runtime stack pins daemonkit `v0.18.0` and FuseKit `v1.14.0`
   exactly in both Go and Swift.
 
 ### Fixed

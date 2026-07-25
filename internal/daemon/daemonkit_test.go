@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/worker"
 )
 
@@ -30,7 +31,7 @@ func activatedDaemonTestWorkers(t *testing.T, capacity int) *worker.Pool {
 	if err != nil {
 		t.Fatal(err)
 	}
-	claim, err := workers.ClaimRuntime()
+	claim, err := workers.ClaimRuntime(trust.VerifierWorkerBudgets())
 	if err != nil {
 		t.Fatal(err)
 	}
