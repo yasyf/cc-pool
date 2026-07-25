@@ -37,6 +37,7 @@ const (
 	//nolint:gosec // G101 cannot distinguish the pinned commit from a secret.
 	releaseAppWorkflowCommit        = "83ee384b1d4fe25a8e4aa7258bb76d55e1593735"
 	releaseActionCommit             = "19c3d5013032ad9c88f9a8f1170d1f366c19b8d9"
+	releaseVerifyTagActionCommit    = "a4179241558456339fa2e41b97693a6cebae2e36"
 	releaseStageDraftActionCommit   = "e4c3108e693681df1a3c666bae80e890bc44cf3e"
 	releasePublishDraftActionCommit = "54e3e194bda69896894a82c17fcdb2822beefab5"
 	releasePublishCommit            = "9525763796fce4d1042cf3393d9479f791908eaa"
@@ -200,6 +201,10 @@ func TestReleaseTapUsesExactVerifiedPublishedBytes(t *testing.T) {
 	}
 	for _, line := range strings.Split(release, "\n") {
 		switch {
+		case strings.Contains(line, "actions/verify-tag-on-main@"):
+			if !strings.Contains(line, "@"+releaseVerifyTagActionCommit) {
+				t.Fatalf("release uses a mixed or mutable tag-verification action reference: %s", line)
+			}
 		case strings.Contains(line, "yasyf/homebrew-tap/.github/workflows/release-app.yml@"):
 			if !strings.Contains(line, "@"+releaseAppWorkflowCommit) {
 				t.Fatalf("release-app uses a mixed or mutable workflow reference: %s", line)
