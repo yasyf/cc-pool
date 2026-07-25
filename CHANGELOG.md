@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.64.7] - 2026-07-24
+
+### Fixed
+- Homebrew publication now verifies the exact installed CLI and signed
+  application without attempting GUI runtime activation on a headless release
+  runner. Live helper activation and FuseKit readiness remain mandatory at the
+  GUI fleet cutover.
+
 ## [0.64.6] - 2026-07-24
 
 ### Fixed

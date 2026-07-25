@@ -419,22 +419,13 @@ jobs:
 
           target="$HOME/Applications"/CCPoolStatus.app
           test ! -e "$target"
-          cleanup() {
-            if [ -e "$target" ]; then
-              "$prefix/bin/ccp" package uninstall || true
-            fi
-          }
-          trap cleanup EXIT
-          install_output="$("$prefix/bin/ccp" package install)"
-          test "$install_output" = "installed: CCPoolStatus package"
-          test -d "$target"
-          codesign --verify --deep --strict --verbose=2 "$target"
-          xcrun stapler validate "$target"
-          spctl --assess --type execute --verbose=4 "$target"
-          uninstall_output="$("$prefix/bin/ccp" package uninstall)"
-          test "$uninstall_output" = "uninstalled: CCPoolStatus package"
+          installed_app="$prefix/libexec/CCPoolStatus.app"
+          APP_PATH="$installed_app" TEAM_ID=SXKCTF23Q2 APP_GROUP=SXKCTF23Q2.ccp \
+            bash "$GITHUB_WORKSPACE/scripts/assert-signed-topology.sh"
+          codesign --verify --deep --strict --verbose=2 "$installed_app"
+          xcrun stapler validate "$installed_app"
+          spctl --assess --type execute --verbose=4 "$installed_app"
           test ! -e "$target"
-          trap - EXIT
 
       - name: Publish the CLI formula to the tap
         uses: yasyf/homebrew-tap/.github/actions/publish@9525763796fce4d1042cf3393d9479f791908eaa
