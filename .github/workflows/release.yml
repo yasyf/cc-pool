@@ -417,7 +417,7 @@ jobs:
           grep -Fq "$GITHUB_REF_NAME" <<< "$version"
           brew test "$audit_tap/cc-pool"
 
-          target="$HOME/Applications/CCPoolStatus.app"
+          target="$HOME/Applications"/CCPoolStatus.app
           test ! -e "$target"
           cleanup() {
             if [ -e "$target" ]; then
