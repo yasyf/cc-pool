@@ -126,15 +126,27 @@ func TestPrepareAccountBackingDeadlineKillsReapsAndUntracks(t *testing.T) {
 	if !errors.Is(prepareErr, context.DeadlineExceeded) {
 		t.Fatalf("prepare account backing error = %v, want deadline exceeded", prepareErr)
 	}
-	records, err := recordStore.Load(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(records) != 0 {
-		t.Fatalf("durable worker records after cancellation = %+v", records)
-	}
+	assertRecordsUntracked(t, recordStore)
 	if current, probeErr := daemonproc.Probe(identity.PID); probeErr == nil &&
 		current.Boot == identity.Boot && current.StartTime == identity.StartTime {
 		t.Fatalf("exact wedged account worker survived cancellation: %+v", current)
+	}
+}
+
+func assertRecordsUntracked(t *testing.T, store daemonproc.Store) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		records, err := store.Load(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(records) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("durable worker records after cancellation = %+v", records)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

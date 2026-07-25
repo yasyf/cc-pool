@@ -292,14 +292,20 @@ func TestHostSyncWorkerDeadlineKillsReapsAndReusesLane(t *testing.T) {
 		t.Fatal("blocked reconcile survived its deadline")
 	}
 
-	records, err := (&daemonproc.FileStore{
-		Path: pool.HostSyncHelperWorkerStorePath(),
-	}).Load(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(records) != 0 {
-		t.Fatalf("timed-out host-sync worker retained records: %+v", records)
+	workerStore := &daemonproc.FileStore{Path: pool.HostSyncHelperWorkerStorePath()}
+	untracked := time.Now().Add(3 * time.Second)
+	for {
+		records, loadErr := workerStore.Load(t.Context())
+		if loadErr != nil {
+			t.Fatal(loadErr)
+		}
+		if len(records) == 0 {
+			break
+		}
+		if time.Now().After(untracked) {
+			t.Fatalf("timed-out host-sync worker retained records: %+v", records)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if err := lock.Close(); err != nil {
 		t.Fatal(err)

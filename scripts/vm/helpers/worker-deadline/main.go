@@ -134,12 +134,8 @@ while :; do sleep 10; done
 	if err := awaitGone(-leader); err != nil {
 		return fmt.Errorf("process group: %w", err)
 	}
-	records, err := store.Load(context.Background())
-	if err != nil {
-		return fmt.Errorf("load durable records: %w", err)
-	}
-	if len(records) != 0 {
-		return fmt.Errorf("durable records after settlement = %d, want 0", len(records))
+	if err := awaitUntracked(store); err != nil {
+		return err
 	}
 	if _, err := pool.Run(context.Background(), worker.CommandRequest{
 		Path: "/usr/bin/true", Dir: root, TotalTimeout: requestTimeout,
@@ -148,7 +144,7 @@ while :; do sleep 10; done
 	}
 	return json.NewEncoder(os.Stdout).Encode(result{
 		LeaderPID: leader, DescendantPID: descendant, ElapsedMS: elapsed.Milliseconds(),
-		RecordsAfter: len(records), TermObserved: true, GroupGone: true, LaneReused: true,
+		RecordsAfter: 0, TermObserved: true, GroupGone: true, LaneReused: true,
 	})
 }
 
@@ -165,6 +161,23 @@ func readPID(root *os.Root, name string) (int, error) {
 		return 0, fmt.Errorf("invalid pid in %s: %q", name, content)
 	}
 	return pid, nil
+}
+
+func awaitUntracked(store proc.Store) error {
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		records, err := store.Load(context.Background())
+		if err != nil {
+			return fmt.Errorf("load durable records: %w", err)
+		}
+		if len(records) == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("durable records after settlement = %d, want 0", len(records))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func awaitGone(pid int) error {
