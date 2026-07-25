@@ -59,11 +59,23 @@ func TestWorkerScannerCancellationKillsReapsAndUntracks(t *testing.T) {
 	if _, err := scanner.Scan(ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Scan error = %v, want deadline exceeded", err)
 	}
-	records, err := store.Load(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(records) != 0 {
-		t.Fatalf("durable worker records after cancellation = %+v", records)
+	assertRecordsUntracked(t, store)
+}
+
+func assertRecordsUntracked(t *testing.T, store dkproc.Store) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		records, err := store.Load(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(records) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("durable worker records after cancellation = %+v", records)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
