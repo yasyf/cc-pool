@@ -112,8 +112,8 @@ github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e h1:JVG44RsyaB9T2KIHavM
 github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e/go.mod h1:RbqR21r5mrJuqunuUZ/Dhy/avygyECGrLceyNeo4LiM=
 github.com/yasyf/daemonkit v0.19.1 h1:oluQyXlsyafo52IPjdQPhZjo2dNOdccKk+4o8itFvCc=
 github.com/yasyf/daemonkit v0.19.1/go.mod h1:5tYeENawEKN1GpM12YXTqIZ1fbWv7bj9P4TyIcSZ24Q=
-github.com/yasyf/fusekit v1.15.1 h1:huxtpUaronxJ44rQPVYKBPk6D0iM1Vxz4+wvGObU96U=
-github.com/yasyf/fusekit v1.15.1/go.mod h1:rjfn3j+dSjnqMOtsFeklRicc7/Z2TG2uazRV2lNG60U=
+github.com/yasyf/fusekit v1.15.2 h1:ytg2LGUrf4VOzFNL94MQ+4HBniFD9Pcrdnq7SHsyq0c=
+github.com/yasyf/fusekit v1.15.2/go.mod h1:rjfn3j+dSjnqMOtsFeklRicc7/Z2TG2uazRV2lNG60U=
 github.com/yasyf/synckit v0.35.2 h1:a1ND3ea+j3aADlJjCUetTeMO8LuJCggkGVWc2EU37g8=
 github.com/yasyf/synckit v0.35.2/go.mod h1:0EJTaW9Ldz/0kkqykXWgZvAYXdOAZEth/gFACME3Ixs=
 go.etcd.io/bbolt v1.5.0 h1:S7GAl7Fxv12yohbwFfIbQCGDWbQbtDGPET4P/bD4lxU=

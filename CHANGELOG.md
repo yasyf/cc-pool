@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   application without attempting GUI runtime activation on a headless release
   runner. Live helper activation and FuseKit readiness remain mandatory at the
   GUI fleet cutover.
+- Signed FUSE-T libraries with no entitlements now use FuseKit's canonical
+  empty entitlement attestation instead of failing helper activation.
 
 ## [0.64.6] - 2026-07-24
 
@@ -610,7 +612,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   picked automatically when fuse-t is present); CI and release workflows.
 - License: PolyForm Noncommercial 1.0.0.
 
-[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.64.6...HEAD
+[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.64.7...HEAD
+[0.64.7]: https://github.com/yasyf/cc-pool/compare/v0.64.6...v0.64.7
 [0.64.6]: https://github.com/yasyf/cc-pool/compare/v0.64.5...v0.64.6
 [0.64.5]: https://github.com/yasyf/cc-pool/compare/v0.64.4...v0.64.5
 [0.64.4]: https://github.com/yasyf/cc-pool/compare/v0.64.3...v0.64.4
