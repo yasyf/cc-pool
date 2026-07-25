@@ -44,6 +44,14 @@ test "$(grep -Fxc '          audit_tap=cc-pool/release-audit' "$workflow")" = 1
 test "$(grep -Fxc "          brew audit --strict --formula \"\$audit_tap/cc-pool\"" "$workflow")" = 1
 test "$(grep -Fxc "          HOMEBREW_NO_AUTO_UPDATE=1 brew install --formula \"\$audit_tap/cc-pool\"" "$workflow")" = 1
 test "$(grep -Fxc "          brew test \"\$audit_tap/cc-pool\"" "$workflow")" = 1
+test "$(grep -Fxc '          test ! -e "$target"' "$workflow")" = 2
+test "$(grep -Fxc '          install_output="$("$prefix/bin/ccp" package install)"' "$workflow")" = 1
+test "$(grep -Fxc '          test "$install_output" = "installed: CCPoolStatus package"' "$workflow")" = 1
+test "$(grep -Fxc '          codesign --verify --deep --strict --verbose=2 "$target"' "$workflow")" = 1
+test "$(grep -Fxc '          xcrun stapler validate "$target"' "$workflow")" = 1
+test "$(grep -Fxc '          spctl --assess --type execute --verbose=4 "$target"' "$workflow")" = 1
+test "$(grep -Fxc '          uninstall_output="$("$prefix/bin/ccp" package uninstall)"' "$workflow")" = 1
+test "$(grep -Fxc '          test "$uninstall_output" = "uninstalled: CCPoolStatus package"' "$workflow")" = 1
 
 line() { grep -Fn "$1" "$workflow" | cut -d: -f1; }
 stage="$(line 'name: Stage and verify the complete draft release')"

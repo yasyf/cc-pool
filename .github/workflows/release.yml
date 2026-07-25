@@ -417,6 +417,25 @@ jobs:
           grep -Fq "$GITHUB_REF_NAME" <<< "$version"
           brew test "$audit_tap/cc-pool"
 
+          target="$HOME/Applications/CCPoolStatus.app"
+          test ! -e "$target"
+          cleanup() {
+            if [ -e "$target" ]; then
+              "$prefix/bin/ccp" package uninstall || true
+            fi
+          }
+          trap cleanup EXIT
+          install_output="$("$prefix/bin/ccp" package install)"
+          test "$install_output" = "installed: CCPoolStatus package"
+          test -d "$target"
+          codesign --verify --deep --strict --verbose=2 "$target"
+          xcrun stapler validate "$target"
+          spctl --assess --type execute --verbose=4 "$target"
+          uninstall_output="$("$prefix/bin/ccp" package uninstall)"
+          test "$uninstall_output" = "uninstalled: CCPoolStatus package"
+          test ! -e "$target"
+          trap - EXIT
+
       - name: Publish the CLI formula to the tap
         uses: yasyf/homebrew-tap/.github/actions/publish@9525763796fce4d1042cf3393d9479f791908eaa
         with:
