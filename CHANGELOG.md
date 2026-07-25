@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Release preflight now rejects lightweight, unsigned, or unverified tags
   before building or publishing any artifact.
+- Signed-helper entitlement attestation now uses daemonkit's canonical plist
+  digest through FuseKit `v1.15.1`, eliminating representation-dependent
+  mismatches during a clean package install.
+- Daemon and worker shutdown now uses daemonkit `v0.19.1` terminal runtime
+  claims so failed owners settle and reaping completes before replacement.
+- Fleet synchronization now pins synckit `v0.35.2`, keeping its daemonkit
+  runtime dependency explicit across the hard-cut release line.
 
 ## [0.64.5] - 2026-07-24
 

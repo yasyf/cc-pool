@@ -13,10 +13,10 @@ options:
 packages:
   FuseKit:
     url: https://github.com/yasyf/fusekit.git
-    exactVersion: 1.15.0
+    exactVersion: 1.15.1
   DaemonKit:
     url: https://github.com/yasyf/daemonkit.git
-    exactVersion: 0.18.0
+    exactVersion: 0.19.1
 
 # release-app.yml writes a per-build Version.xcconfig before `xcodegen generate`;
 # keep MARKETING_VERSION/CURRENT_PROJECT_VERSION out of `settings:` so it wins.
