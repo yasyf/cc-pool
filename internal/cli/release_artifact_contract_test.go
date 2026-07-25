@@ -35,7 +35,7 @@ func TestPureGoCLIDoesNotEmbedSwiftOwnedContainerIdentity(t *testing.T) {
 const (
 	// releaseAppWorkflowCommit is an immutable Git commit, not a credential.
 	//nolint:gosec // G101 cannot distinguish the pinned commit from a secret.
-	releaseAppWorkflowCommit        = "83ee384b1d4fe25a8e4aa7258bb76d55e1593735"
+	releaseAppWorkflowCommit        = "7cc8a6c981cbec10fcb7f19bd75b36e9ee65ea7e"
 	releaseActionCommit             = "19c3d5013032ad9c88f9a8f1170d1f366c19b8d9"
 	releaseVerifyTagActionCommit    = "a4179241558456339fa2e41b97693a6cebae2e36"
 	releaseStageDraftActionCommit   = "e4c3108e693681df1a3c666bae80e890bc44cf3e"
