@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/worker"
 )
 
@@ -59,7 +60,7 @@ func run() (resultErr error) {
 	if err != nil {
 		return err
 	}
-	claim, err := pool.ClaimRuntime()
+	claim, err := pool.ClaimRuntime(trust.VerifierWorkerBudgets())
 	if err != nil {
 		return fmt.Errorf("claim worker runtime: %w", err)
 	}

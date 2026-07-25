@@ -9,6 +9,7 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/worker"
 )
 
@@ -51,7 +52,7 @@ func newWorkerRuntimeAt(
 	workers := runtime.pool
 	workerReaper := runtime.reaper
 	if activate {
-		claim, claimErr := workers.ClaimRuntime()
+		claim, claimErr := workers.ClaimRuntime(trust.VerifierWorkerBudgets())
 		if claimErr != nil {
 			return nil, nil, claimErr
 		}

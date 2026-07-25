@@ -131,9 +131,12 @@ func startCLITestSyncHelper(t *testing.T, socket string, consumer syncservice.Sy
 	dispatcher := rpc.NewDispatcher()
 	syncservice.RegisterConsumer(dispatcher, consumer)
 	runtime, err := helperruntime.New(helperruntime.Config{
-		App:    helperruntime.App{Name: hostsync.SyncServiceID, RuntimeBuild: "cli-test"},
-		Socket: socket, Server: rpc.NewServer(dispatcher), Workers: workers, Children: children,
-		StopStore: &proc.FileStore{Path: filepath.Join(t.TempDir(), "stop-v1.db")},
+		App:        helperruntime.App{Name: hostsync.SyncServiceID, RuntimeBuild: "cli-test"},
+		Socket:     socket,
+		Dispatcher: dispatcher,
+		Workers:    workers,
+		Children:   children,
+		StopStore:  &proc.FileStore{Path: filepath.Join(t.TempDir(), "stop-v1.db")},
 		Prepare: func(dkdaemon.Activation) (helperruntime.Product, error) {
 			return cliTestSyncProduct{}, nil
 		},

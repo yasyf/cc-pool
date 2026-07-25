@@ -15,7 +15,7 @@ catalog_tests="$(acceptance_stage_test_binary github.com/yasyf/fusekit/catalog f
 tenant_tests="$(acceptance_stage_test_binary github.com/yasyf/fusekit/tenant fusekit-tenant-tests)"
 log_start="$(vm_ssh date -u '+%Y-%m-%d %H:%M:%S')" || die "could not timestamp convergence log window"
 
-# FuseKit v1.13.3 proves targeting, delivery, and on-demand catch-up in their owning packages.
+# FuseKit v1.14.0 proves targeting, delivery, and on-demand catch-up in their owning packages.
 vm_phase convergence-fleet
 acceptance_run_tests \
   "$catalog_tests" \

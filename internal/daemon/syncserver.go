@@ -70,9 +70,12 @@ func newSyncHelperRuntime(
 	dispatcher := rpc.NewDispatcher()
 	syncservice.RegisterConsumer(dispatcher, consumer)
 	return helperruntime.New(helperruntime.Config{
-		App:    helperruntime.App{Name: hostsync.SyncServiceID, RuntimeBuild: version.String()},
-		Socket: socket, Server: rpc.NewServer(dispatcher), Workers: workers, Children: children,
-		StopStore: stopStore,
+		App:        helperruntime.App{Name: hostsync.SyncServiceID, RuntimeBuild: version.String()},
+		Socket:     socket,
+		Dispatcher: dispatcher,
+		Workers:    workers,
+		Children:   children,
+		StopStore:  stopStore,
 		Prepare: func(dkdaemon.Activation) (helperruntime.Product, error) {
 			return syncHelperProduct{}, nil
 		},
