@@ -2,6 +2,7 @@
 set -euo pipefail
 
 workflow=.github/workflows/release.yml
+tag_pin=6ff6d7538aa743581185054c46627a9a644ba695
 stage_pin=e4c3108e693681df1a3c666bae80e890bc44cf3e
 draft_pin=54e3e194bda69896894a82c17fcdb2822beefab5
 tap_pin=9525763796fce4d1042cf3393d9479f791908eaa
@@ -10,6 +11,7 @@ if grep -Eq 'yasyf/homebrew-tap/.+@(main|v[0-9]+|swift-v[0-9]+)' "$workflow"; th
   echo "homebrew-tap release actions must use an exact commit" >&2
   exit 1
 fi
+test "$(grep -Ec "actions/verify-tag-on-main@${tag_pin}$" "$workflow")" = 1
 test "$(grep -Ec "actions/stage-draft-release@${stage_pin}$" "$workflow")" = 1
 test "$(grep -Ec "actions/publish-draft-release@${draft_pin}$" "$workflow")" = 1
 test "$(grep -Ec "actions/publish@${tap_pin}$" "$workflow")" = 1

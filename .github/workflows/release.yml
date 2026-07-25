@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: yasyf/homebrew-tap/.github/actions/verify-tag-on-main@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9
+      - uses: yasyf/homebrew-tap/.github/actions/verify-tag-on-main@6ff6d7538aa743581185054c46627a9a644ba695
 
   version:
     runs-on: ubuntu-latest

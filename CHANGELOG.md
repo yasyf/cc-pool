@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.64.6] - 2026-07-24
+
+### Fixed
+- Release preflight now rejects lightweight, unsigned, or unverified tags
+  before building or publishing any artifact.
+
 ## [0.64.5] - 2026-07-24
 
 ### Fixed
@@ -589,7 +595,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   picked automatically when fuse-t is present); CI and release workflows.
 - License: PolyForm Noncommercial 1.0.0.
 
-[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.64.5...HEAD
+[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.64.6...HEAD
+[0.64.6]: https://github.com/yasyf/cc-pool/compare/v0.64.5...v0.64.6
 [0.64.5]: https://github.com/yasyf/cc-pool/compare/v0.64.4...v0.64.5
 [0.64.4]: https://github.com/yasyf/cc-pool/compare/v0.64.3...v0.64.4
 [0.64.3]: https://github.com/yasyf/cc-pool/compare/v0.64.2...v0.64.3
