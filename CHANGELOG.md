@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.64.5] - 2026-07-24
+
+### Fixed
+- Clean installations now derive the canonical signed-helper service policy
+  from the packaged application before the fixed user application target
+  exists. Release publication proves the real absent-target package install,
+  runtime readiness, signature, notarization, and uninstall path.
+
 ## [0.64.4] - 2026-07-24
 
 ### Fixed
@@ -581,7 +589,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   picked automatically when fuse-t is present); CI and release workflows.
 - License: PolyForm Noncommercial 1.0.0.
 
-[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.64.4...HEAD
+[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.64.5...HEAD
+[0.64.5]: https://github.com/yasyf/cc-pool/compare/v0.64.4...v0.64.5
 [0.64.4]: https://github.com/yasyf/cc-pool/compare/v0.64.3...v0.64.4
 [0.64.3]: https://github.com/yasyf/cc-pool/compare/v0.64.2...v0.64.3
 [0.64.2]: https://github.com/yasyf/cc-pool/compare/v0.64.1...v0.64.2

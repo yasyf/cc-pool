@@ -172,10 +172,10 @@ func testServicePlan(generation installedGeneration, buildID string) (service.Pl
 func installTestBuilders(hooks *productHooks) {
 	hooks.servicePlan = testServicePlan
 	hooks.candidatePlan = func(
-		generation installedGeneration,
+		targetAppPath string,
 		buildID, sourcePath string,
 	) (deployment.CandidatePlan, error) {
-		plan, err := testServicePlan(generation, buildID)
+		plan, err := testServicePlan(installedGeneration{path: targetAppPath}, buildID)
 		if err != nil {
 			return deployment.CandidatePlan{}, err
 		}

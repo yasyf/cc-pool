@@ -29,7 +29,7 @@ type productHooks struct {
 	buildID       string
 	policyDigest  deployment.SHA256
 	servicePlan   func(installedGeneration, string) (service.Plan, error)
-	candidatePlan func(installedGeneration, string, string) (deployment.CandidatePlan, error)
+	candidatePlan func(string, string, string) (deployment.CandidatePlan, error)
 	target        func(installedGeneration, string) (runtimeTarget, error)
 	observe       func(context.Context, string) (holder.LocalRuntimeReadiness, error)
 	identities    func(string) ([]proc.Identity, error)
@@ -207,21 +207,20 @@ func (h productHooks) defaultServicePlanForBuild(generation installedGeneration,
 }
 
 func (h productHooks) candidatePlanForBuild(
-	generation installedGeneration,
+	targetAppPath string,
 	buildID, sourceAppPath string,
 ) (deployment.CandidatePlan, error) {
-	return h.candidatePlan(generation, buildID, sourceAppPath)
+	return h.candidatePlan(targetAppPath, buildID, sourceAppPath)
 }
 
 func (h productHooks) defaultCandidatePlanForBuild(
-	generation installedGeneration,
+	targetAppPath string,
 	buildID, sourceAppPath string,
 ) (deployment.CandidatePlan, error) {
-	plan, err := holderbridge.NewDeploymentPlan(generation.path, pool.FuseKitRuntimeDir(), buildID)
-	if err != nil {
-		return deployment.CandidatePlan{}, err
-	}
-	return plan.CandidatePlan(sourceAppPath)
+	return holder.NewCandidatePlan(
+		holderbridge.DeploymentPlanSpec(targetAppPath, pool.FuseKitRuntimeDir(), buildID),
+		sourceAppPath,
+	)
 }
 
 func (h productHooks) runtimeTargetForBuild(generation installedGeneration, buildID string) (runtimeTarget, error) {

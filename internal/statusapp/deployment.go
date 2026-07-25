@@ -371,10 +371,8 @@ func applyPackagedApp(
 	if err != nil {
 		return ServiceInstallReceipt{}, fmt.Errorf("CCPoolStatus: attest packaged candidate: %w", err)
 	}
-	installedCandidate := candidate
-	installedCandidate.path = spec.current.AppPath
 	candidatePlan, err := spec.hooks.candidatePlanForBuild(
-		installedCandidate, spec.hooks.buildID, candidateSourcePath,
+		spec.current.AppPath, spec.hooks.buildID, candidateSourcePath,
 	)
 	if err != nil {
 		return ServiceInstallReceipt{}, fmt.Errorf("CCPoolStatus: bind packaged candidate plan: %w", err)

@@ -3,9 +3,13 @@ package statusapp
 import (
 	"context"
 	"errors"
+	"os"
+	"os/user"
+	"path/filepath"
 	"testing"
 
 	"github.com/yasyf/cc-pool/internal/holderbridge"
+	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/daemonkit/deployment"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/service"
@@ -14,6 +18,42 @@ import (
 	"github.com/yasyf/fusekit/transportproto"
 	"github.com/yasyf/fusekit/trustroles"
 )
+
+func TestDefaultCandidatePlanAcceptsAbsentFixedTarget(t *testing.T) {
+	account, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(
+		account.HomeDir, "Applications", "CCPoolStatusCandidate-"+filepath.Base(root)+".app",
+	)
+	if _, err := os.Lstat(target); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fixed target unexpectedly exists: %v", err)
+	}
+	source := filepath.Join(root, "CCPoolStatus.app")
+	executable := holderExecutablePath(source)
+	if err := os.MkdirAll(filepath.Dir(executable), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// #nosec G306 -- the fixture must be executable to model the signed app binary.
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	hooks := newProductHooks("runtime-v1", deployment.SHA256{1})
+	if _, err := hooks.defaultCandidatePlanForBuild(target, "runtime-v1", source); err != nil {
+		t.Fatalf("plan absent-target packaged candidate: %v", err)
+	}
+	if _, err := holderbridge.NewDeploymentPlan(
+		target, pool.FuseKitRuntimeDir(), "runtime-v1",
+	); err == nil {
+		t.Fatal("installed deployment planning accepted the absent fixed target")
+	}
+}
 
 func TestRuntimeQuiesceStopsExactObservedGeneration(t *testing.T) {
 	generation := exactTestGeneration(t)
