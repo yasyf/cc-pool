@@ -6,7 +6,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.64.7] - 2026-07-24
+## [0.64.7] - 2026-07-25
 
 ### Fixed
 - Homebrew publication now verifies the exact installed CLI and signed
@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GUI fleet cutover.
 - Signed FUSE-T libraries with no entitlements now use FuseKit's canonical
   empty entitlement attestation instead of failing helper activation.
+- Daemon and worker lifecycle now runs on daemonkit `v0.20.6`, whose durable
+  untrack lands once a reaped owner has settled.
+- The Go runtime and the packaged status application now share FuseKit
+  `v1.15.3`.
 
 ## [0.64.6] - 2026-07-24
 
