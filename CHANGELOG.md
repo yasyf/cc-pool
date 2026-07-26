@@ -6,7 +6,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.64.7] - 2026-07-25
+## [0.64.8] - 2026-07-25
 
 ### Fixed
 - Homebrew publication now verifies the exact installed CLI and signed
@@ -616,8 +616,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   picked automatically when fuse-t is present); CI and release workflows.
 - License: PolyForm Noncommercial 1.0.0.
 
-[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.64.7...HEAD
-[0.64.7]: https://github.com/yasyf/cc-pool/compare/v0.64.6...v0.64.7
+[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.64.8...HEAD
+[0.64.8]: https://github.com/yasyf/cc-pool/compare/v0.64.6...v0.64.8
 [0.64.6]: https://github.com/yasyf/cc-pool/compare/v0.64.5...v0.64.6
 [0.64.5]: https://github.com/yasyf/cc-pool/compare/v0.64.4...v0.64.5
 [0.64.4]: https://github.com/yasyf/cc-pool/compare/v0.64.3...v0.64.4
