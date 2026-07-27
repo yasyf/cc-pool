@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: yasyf/homebrew-tap/.github/actions/verify-tag-on-main@a4179241558456339fa2e41b97693a6cebae2e36
+      - uses: yasyf/homebrew-tap/.github/actions/verify-tag-on-main@2281a3ea884422db190de44fad65ce9bc08b19c4
 
   version:
     runs-on: ubuntu-latest
@@ -274,7 +274,7 @@ jobs:
     needs: [version, widget-test]
     permissions:
       contents: read
-    uses: yasyf/homebrew-tap/.github/workflows/release-app.yml@7cc8a6c981cbec10fcb7f19bd75b36e9ee65ea7e
+    uses: yasyf/homebrew-tap/.github/workflows/release-app.yml@41f8de6765b3b833ef333b0b98f5683f0e46685b
     with:
       app_name: CCPoolStatus
       asset_name: cc-pool-status

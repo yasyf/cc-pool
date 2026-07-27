@@ -2,8 +2,8 @@
 set -euo pipefail
 
 workflow=.github/workflows/release.yml
-tag_pin=a4179241558456339fa2e41b97693a6cebae2e36
-app_pin=7cc8a6c981cbec10fcb7f19bd75b36e9ee65ea7e
+tag_pin=2281a3ea884422db190de44fad65ce9bc08b19c4
+app_pin=41f8de6765b3b833ef333b0b98f5683f0e46685b
 stage_pin=e4c3108e693681df1a3c666bae80e890bc44cf3e
 draft_pin=54e3e194bda69896894a82c17fcdb2822beefab5
 tap_pin=9525763796fce4d1042cf3393d9479f791908eaa
