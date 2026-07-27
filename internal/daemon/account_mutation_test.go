@@ -21,6 +21,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
+	"github.com/yasyf/cc-pool/internal/testhome"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalogproto"
@@ -235,7 +236,7 @@ func TestAccountMutationAddCommitsOneImmutablePresentationIdentity(t *testing.T)
 }
 
 func TestAccountMutationAddStableIdentitySurvivesStoreReopen(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	dbPath := filepath.Join(t.TempDir(), "account-mutation-restart.db")
 	st, err := store.Open(dbPath)
 	if err != nil {
@@ -1204,7 +1205,7 @@ func newAccountMutationTestServer(
 ) (*Server, *credstest.Fake, store.Account) {
 	t.Helper()
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	st, err := store.Open(filepath.Join(t.TempDir(), "account-mutation.db"))
 	if err != nil {
 		t.Fatal(err)

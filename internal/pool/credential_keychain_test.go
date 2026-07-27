@@ -8,6 +8,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 )
 
 func datedCred(token string, exp time.Duration) *creds.Credential {
@@ -19,7 +20,7 @@ func datedCred(token string, exp time.Duration) *creds.Credential {
 }
 
 func TestReadCredentialUsesKeychain(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	database := openTestStore(t)
 	account := persistTestAccount(t, database, store.Account{ID: 1, KeychainAccount: "user"})
 	credentials := credstest.NewFake()

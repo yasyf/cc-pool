@@ -13,6 +13,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/daemonkit/worker"
@@ -219,7 +220,7 @@ func TestSyncHelperRuntimeSettlesAdmittedApplyBeforeClose(t *testing.T) {
 func TestSyncHelperSpawnConfigPreservesExactEnvironment(t *testing.T) {
 	home := t.TempDir()
 	configHome := filepath.Join(home, "xdg")
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	t.Setenv("XDG_CONFIG_HOME", configHome)
 
 	config, err := syncHelperSpawnConfig("/exact/cc-pool", "/exact/synckitd")

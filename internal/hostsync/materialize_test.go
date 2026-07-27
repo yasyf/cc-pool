@@ -21,6 +21,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/worker"
 )
@@ -222,7 +223,7 @@ var (
 // holder-first lifecycle boundary before deleting manager-owned private state.
 func newMaterializeService(t *testing.T) (*Service, *pool.Manager, *credstest.Fake, *runRecorder) {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	t.Setenv("USER", "tester")
 	if err := os.MkdirAll(pool.ClaudeDir(), 0o700); err != nil {
 		t.Fatal(err)

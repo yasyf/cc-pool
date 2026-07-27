@@ -15,6 +15,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 	dkdaemon "github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/worker"
@@ -32,7 +33,7 @@ import (
 func syncTestEnv(t *testing.T) *pool.Manager {
 	t.Helper()
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
 	if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
 		t.Fatal(err)

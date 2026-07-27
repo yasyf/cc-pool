@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/yasyf/cc-pool/internal/testhome"
 )
 
 func fakeOpen(t *testing.T) string {
@@ -25,7 +27,7 @@ func fakeOpen(t *testing.T) string {
 
 func TestRunWidgetReconcilesExactStackThenLaunchesUserApp(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	logPath := fakeOpen(t)
 	calls := 0
 	swapVar(t, &installWidgetStack, func(context.Context) error {

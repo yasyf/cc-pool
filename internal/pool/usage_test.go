@@ -10,6 +10,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 )
 
 // TestPoolNeverTouchesDefaultKeychainItem pins the #1 safety invariant: no
@@ -18,7 +19,7 @@ import (
 // rotated-token re-assert, remove — asserting each names only the account's own
 // suffixed service.
 func TestPoolNeverTouchesDefaultKeychainItem(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	t.Setenv("USER", "user")
 	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {

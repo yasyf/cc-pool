@@ -17,6 +17,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
+	"github.com/yasyf/cc-pool/internal/testhome"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
@@ -463,7 +464,7 @@ func allAccountRemovals(t *testing.T, st *store.Store) []store.AccountRemoval {
 
 func testTenantAccount(t *testing.T) (store.Account, tenantfs.Account, catalog.TenantID) {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	account := store.Account{
 		ID: 18, InstanceID: "0123456789abcdef0123456789abcdef", Generation: 7,
 	}
@@ -488,7 +489,7 @@ func insertCoordinatorAccounts(t *testing.T, st *store.Store, total int) {
 func openDesiredCoordinatorStore(t *testing.T, total int) *store.Store {
 	t.Helper()
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	path := filepath.Join(home, "pool-v1.db")
 	st, err := store.Open(path)
 	if err != nil {
@@ -558,7 +559,7 @@ func TestPrepareProvisionsBeforeOnDemandConvergence(t *testing.T) {
 
 func TestBackgroundTenantRecoveryReservesForegroundProvisionLane(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	st, err := store.Open(filepath.Join(home, "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -619,7 +620,7 @@ func TestBackgroundTenantRecoveryReservesForegroundProvisionLane(t *testing.T) {
 
 func TestInitializeProvisionsEveryActiveAccountWithoutPreparingContent(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	st, err := store.Open(filepath.Join(home, "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -858,7 +859,7 @@ func TestInitializeDoesNotRetryRawHolderTransitions(t *testing.T) {
 
 func TestInitializeRecoversRemovalBeforePreparingActiveFleet(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	st, err := store.Open(filepath.Join(home, "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -892,7 +893,7 @@ func TestInitializeRecoversRemovalBeforePreparingActiveFleet(t *testing.T) {
 
 func TestInitializeIgnoresContentPreparationFailuresAndRestartReprovisionsFleet(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	st, err := store.Open(filepath.Join(home, "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -934,7 +935,7 @@ func TestInitializeIgnoresContentPreparationFailuresAndRestartReprovisionsFleet(
 
 func TestInitializeNeverStartsContentPreparation(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	st, err := store.Open(filepath.Join(home, "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -1072,7 +1073,7 @@ func TestRemovalRecoveryRestartsCursorAndReplaysFailedClaims(t *testing.T) {
 
 func TestInitializePagesOnlyInterruptedRemovalClaims(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	st, err := store.Open(filepath.Join(home, "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -1153,7 +1154,7 @@ func TestOnDemandProvisioningIsBounded(t *testing.T) {
 }
 
 func TestRetireReservedAccountRequiresExactFileProviderAbsenceProof(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	reservation := store.PendingAccountReservation{
 		ID: 7, InstanceID: "0123456789abcdef0123456789abcdef", Generation: 3,
 	}
@@ -1282,7 +1283,7 @@ func TestActivatePreparedValidatesBeforeSessionActivation(t *testing.T) {
 
 func TestFinishRemovalNeedsOnlyTenantAbsenceProof(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	if err := pool.EnsureStateDir(); err != nil {
 		t.Fatal(err)
 	}
@@ -1349,7 +1350,7 @@ func TestFinishRemovalNeedsOnlyTenantAbsenceProof(t *testing.T) {
 
 func TestFinishRemovalRequiresExplicitTenantAbsenceProofWhenStateIsAbsent(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	if err := pool.EnsureStateDir(); err != nil {
 		t.Fatal(err)
 	}

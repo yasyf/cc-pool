@@ -6,10 +6,11 @@ import (
 	"testing"
 
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 )
 
 func TestFuseKitPathsArePrivate(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	runtime := filepath.Join(StateDir(), "fusekit")
 	if got := FuseKitRuntimeDir(); got != runtime {
 		t.Fatalf("FuseKitRuntimeDir() = %q, want %q", got, runtime)
@@ -28,21 +29,21 @@ func TestFuseKitPathsArePrivate(t *testing.T) {
 
 func TestWidgetAppPath(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	if got, want := WidgetAppPath(), filepath.Join(home, "Applications", "CCPoolStatus.app"); got != want {
 		t.Fatalf("WidgetAppPath() = %q, want %q", got, want)
 	}
 }
 
 func TestDBPathIsV1Only(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	if got, want := DBPath(), filepath.Join(StateDir(), "pool-v1.db"); got != want {
 		t.Fatalf("DBPath() = %q, want %q", got, want)
 	}
 }
 
 func TestV1StoreIgnoresOldPoolDatabase(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	if err := EnsureStateDir(); err != nil {
 		t.Fatal(err)
 	}

@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/yasyf/cc-pool/internal/testhome"
 )
 
 const (
@@ -79,7 +81,7 @@ func TestCredentialLockRecoversEveryCrashTransition(t *testing.T) {
 	for _, checkpoint := range checkpoints {
 		t.Run(checkpoint.name, func(t *testing.T) {
 			home := t.TempDir()
-			t.Setenv("HOME", home)
+			testhome.Sandbox(t, home)
 			executable, err := os.Executable()
 			if err != nil {
 				t.Fatal(err)
@@ -124,7 +126,7 @@ func TestCredentialLockRecoversEveryCrashTransition(t *testing.T) {
 }
 
 func TestCredentialLockRecoversAbandonedSameWorkerJournal(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	configDir := prepareTestAccountConfigDir(t, 1)
 	lease, err := acquireCredentialRefreshLocks(t.Context(), 1, configDir)
 	if err != nil {
@@ -158,7 +160,7 @@ func TestCredentialLockRecoversAbandonedSameWorkerJournal(t *testing.T) {
 }
 
 func TestCredentialLockReleaseOutlivesCallerCancellation(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	configDir := prepareTestAccountConfigDir(t, 1)
 	lease, err := acquireCredentialRefreshLocks(t.Context(), 1, configDir)
 	if err != nil {
@@ -173,7 +175,7 @@ func TestCredentialLockReleaseOutlivesCallerCancellation(t *testing.T) {
 }
 
 func TestCredentialLockNeverDeletesUnmarkedAmbiguousTarget(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	configDir := prepareTestAccountConfigDir(t, 1)
 	paths, err := credentialRefreshLockPaths(configDir)
 	if err != nil {

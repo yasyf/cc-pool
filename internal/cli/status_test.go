@@ -18,6 +18,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 	"github.com/yasyf/cc-pool/internal/version"
 )
 
@@ -123,7 +124,7 @@ func TestRenderTableNoDataDash(t *testing.T) {
 // TestAbbreviateHome pins the ~-abbreviation used by the pin summary line.
 func TestAbbreviateHome(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	cases := map[string]struct{ in, want string }{
 		"inside home":  {home + "/Code/proj", "~/Code/proj"},
 		"home itself":  {home, "~"},
@@ -525,7 +526,7 @@ func writeStatusSnapshotTest(t *testing.T, snapshot daemon.StatusSnapshot) {
 }
 
 func TestStatusSnapshotJSONUsesExactDiskSnapshotWithoutDaemon(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	generatedAt := time.Now().Add(-time.Minute).Truncate(time.Second)
 	want := daemon.NewStatusSnapshot([]daemon.AccountStatus{{
 		ID: 1, Label: "from-disk", SampleAge: "37s", HasUsage: true, Remaining5h: 60,
@@ -567,7 +568,7 @@ func TestStatusSnapshotJSONDaemonBranch(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = os.RemoveAll(home) })
-			t.Setenv("HOME", home)
+			testhome.Sandbox(t, home)
 
 			if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
 				t.Fatal(err)
@@ -659,7 +660,7 @@ func TestReadStatusSnapshotRejectsUnknownAndTrailingJSON(t *testing.T) {
 }
 
 func TestGatherStatusUsesDiskSnapshotWithoutManager(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	writeStatusSnapshotTest(t, daemon.NewStatusSnapshot([]daemon.AccountStatus{{
 		ID: 7, Label: "disk-only",
 	}}, time.Now()))
@@ -723,7 +724,7 @@ func TestRunStatusPlainLedgerFooter(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(home) })
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
 		t.Fatal(err)
 	}

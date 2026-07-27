@@ -17,6 +17,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 	"github.com/yasyf/daemonkit/proc"
 )
 
@@ -334,7 +335,7 @@ func TestCredentialOperationRetryAfterLostResponseReplaysReceipt(t *testing.T) {
 }
 
 func TestCredentialRemovalRecoversOwnerDeathAfterDelete(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	st := openTestStore(t)
 	credentials := credstest.NewFake()
 	owner := credentialRecoveryManager(t, st, credentials, "remove-owner")
@@ -1421,7 +1422,7 @@ func TestExpiredCompensationRecoveryFinishesExactPartialDelete(t *testing.T) {
 }
 
 func TestExpiredAddCompensationRecoversFromAccountMutationSubject(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	st := openTestStore(t)
 	credentials := credstest.NewFake()
 	manager := credentialRecoveryManager(t, st, credentials, "pending-compensation-owner")

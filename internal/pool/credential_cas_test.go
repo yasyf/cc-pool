@@ -20,6 +20,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 	"github.com/yasyf/daemonkit/worker"
 )
 
@@ -510,7 +511,7 @@ func newCredentialCASFixture(
 ) (store.Account, map[creds.Source]creds.Store) {
 	t.Helper()
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	t.Setenv("USER", "credential-cas-test")
 	itemPath := filepath.Join(t.TempDir(), "keychain-item")
 	t.Setenv("CCP_CAS_KEYCHAIN_ITEM", itemPath)

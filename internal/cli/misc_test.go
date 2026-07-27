@@ -9,11 +9,12 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 )
 
 func TestEnvExportsFuseKitPresentationWithoutSessionOwnership(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 
 	dir := filepath.Join(home, "acct-01")
 	if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {

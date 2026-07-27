@@ -14,6 +14,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/daemonkit/service"
 )
@@ -32,7 +33,7 @@ func tempHome(t *testing.T) string {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(home) })
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	return home
 }
 

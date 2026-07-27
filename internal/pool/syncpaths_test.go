@@ -3,13 +3,15 @@ package pool
 import (
 	"path/filepath"
 	"testing"
+
+	"github.com/yasyf/cc-pool/internal/testhome"
 )
 
 // TestSyncPaths pins the host-sync path helpers to their exact strings rooted
 // at ~/.cc-pool, mirroring the existing stateDir.Path one-liner layout.
 func TestSyncPaths(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	root := filepath.Join(home, ".cc-pool")
 
 	cases := map[string]struct {

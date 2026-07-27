@@ -8,12 +8,13 @@ import (
 	"testing"
 
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 	"github.com/yasyf/daemonkit/proc"
 )
 
 func TestReconcileAccountPresentationRetargetsOnlyStableLink(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	st, account, previous := stablePresentationTestAccount(t, filepath.Join(t.TempDir(), "pool-v1.db"))
 	manager := &Manager{Store: st}
 	if err := EnsureAccountConfigDir(account.InstanceID, previous.PublicPath); err != nil {
@@ -54,7 +55,7 @@ func TestRecoverAccountPresentationRepairsHandlesBothCrashSides(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			home := t.TempDir()
-			t.Setenv("HOME", home)
+			testhome.Sandbox(t, home)
 			databasePath := filepath.Join(t.TempDir(), "pool-v1.db")
 			st, account, previous := stablePresentationTestAccount(t, databasePath)
 			target := previous
@@ -88,7 +89,7 @@ func TestRecoverAccountPresentationRepairsHandlesBothCrashSides(t *testing.T) {
 }
 
 func TestRecoverAccountConfigDirRepairsMissingCommittedLink(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	st, account, presentation := stablePresentationTestAccount(t, filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err := (&Manager{Store: st}).RecoverAccountConfigDir(account); err != nil {
 		t.Fatal(err)
@@ -98,7 +99,7 @@ func TestRecoverAccountConfigDirRepairsMissingCommittedLink(t *testing.T) {
 }
 
 func TestReconcileAccountPresentationRepairsMissingSteadyLink(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	st, account, presentation := stablePresentationTestAccount(t, filepath.Join(t.TempDir(), "pool-v1.db"))
 	committed, err := (&Manager{Store: st}).ReconcileAccountPresentation(t.Context(), account, presentation)
 	if err != nil || committed.Identity != presentation {
@@ -109,7 +110,7 @@ func TestReconcileAccountPresentationRepairsMissingSteadyLink(t *testing.T) {
 }
 
 func TestReconcileAccountPresentationFailsClosedOnForeignLink(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	st, account, previous := stablePresentationTestAccount(t, filepath.Join(t.TempDir(), "pool-v1.db"))
 	link, _ := AccountConfigDir(account.InstanceID)
 	if err := os.MkdirAll(filepath.Dir(link), 0o700); err != nil {
@@ -133,7 +134,7 @@ func TestReconcileAccountPresentationFailsClosedOnForeignLink(t *testing.T) {
 }
 
 func TestReconcileAccountPresentationRejectsExecutionIdentityMismatch(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	st, account, presentation := stablePresentationTestAccount(t, filepath.Join(t.TempDir(), "pool-v1.db"))
 	account.ConfigDir += "-foreign"
 	if _, err := (&Manager{Store: st}).ReconcileAccountPresentation(t.Context(), account, presentation); err == nil {

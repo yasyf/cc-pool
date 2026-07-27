@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/testhome"
 	daemonproc "github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/worker"
 )
@@ -51,7 +52,7 @@ func writePoolTestExecutable(t *testing.T, path, contents string) {
 }
 
 func TestBackingWorkerUsesOnlyOpaqueAccountIdentity(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	got, err := accountBackingPath(18)
 	if err != nil {
 		t.Fatal(err)
@@ -65,7 +66,7 @@ func TestBackingWorkerUsesOnlyOpaqueAccountIdentity(t *testing.T) {
 }
 
 func TestBackingWorkerRemovesOnlyDirectAccountDirectory(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	path := AccountBackingDir(18)
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		t.Fatal(err)
@@ -80,7 +81,7 @@ func TestBackingWorkerRemovesOnlyDirectAccountDirectory(t *testing.T) {
 
 func TestPrepareAccountBackingDeadlineKillsReapsAndUntracks(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	script := filepath.Join(home, "wedged-account-worker")
 	pidPath := filepath.Join(home, "wedged-account-worker.pid")
 	writePoolTestExecutable(

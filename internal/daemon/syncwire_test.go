@@ -19,6 +19,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 	daemonproc "github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/synckit/hostregistry"
@@ -37,7 +38,7 @@ func newWireServer(t *testing.T) (*Server, context.Context) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(home) })
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
 	bin := filepath.Join(home, "bin")
 	if err := os.MkdirAll(bin, 0o700); err != nil {

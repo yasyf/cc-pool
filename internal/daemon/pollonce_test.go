@@ -22,6 +22,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 )
 
 // The daemon's Manager is fed the shared credstest seam fake; fakeOAuth is
@@ -127,7 +128,7 @@ func (f *fakeOAuth) setUsage401(v bool) {
 // under the launching session; an expired reservation refreshes as usual.
 func TestPollOnceSkipsReservedAccountRefresh(t *testing.T) {
 	// Redirect ClaudeDir/StateDir off the real ~/.claude and ~/.cc-pool.
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 
 	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
@@ -181,7 +182,7 @@ func TestPollOnceSkipsReservedAccountRefresh(t *testing.T) {
 func TestPollOnceFailsClosedOnScanError(t *testing.T) {
 	setup := func(t *testing.T, scan func(context.Context) ([]procscan.Session, error)) (*Server, *fakeOAuth, *credstest.Fake) {
 		t.Helper()
-		t.Setenv("HOME", t.TempDir())
+		testhome.Sandbox(t, t.TempDir())
 		st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 		if err != nil {
 			t.Fatal(err)
@@ -237,7 +238,7 @@ func TestPollOnceFailsClosedOnScanError(t *testing.T) {
 // (invalid_grant on the pre-flight refresh) flags needs-login and a recovered
 // credential clears it on the next due poll.
 func TestPollOnceFlagsAndRecoversNeedsLogin(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -312,7 +313,7 @@ func TestPollOnceAbsentCredentialAuthHealth(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
+			testhome.Sandbox(t, t.TempDir())
 			st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 			if err != nil {
 				t.Fatal(err)
@@ -377,7 +378,7 @@ func TestPollOnceAbsentCredentialAuthHealth(t *testing.T) {
 // TestPollOnceTransient401StaysSelectable pins that one durable transient
 // refresh failure cannot be replayed into multiple auth strikes or needs-login.
 func TestPollOnceTransient401StaysSelectable(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -461,7 +462,7 @@ func TestClassifyOutcomeRetainedEvidenceIsNotAProbe(t *testing.T) {
 // evidence cannot keep outage mode alive without network I/O. The scheduler
 // follows a replay-only credential result with one read-only usage probe.
 func TestPollOnceOutageProbesAfterRetainedFailure(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -531,7 +532,7 @@ func TestPollOnceRestartProbesWhenAllCredentialResultsRetained(t *testing.T) {
 		{name: "network outage", networkDown: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
+			testhome.Sandbox(t, t.TempDir())
 			databasePath := filepath.Join(t.TempDir(), "pool-v1.db")
 			st, err := store.Open(databasePath)
 			if err != nil {
@@ -629,7 +630,7 @@ func TestPollOnceRestartProbesWhenAllCredentialResultsRetained(t *testing.T) {
 // invalid_grant, credential unchanged on re-read) flags needs-login on the
 // first poll, independent of the transient-401 streak.
 func TestPollOnceFlagsConfirmedRevocation(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -673,7 +674,7 @@ func TestPollOnceFlagsConfirmedRevocation(t *testing.T) {
 // behavior via its usageNet/netByAT fields.
 func newOutageServer(t *testing.T, n int) (*Server, *fakeOAuth) {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -848,7 +849,7 @@ func TestPollOnceOutageLogThrottle(t *testing.T) {
 func TestPollOnceRecoverySweepHealsBusy401(t *testing.T) {
 	newBusy := func(t *testing.T) (*Server, *fakeOAuth) {
 		t.Helper()
-		t.Setenv("HOME", t.TempDir())
+		testhome.Sandbox(t, t.TempDir())
 		st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 		if err != nil {
 			t.Fatal(err)

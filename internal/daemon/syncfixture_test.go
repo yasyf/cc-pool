@@ -11,6 +11,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 )
 
 // newGateServer builds a one-account daemon Server whose account carries
@@ -18,7 +19,7 @@ import (
 // the fake OAuth and credential seams but no host-sync helper client.
 func newGateServer(t *testing.T, cred *creds.Credential, sessions []procscan.Session) (*Server, *fakeOAuth, store.Account) {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)

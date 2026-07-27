@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/testhome"
 	"github.com/yasyf/cc-pool/internal/version"
 )
 
@@ -62,7 +63,7 @@ func TestStatusAppVersionRejectsMissingOrInexactMetadata(t *testing.T) {
 
 func TestProveElectionRegistersExactFixedFileProvider(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	appPath := filepath.Join(home, "Applications", "CCPoolStatus.app")
 	extension := filepath.Join(appPath, "Contents", "PlugIns", "CCPoolFileProvider.appex")
 	commands := &recordingRunner{output: []byte("+    " + fileProviderBundleID + "(0.63.0)\tUUID\tdate\t" + extension + "\n (1 plug-in)\n")}
@@ -80,7 +81,7 @@ func TestProveElectionRegistersExactFixedFileProvider(t *testing.T) {
 }
 
 func TestProveElectionRejectsUnexpectedInstallPathBeforeRegistration(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	commands := &recordingRunner{}
 	if err := proveElection(t.Context(), filepath.Join(t.TempDir(), "CCPoolStatus.app"), commands); err == nil {
 		t.Fatal("proof accepted an unexpected installation path")
@@ -92,7 +93,7 @@ func TestProveElectionRejectsUnexpectedInstallPathBeforeRegistration(t *testing.
 
 func TestEnsureInstallDirectoryRejectsSymlink(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	if err := os.Symlink(t.TempDir(), pool.WidgetAppDir()); err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +103,7 @@ func TestEnsureInstallDirectoryRejectsSymlink(t *testing.T) {
 }
 
 func TestProveElectionSurfacesRegistrationFailure(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	want := errors.New("failure")
 	if err := proveElection(t.Context(), pool.WidgetAppPath(), &recordingRunner{err: want}); !errors.Is(err, want) {
 		t.Fatalf("registration error = %v", err)

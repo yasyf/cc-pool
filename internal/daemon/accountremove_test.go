@@ -14,6 +14,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
+	"github.com/yasyf/cc-pool/internal/testhome"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/holder"
 )
@@ -93,7 +94,7 @@ func assertRemovalFencesSelection(t *testing.T, manager *pool.Manager) {
 
 func TestAccountRemovalReleasesClaimBeforeTenantRemoval(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	if err := pool.EnsureStateDir(); err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +152,7 @@ func TestAccountRemovalReleasesClaimBeforeTenantRemoval(t *testing.T) {
 
 func TestCancelledAccountRemovalReleasesClaimAndRestartResumesIntent(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	if err := pool.EnsureStateDir(); err != nil {
 		t.Fatal(err)
 	}

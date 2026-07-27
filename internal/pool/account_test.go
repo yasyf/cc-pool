@@ -12,6 +12,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 )
 
 func openTestStore(t *testing.T) *store.Store {
@@ -31,7 +32,7 @@ func persistTestAccount(t *testing.T, st *store.Store, account store.Account) st
 
 func newAccountManager(t *testing.T) *Manager {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	manager := credentialRecoveryManager(
 		t, openTestStore(t), credstest.NewFake(), "account-manager",
 	)

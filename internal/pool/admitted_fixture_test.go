@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 	"github.com/yasyf/daemonkit/proc"
 )
 
@@ -76,7 +77,7 @@ func commitPoolTestAccountAtPresentation(
 	if !strings.HasPrefix(
 		filepath.Clean(home), filepath.Clean(os.TempDir())+string(os.PathSeparator),
 	) {
-		t.Setenv("HOME", t.TempDir())
+		testhome.Sandbox(t, t.TempDir())
 	}
 	configDir, err := AccountConfigDir(reservation.InstanceID)
 	if err != nil {

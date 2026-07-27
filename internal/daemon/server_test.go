@@ -22,6 +22,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
+	"github.com/yasyf/cc-pool/internal/testhome"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalogproto"
 )
@@ -292,7 +293,7 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 
 func newTestServerWithPaths(t *testing.T, paths map[int]string) (*Server, map[int]string) {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)

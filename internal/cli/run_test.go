@@ -14,10 +14,11 @@ import (
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 )
 
 func TestExecEnv(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	pluginRoot := "CLAUDE_CODE_PLUGIN_CACHE_DIR=" + filepath.Join(pool.ClaudeDir(), "plugins")
 	debugDir := "CLAUDE_CODE_DEBUG_LOGS_DIR=" + filepath.Join(pool.ClaudeDir(), "debug")
 
@@ -123,7 +124,7 @@ func TestRunClaudeRejectsMalformedDaemonSelectionBeforeConsequences(t *testing.T
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(home) })
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	t.Setenv(ccpAccountEnv, "1")
 	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{"mergeMarker":"yes"}`), 0o600); err != nil {
 		t.Fatal(err)

@@ -9,6 +9,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 )
 
 const credentialBoundaryTestInstance = "11223344556677889900aabbccddeeff"
@@ -137,7 +138,7 @@ func TestCredentialBoundaryRequiresExactExpectedPublicPath(t *testing.T) {
 func credentialBoundaryFixture(t *testing.T) (store.Account, string, *credstest.Fake) {
 	t.Helper()
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	publicPath := filepath.Join(home, "Library", "CloudStorage", "CCPool", "Account")
 	if err := os.MkdirAll(publicPath, 0o700); err != nil {
 		t.Fatal(err)

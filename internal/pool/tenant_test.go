@@ -5,12 +5,13 @@ import (
 	"testing"
 
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 	"github.com/yasyf/fusekit/catalog"
 )
 
 func TestTenantAccountSeparatesPreservedBackingFromPresentation(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	account := store.Account{
 		ID: 18, InstanceID: "0123456789abcdef0123456789abcdef", Generation: 7,
 	}

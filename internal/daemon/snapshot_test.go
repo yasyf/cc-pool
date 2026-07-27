@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 	"github.com/yasyf/cc-pool/internal/version"
 )
 
@@ -148,7 +149,7 @@ func TestWriteStatusSnapshotError(t *testing.T) {
 
 func TestPollOnceWritesSnapshot(t *testing.T) {
 	// Redirect ClaudeDir/StateDir off the real ~/.claude and ~/.cc-pool.
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	s, _ := newTestServer(t)
 	s.snapshot = filepath.Join(t.TempDir(), "status.json")
 
@@ -161,7 +162,7 @@ func TestPollOnceWritesSnapshot(t *testing.T) {
 }
 
 func TestPollOnceLogsSnapshotFailure(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	s, _ := newTestServer(t)
 	var buf bytes.Buffer
 	s.log = log.New(&buf, "", 0)

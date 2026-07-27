@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/yasyf/cc-pool/internal/creds"
+	"github.com/yasyf/cc-pool/internal/testhome"
 )
 
 const (
@@ -17,7 +18,7 @@ const (
 
 func TestAccountConfigIdentityIsInstanceStable(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	first, err := AccountConfigDir(firstTestInstance)
 	if err != nil {
 		t.Fatal(err)
@@ -39,7 +40,7 @@ func TestAccountConfigIdentityIsInstanceStable(t *testing.T) {
 }
 
 func TestAccountConfigIdentityRejectsNonCanonicalInstanceID(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	for _, instanceID := range []string{"", "abc", "00112233445566778899AABBCCDDEEFF", "00112233445566778899aabbccddeefg"} {
 		if _, err := AccountConfigDir(instanceID); err == nil {
 			t.Fatalf("AccountConfigDir(%q) succeeded", instanceID)
@@ -49,7 +50,7 @@ func TestAccountConfigIdentityRejectsNonCanonicalInstanceID(t *testing.T) {
 
 func TestAccountConfigLinkCreateRetargetAndRemove(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	first := filepath.Join(home, "Library", "CloudStorage", "First")
 	second := filepath.Join(home, "Library", "CloudStorage", "Second")
 	if err := EnsureAccountConfigDir(firstTestInstance, first); err != nil {
@@ -77,7 +78,7 @@ func TestAccountConfigLinkCreateRetargetAndRemove(t *testing.T) {
 
 func TestAccountConfigLinkRemovalPreservesTarget(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	target := filepath.Join(home, "Library", "CloudStorage", "Target")
 	if err := os.MkdirAll(target, 0o700); err != nil {
 		t.Fatal(err)
@@ -99,7 +100,7 @@ func TestAccountConfigLinkRemovalPreservesTarget(t *testing.T) {
 }
 
 func TestAccountConfigLinkConcurrentSameTargetIsIdempotent(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	const workers = 16
 	var group sync.WaitGroup
 	errorsCh := make(chan error, workers)
@@ -122,7 +123,7 @@ func TestAccountConfigLinkConcurrentSameTargetIsIdempotent(t *testing.T) {
 }
 
 func TestAccountConfigIdentitySurvivesRepeatedRetarget(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	configDir, err := AccountConfigDir(firstTestInstance)
 	if err != nil {
 		t.Fatal(err)
@@ -159,7 +160,7 @@ func TestAccountConfigLinkFailsClosed(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			home := t.TempDir()
-			t.Setenv("HOME", home)
+			testhome.Sandbox(t, home)
 			link, _ := AccountConfigDir(firstTestInstance)
 			if err := os.MkdirAll(filepath.Dir(link), 0o700); err != nil {
 				t.Fatal(err)
@@ -176,7 +177,7 @@ func TestAccountConfigLinkFailsClosed(t *testing.T) {
 
 func TestAccountConfigLinkRefusesWrongTarget(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	if err := EnsureAccountConfigDir(firstTestInstance, "/verified/first"); err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +194,7 @@ func TestAccountConfigLinkRefusesWrongTarget(t *testing.T) {
 
 func TestAccountConfigParentMustBeReal0700Directory(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	realParent := filepath.Join(home, "real")
 	if err := os.Mkdir(realParent, 0o700); err != nil {
 		t.Fatal(err)

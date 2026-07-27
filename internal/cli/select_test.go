@@ -14,6 +14,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 	"github.com/yasyf/cc-pool/internal/version"
 )
 
@@ -23,7 +24,7 @@ func TestAbortDaemonSelectionOutlivesCallerCancellation(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(home) })
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +152,7 @@ func TestWarnExhaustedFallback(t *testing.T) {
 // least-bad fallback (emptier 7d, overage enabled).
 func exhaustedPoolManager(t *testing.T) *pool.Manager {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	t.Setenv("USER", "user")
 	st := openTestStore(t)
 	now := time.Now()
@@ -217,7 +218,7 @@ func TestResolveSelectionDaemonPickDoesNotRepeatBaseMerge(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(home) })
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{"mergeMarker": "yes"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +281,7 @@ func TestResolveSelectionRejectsDaemonBuildSkewWithoutLocalFallback(t *testing.T
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(home) })
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -303,7 +304,7 @@ func TestResolveSelectionRejectsDaemonBuildSkewWithoutLocalFallback(t *testing.T
 }
 
 func TestValidateDaemonSelection(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	st := openTestStore(t)
 	a := store.Account{
 		ID: 5, ConfigDir: filepath.Join(t.TempDir(), "acct-05"), Label: "work@example.com",

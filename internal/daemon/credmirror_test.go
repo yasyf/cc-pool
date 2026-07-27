@@ -17,6 +17,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 	"github.com/yasyf/daemonkit/worker"
 )
 
@@ -47,7 +48,7 @@ func testCredentialWriteSettlement(
 }
 
 func TestCredentialWriteSettlementIsWorkerBackedAndExactIdempotent(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	registry := hostsync.NewRegistryFile(pool.SyncDir())
 	stampDir := pool.SyncStampsDir()
 	seed := &hostsync.Service{Registry: registry, StampDir: stampDir}
@@ -159,7 +160,7 @@ func TestCredentialWriteSettlementIsWorkerBackedAndExactIdempotent(t *testing.T)
 }
 
 func TestCredentialWriteWorkerRepairsRegistrySavedBeforeStamp(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	registry := hostsync.NewRegistryFile(pool.SyncDir())
 	stampDir := pool.SyncStampsDir()
 	committedAt := time.UnixMilli(1_700_000_000_123)
@@ -230,7 +231,7 @@ func TestCredentialWriteWorkerRepairsRegistrySavedBeforeStamp(t *testing.T) {
 
 func TestCredentialWriteSettlementStructuralNoopsPrecedePolicy(t *testing.T) {
 	var policyCalls atomic.Int32
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	registry := hostsync.NewRegistryFile(pool.SyncDir())
 	settler := newCredentialWriteSettler(
 		nil, "", func() (bool, error) {
@@ -285,7 +286,7 @@ func TestCredentialWriteSettlementPublicationPolicyIsExact(t *testing.T) {
 				workerCalls.Add(1)
 				return worker.CommandResult{}, errors.New("worker must not run")
 			})
-			t.Setenv("HOME", t.TempDir())
+			testhome.Sandbox(t, t.TempDir())
 			registry := hostsync.NewRegistryFile(pool.SyncDir())
 			settler := newCredentialWriteSettler(
 				runner, "credential-worker",
@@ -304,7 +305,7 @@ func TestCredentialWriteSettlementPublicationPolicyIsExact(t *testing.T) {
 }
 
 func TestCredentialWriteSettlementPropagatesCancellationAndRejectsWrongResponse(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	registry := hostsync.NewRegistryFile(pool.SyncDir())
 	credential := creds.Credential{}
 	credential.ClaudeAiOauth.RefreshToken = "refresh"

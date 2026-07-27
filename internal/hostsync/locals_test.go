@@ -13,6 +13,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 )
 
 // localsFixture is a temp-dir pool Manager for the Locals builder:
@@ -24,7 +25,7 @@ type localsFixture struct {
 
 func newLocalsFixture(t *testing.T) *localsFixture {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir())
+	testhome.Sandbox(t, t.TempDir())
 	m, err := pool.OpenHostSyncWorker(t.Context())
 	if err != nil {
 		t.Fatal(err)

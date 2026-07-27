@@ -12,6 +12,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/testhome"
 )
 
 func TestPromoteSyncedAddLostResponseResolvesWithoutCleanup(t *testing.T) {
@@ -443,7 +444,7 @@ func syncedAdmissionFixture(
 ) (*Manager, *credstest.Fake, store.Account, store.FileProviderPresentationIdentity, store.FileProviderPresentationIdentity, *creds.Credential, string) {
 	t.Helper()
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testhome.Sandbox(t, home)
 	databasePath := filepath.Join(t.TempDir(), "synced-admission-v1.db")
 	st, err := store.Open(databasePath)
 	if err != nil {
