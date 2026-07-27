@@ -16,7 +16,7 @@ packages:
     exactVersion: 1.15.3
   DaemonKit:
     url: https://github.com/yasyf/daemonkit.git
-    exactVersion: 0.20.6
+    exactVersion: 0.20.9
 
 # release-app.yml writes a per-build Version.xcconfig before `xcodegen generate`;
 # keep MARKETING_VERSION/CURRENT_PROJECT_VERSION out of `settings:` so it wins.
