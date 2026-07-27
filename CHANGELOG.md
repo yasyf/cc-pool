@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failure; it surfaces immediately as the permanent domain rejection it is.
 - Recovery-mode reconciliation now clears a self-wedged install instead of
   leaving a half-registered service the next bootstrap cannot replace.
+- The Go runtime and the packaged status application now share FuseKit
+  `v1.15.5`, whose DaemonKit requirement matches the pinned `v0.20.9`. The
+  widget's Swift package graph could not resolve at all against FuseKit
+  `v1.15.3`, which held DaemonKit at `0.20.6`.
 
 ## [0.64.8] - 2026-07-25
 
