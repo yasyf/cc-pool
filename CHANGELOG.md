@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.64.9] - 2026-07-27
+
+### Fixed
+- Helper installation now resolves the real home directory from the passwd
+  database through daemonkit `v0.20.9`, so a helper installed under Homebrew
+  postinstall's sandboxed temporary `HOME` still lands in the invoking user's
+  launchd domain.
+- A launchctl exit status of 5 is no longer retried as a transient bootstrap
+  failure; it surfaces immediately as the permanent domain rejection it is.
+- Recovery-mode reconciliation now clears a self-wedged install instead of
+  leaving a half-registered service the next bootstrap cannot replace.
+
 ## [0.64.8] - 2026-07-25
 
 ### Fixed
@@ -616,7 +628,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   picked automatically when fuse-t is present); CI and release workflows.
 - License: PolyForm Noncommercial 1.0.0.
 
-[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.64.8...HEAD
+[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.64.9...HEAD
+[0.64.9]: https://github.com/yasyf/cc-pool/compare/v0.64.8...v0.64.9
 [0.64.8]: https://github.com/yasyf/cc-pool/compare/v0.64.6...v0.64.8
 [0.64.6]: https://github.com/yasyf/cc-pool/compare/v0.64.5...v0.64.6
 [0.64.5]: https://github.com/yasyf/cc-pool/compare/v0.64.4...v0.64.5
