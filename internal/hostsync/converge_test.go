@@ -10,7 +10,7 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/pool"
-	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/durable"
 	"github.com/yasyf/synckit/converge"
 	"github.com/yasyf/synckit/cregistry"
 )
@@ -256,9 +256,9 @@ func TestTeardownRegistryFencePrecedesRemovalIntent(t *testing.T) {
 	s.Sessions = fakeSessions{busy: map[string]bool{}}
 	remover := s.Remover.(*fixtureAccountRemover)
 
-	lock, err := (proc.FileLockSpec{
-		Path: s.Registry.LockPath, Mode: proc.FileLockExclusive, Deadline: time.Second,
-	}).Acquire(ctx)
+	lockCtx, cancelLock := context.WithTimeout(ctx, time.Second)
+	defer cancelLock()
+	lock, err := durable.AcquireLock(lockCtx, s.Registry.LockPath)
 	if err != nil {
 		t.Fatal(err)
 	}

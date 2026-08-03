@@ -21,7 +21,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/cc-pool/internal/version"
-	"github.com/yasyf/daemonkit/deployment"
 	"github.com/yasyf/fusekit/holder"
 )
 
@@ -129,14 +128,10 @@ func newHolderRuntime(ctx context.Context, requiredAppGroup string) (*holder.Run
 	if err != nil {
 		return nil, err
 	}
-	stopControlStore, err := deployment.RuntimeStopControlStore()
-	if err != nil {
-		return nil, fmt.Errorf("FuseKit runtime: resolve deployment stop authority: %w", err)
-	}
 	return holderbridge.NewRuntime(ctx, holderbridge.RuntimeSpec{
-		Plan: plan, TrustRequirements: holderbridge.RuntimeTrustRequirements(requiredAppGroup),
-		StopControlStore: stopControlStore,
-		Owner:            tenantfs.SourceAuthorityFleetOwner, Drivers: drivers,
+		Plan:  plan,
+		Trust: holderbridge.RuntimeTrust(requiredAppGroup),
+		Owner: tenantfs.SourceAuthorityFleetOwner, Drivers: drivers,
 		CatalogAuthorizer: tenantfs.NewCatalogAuthorizer(),
 		Authorizer:        tenantfs.NewMountAuthorizer(),
 		BusinessHandlers:  tenantfs.BusinessHandlers(),

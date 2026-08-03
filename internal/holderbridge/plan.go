@@ -2,8 +2,7 @@
 package holderbridge
 
 import (
-	"github.com/yasyf/daemonkit/codeidentity"
-	"github.com/yasyf/daemonkit/trust"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/holder"
 )
 
@@ -18,12 +17,7 @@ const (
 
 const fileProviderBundleID = "com.yasyf.cc-pool.status.fileprovider"
 
-var runtimePolicyDigest = codeidentity.PolicyDigest{
-	0x48, 0xe0, 0x64, 0xe5, 0xc6, 0xcd, 0x4f, 0xa0,
-	0x85, 0xd9, 0x91, 0x31, 0x57, 0x59, 0x35, 0x1d,
-	0x8a, 0xb7, 0x6f, 0xb2, 0x23, 0xaf, 0x6b, 0x9f,
-	0x8c, 0x6f, 0x25, 0xa6, 0xcf, 0x7f, 0xbd, 0x9b,
-}
+const runtimePolicyDigest daemonkit.PolicyDigest = "cca1c08f02957912b419b602a6c4b943b8ef9d65906c7b5f3d38d29d2633b838"
 
 // Application returns cc-pool's exact fixed signed application identity.
 func Application(appPath string) holder.SignedApplication {
@@ -40,12 +34,11 @@ func Application(appPath string) holder.SignedApplication {
 // ReadinessContract returns cc-pool's one signed-runtime and service-observer budget.
 func ReadinessContract() holder.ReadinessContract { return holder.StandardReadinessContract() }
 
-// RuntimeTrustRequirements returns the signed peers admitted to FuseKit's fixed roles.
-func RuntimeTrustRequirements(requiredAppGroup string) holder.RuntimeTrustRequirements {
-	controller := trust.Requirement{TeamID: TeamID, SigningIdentifier: BundleID}
-	return holder.RuntimeTrustRequirements{
-		StopController: controller, ReceiptController: controller, ReadinessController: controller,
-		FileProviderExtension: trust.Requirement{
+// RuntimeTrust returns the signed peers admitted to FuseKit's two trust lanes.
+func RuntimeTrust(requiredAppGroup string) holder.RuntimeTrust {
+	return holder.RuntimeTrust{
+		Controller: daemonkit.Requirement{TeamID: TeamID, SigningIdentifier: BundleID},
+		FileProviderExtension: daemonkit.Requirement{
 			TeamID: TeamID, SigningIdentifier: fileProviderBundleID, RequiredAppGroup: requiredAppGroup,
 		},
 	}

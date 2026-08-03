@@ -3,21 +3,18 @@ package holderbridge
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"reflect"
 	"testing"
 
-	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/holder"
 )
 
 func TestNewRuntimeSuppliesExactRuntimeDeadlines(t *testing.T) {
 	want := errors.New("stop after config capture")
-	store := &proc.FileStore{Path: filepath.Join(t.TempDir(), "stop-processes.db")}
-	requirements := RuntimeTrustRequirements("group.com.yasyf.cc-pool")
+	trust := RuntimeTrust("group.com.yasyf.cc-pool")
 	var got holder.Config
 	runtime, err := newRuntime(
-		t.Context(), RuntimeSpec{TrustRequirements: requirements, StopControlStore: store},
+		t.Context(), RuntimeSpec{Trust: trust},
 		func(_ context.Context, config holder.Config) (*holder.Runtime, error) {
 			got = config
 			return nil, want
@@ -43,8 +40,8 @@ func TestNewRuntimeSuppliesExactRuntimeDeadlines(t *testing.T) {
 	if got.RuntimeBuild != got.Plan.BuildID() {
 		t.Fatalf("holder config build = %q, plan build = %q", got.RuntimeBuild, got.Plan.BuildID())
 	}
-	if !reflect.DeepEqual(got.TrustRequirements, requirements) || got.StopControlStore != store {
-		t.Fatalf("holder trust/stop authority = %#v/%T", got.TrustRequirements, got.StopControlStore)
+	if !reflect.DeepEqual(got.Trust, trust) {
+		t.Fatalf("holder trust = %#v", got.Trust)
 	}
 }
 

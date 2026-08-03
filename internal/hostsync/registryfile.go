@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/overlay"
-	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/durable"
 	"github.com/yasyf/synckit/cregistry"
 )
 
@@ -135,15 +135,13 @@ func canonicalRegistry(reg Registry) ([]byte, string, error) {
 // WithLock runs fn under the exclusive registry flock; the signature matches
 // converge.Reconcile's lock parameter.
 func (rf RegistryFile) WithLock(ctx context.Context, fn func() error) error {
-	h, err := (proc.FileLockSpec{
-		Path:     rf.LockPath,
-		Mode:     proc.FileLockExclusive,
-		Deadline: 30 * time.Second,
-	}).Acquire(ctx)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	lock, err := durable.AcquireLock(ctx, rf.LockPath)
 	if err != nil {
 		return fmt.Errorf("acquire registry lock: %w", err)
 	}
-	defer func() { _ = h.Close() }()
+	defer func() { _ = lock.Close() }()
 	return fn()
 }
 

@@ -4,7 +4,6 @@ import (
 	"context"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogservice"
 	"github.com/yasyf/fusekit/holder"
@@ -25,8 +24,7 @@ const (
 // RuntimeSpec defines cc-pool's complete FuseKit runtime policy.
 type RuntimeSpec struct {
 	Plan              holder.RuntimePlan
-	TrustRequirements holder.RuntimeTrustRequirements
-	StopControlStore  *proc.FileStore
+	Trust             holder.RuntimeTrust
 	Owner             catalog.SourceAuthorityFleetOwnerID
 	Drivers           holder.DriverFactories
 	CatalogAuthorizer catalogservice.Authorizer
@@ -46,7 +44,7 @@ func newRuntime(
 ) (*holder.Runtime, error) {
 	config := holder.Config{
 		Plan: spec.Plan, RuntimeBuild: spec.Plan.BuildID(),
-		TrustRequirements: spec.TrustRequirements, StopControlStore: spec.StopControlStore,
+		Trust: spec.Trust,
 		Owner: spec.Owner, Drivers: spec.Drivers,
 		CatalogAuthorizer:       spec.CatalogAuthorizer,
 		Authorizer:              spec.Authorizer,
