@@ -2,9 +2,11 @@ package tenantfs
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/yasyf/daemonkit"
+	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/catalogservice"
 	"github.com/yasyf/fusekit/mountproto"
@@ -50,17 +52,34 @@ func TestNativeOperationsAreExhaustivelyRejected(t *testing.T) {
 	}
 }
 
-func TestUnforwardedTenantCatalogRequestsAreRejected(t *testing.T) {
-	if _, err := catalogAuthorization(
-		catalogproto.OperationCatalogLookup,
-		catalogservice.Route{Tenant: "tenant"},
-	); err == nil {
-		t.Fatal("unforwarded tenant catalog request was authorized")
+func testAccountRoute(t *testing.T) (catalogservice.Route, catalogservice.Authorization) {
+	t.Helper()
+	tenantID, err := Account{InstanceID: testInstanceID}.TenantID()
+	if err != nil {
+		t.Fatalf("TenantID: %v", err)
+	}
+	domain, err := catalogproto.DeriveDomainID(OwnerID, catalogproto.PresentationInstanceID(testInstanceID))
+	if err != nil {
+		t.Fatalf("DeriveDomainID: %v", err)
+	}
+	route := catalogservice.Route{Tenant: tenantID, Generation: 3}
+	return route, catalogservice.Authorization{
+		Principal:    "cc-pool-fileprovider",
+		Role:         catalogservice.RoleFileProvider,
+		Presentation: catalog.PresentationFileProvider,
+		Route: catalogservice.Route{
+			Tenant: route.Tenant, Generation: route.Generation, Domain: domain, Forwarded: true,
+		},
 	}
 }
 
-func TestProductAdminCatalogOperationsAreExternallyRejected(t *testing.T) {
+// Product admin and tenant owner operations are refused one layer up, by
+// FuseKit's own role check: this authorizer issues RoleFileProvider whatever
+// the operation, and RoleFileProvider admits no admin operation.
+func TestCatalogAuthorizationGrantsOnlyTheFileProviderRole(t *testing.T) {
+	route, want := testAccountRoute(t)
 	for _, operation := range []catalogproto.Operation{
+		catalogproto.OperationCatalogLookupPrivate,
 		catalogproto.OperationTenantPrepare,
 		catalogproto.OperationPresentationLeaseCommit,
 		catalogproto.OperationPresentationLeaseRenew,
@@ -68,10 +87,81 @@ func TestProductAdminCatalogOperationsAreExternallyRejected(t *testing.T) {
 		catalogproto.OperationSourceAuthorityPublishDesiredFleet,
 		catalogproto.OperationSourceAuthorityReadDesiredFleet,
 	} {
-		for _, route := range []catalogservice.Route{{}, {Tenant: "tenant"}, {Tenant: "tenant", Domain: "domain"}} {
-			if _, err := catalogAuthorization(operation, route); err == nil {
-				t.Fatalf("product admin operation %q accepted route %+v", operation, route)
+		t.Run(string(operation), func(t *testing.T) {
+			authorization, err := catalogAuthorization(operation, route)
+			if err != nil {
+				t.Fatalf("catalogAuthorization: %v", err)
 			}
-		}
+			if authorization != want {
+				t.Fatalf("catalogAuthorization = %+v, want %+v", authorization, want)
+			}
+		})
+	}
+}
+
+func TestCatalogAuthorizationDerivesTheDomainFromTheTenant(t *testing.T) {
+	route, want := testAccountRoute(t)
+	route.Domain = "com.yasyf.cc-pool.chosen-by-the-caller"
+	authorization, err := catalogAuthorization(catalogproto.OperationCatalogLookupPrivate, route)
+	if err != nil {
+		t.Fatalf("catalogAuthorization: %v", err)
+	}
+	if authorization != want {
+		t.Fatalf("catalogAuthorization = %+v, want the tenant-derived route %+v", authorization, want)
+	}
+}
+
+func TestCatalogAuthorizationRequiresAGenerationFencedAccountTenant(t *testing.T) {
+	route, _ := testAccountRoute(t)
+	foreign, err := catalog.NewTenantID("tenant")
+	if err != nil {
+		t.Fatalf("NewTenantID: %v", err)
+	}
+	malformed, err := catalog.NewTenantID(accountTenantPrefix + "beef")
+	if err != nil {
+		t.Fatalf("NewTenantID: %v", err)
+	}
+	tests := []struct {
+		name  string
+		route catalogservice.Route
+	}{
+		{"no tenant", catalogservice.Route{Generation: route.Generation}},
+		{"no generation", catalogservice.Route{Tenant: route.Tenant}},
+		{"tenant outside the account namespace", catalogservice.Route{Tenant: foreign, Generation: route.Generation}},
+		{"account tenant with a malformed instance", catalogservice.Route{Tenant: malformed, Generation: route.Generation}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := catalogAuthorization(catalogproto.OperationCatalogLookupPrivate, tt.route)
+			if !errors.Is(err, errUnauthorized) {
+				t.Fatalf("catalogAuthorization(%+v) = %v, want %v", tt.route, err, errUnauthorized)
+			}
+		})
+	}
+}
+
+func TestBrokerCatalogOperationsRequireAnUntenantedRoute(t *testing.T) {
+	route, _ := testAccountRoute(t)
+	for _, operation := range []catalogproto.Operation{
+		catalogproto.OperationBrokerPoll,
+		catalogproto.OperationBrokerResult,
+	} {
+		t.Run(string(operation), func(t *testing.T) {
+			authorization, err := catalogAuthorization(operation, catalogservice.Route{})
+			if err != nil {
+				t.Fatalf("catalogAuthorization: %v", err)
+			}
+			want := catalogservice.Authorization{
+				Principal:    "cc-pool-fileprovider",
+				Role:         catalogservice.RoleFileProvider,
+				Presentation: catalog.PresentationFileProvider,
+			}
+			if authorization != want {
+				t.Fatalf("catalogAuthorization = %+v, want the untenanted broker session %+v", authorization, want)
+			}
+			if _, err := catalogAuthorization(operation, route); !errors.Is(err, errUnauthorized) {
+				t.Fatalf("broker operation accepted tenant route %+v: %v", route, err)
+			}
+		})
 	}
 }
