@@ -143,7 +143,7 @@ func (r *hostSyncWorkerRemover) runtime(ctx context.Context) (*tenantCoordinator
 	return r.coordinator, nil
 }
 
-func (r *hostSyncWorkerRemover) Close() error {
+func (r *hostSyncWorkerRemover) Close(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.cancel != nil {
@@ -153,9 +153,7 @@ func (r *hostSyncWorkerRemover) Close() error {
 	if r.client == nil {
 		return nil
 	}
-	closeCtx, cancel := context.WithTimeout(context.Background(), hostSyncWorkerScopeTimeout)
-	defer cancel()
-	err := r.client.Close(closeCtx)
+	err := r.client.Close(ctx)
 	r.client = nil
 	r.coordinator = nil
 	return err
@@ -194,7 +192,9 @@ func RunHostSyncWorker(
 	}
 	remover := &hostSyncWorkerRemover{lifecycle: ctx, manager: manager}
 	defer func() {
-		err = errors.Join(err, remover.Close(), manager.Close())
+		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hostSyncWorkerScopeTimeout)
+		defer cancel()
+		err = errors.Join(err, remover.Close(closeCtx), manager.Close())
 	}()
 
 	manifestPath, err := hostsync.ManifestPath()
