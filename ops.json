@@ -1,1 +1,1 @@
-{"v":1,"lamport":4,"session":"cfa0f537-f63b-4af9-844c-1efcf2ab6814","ops":[{"kind":"remove_criterion","id":"1f1be7bdfa765233f452e53d0ca06001"}]}
+{"v":1,"lamport":5,"session":"cfa0f537-f63b-4af9-844c-1efcf2ab6814","ops":[{"kind":"add_criterion","id":"4b55f369f68469608bc78787bfff5d43","text":"At cc-pool v0.21 ship time: confirm both idx_*_owner indexes are still present (restored by b1d2e93 for 0.64.x fingerprint parity) — the schema must match v0.64.9's fingerprint exactly","script":""}]}
