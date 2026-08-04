@@ -134,7 +134,7 @@ func requireDaemon(m *pool.Manager, purpose string) (*daemon.Client, error) {
 			_ = cl.Close()
 		}
 	}()
-	health, err := cl.Health()
+	health, err := daemonHealthContext(context.Background(), cl)
 	switch {
 	case errors.Is(err, daemon.ErrDaemonUnavailable):
 		return nil, fmt.Errorf("%s, which is not running; start it with `ccp service install` and re-run: %w", purpose, err)

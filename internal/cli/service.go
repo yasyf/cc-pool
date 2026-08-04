@@ -36,7 +36,14 @@ var (
 		return client.Ensure(ctx)
 	}
 	removeLegacyDaemon = daemon.RemoveLegacyDaemon
-	stopDaemonRuntime  = func(ctx context.Context) error {
+	// daemonHealthContext is the Control-routed health observation, seamed
+	// because daemonkit's control lane refuses an in-process self-attach
+	// (daemonkit control.go:136): a test daemon serves the business lane
+	// in-process but can never answer this verb.
+	daemonHealthContext = func(ctx context.Context, cl *daemon.Client) (*daemon.HealthResponse, error) {
+		return cl.HealthContext(ctx)
+	}
+	stopDaemonRuntime = func(ctx context.Context) error {
 		if err := removeLegacyDaemon(ctx); err != nil {
 			return err
 		}
@@ -99,7 +106,7 @@ func newServiceCmd() *cobra.Command {
 			RunE: func(cmd *cobra.Command, _ []string) error {
 				out := cmd.OutOrStdout()
 				cl := daemon.NewClient()
-				resp, healthErr := cl.Health()
+				resp, healthErr := daemonHealthContext(context.Background(), cl)
 				_ = cl.Close()
 				if healthErr == nil {
 					_, _ = fmt.Fprintf(out, "Daemon: running (%s)\n", resp.RuntimeBuild)
@@ -336,7 +343,7 @@ func daemonAt(wantVersion string) bool {
 func daemonHealth(ctx context.Context, wantVersion string) error {
 	cl := daemon.NewClient()
 	defer func() { _ = cl.Close() }()
-	resp, err := cl.HealthContext(ctx)
+	resp, err := daemonHealthContext(ctx, cl)
 	if err != nil {
 		return err
 	}

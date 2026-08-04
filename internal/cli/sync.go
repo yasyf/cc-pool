@@ -50,7 +50,7 @@ var synckitdRun = func(ctx context.Context, args ...string) error {
 var syncEnsureDaemon = func(ctx context.Context) bool {
 	cl := daemon.NewClient()
 	defer func() { _ = cl.Close() }()
-	health, err := cl.HealthContext(ctx)
+	health, err := daemonHealthContext(ctx, cl)
 	return err == nil && health.RuntimeBuild == version.String()
 }
 

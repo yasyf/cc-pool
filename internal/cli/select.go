@@ -153,7 +153,7 @@ func resolveSelectionTxn(ctx context.Context, cmd *cobra.Command, m *pool.Manage
 			_ = cl.Close()
 		}
 	}()
-	health, err := cl.HealthContext(ctx)
+	health, err := daemonHealthContext(ctx, cl)
 	if errors.Is(err, daemon.ErrDaemonUnavailable) {
 		health, err = startSelectionDaemon(ctx, cmd, cl)
 	}
@@ -228,7 +228,7 @@ func startSelectionDaemon(ctx context.Context, cmd *cobra.Command, cl *daemon.Cl
 	want := version.String()
 	step(cmd.OutOrStdout(), "Starting the cc-pool daemon…")
 	if err := installSelectionDaemon(ctx, cmd); err != nil {
-		health, healthErr := cl.HealthContext(ctx)
+		health, healthErr := daemonHealthContext(ctx, cl)
 		if healthErr == nil && health.RuntimeBuild == want {
 			return health, nil
 		}
@@ -244,7 +244,7 @@ func startSelectionDaemon(ctx context.Context, cmd *cobra.Command, cl *daemon.Cl
 	var health *daemon.HealthResponse
 	var err error
 	for {
-		health, err = cl.HealthContext(waitCtx)
+		health, err = daemonHealthContext(waitCtx, cl)
 		if err == nil && health.RuntimeBuild == want {
 			return health, nil
 		}

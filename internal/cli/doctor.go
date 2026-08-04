@@ -46,7 +46,7 @@ func runDoctor(cmd *cobra.Command, manager *pool.Manager) error {
 	defer func() { _ = client.Close() }()
 	ctx, cancel := context.WithTimeout(cmd.Context(), 3*time.Second)
 	defer cancel()
-	health, err := client.HealthContext(ctx)
+	health, err := daemonHealthContext(ctx, client)
 	if err != nil {
 		fail(cmd.ErrOrStderr(), "daemon/FuseKit readiness: %v", err)
 		return fmt.Errorf("doctor found unhealthy state")
