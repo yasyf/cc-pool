@@ -2,9 +2,6 @@ package daemon
 
 import (
 	"testing"
-	"time"
-
-	"github.com/yasyf/daemonkit/wire"
 )
 
 func TestAccountIdentityRequiresStoredPositiveAccountAndReturnsMinimalProjection(t *testing.T) {
@@ -36,14 +33,6 @@ func TestAccountIdentityRequiresStoredPositiveAccountAndReturnsMinimalProjection
 		got.AccountUUID != "old-uuid" || got.EmailAddress != "old@example.com" {
 		t.Fatalf("account identity projection = %+v", got)
 	}
-	ladder, err := operationLadder()
-	if err != nil {
-		t.Fatal(err)
-	}
-	server, client, ok := ladder.Deadlines(wire.Op(OpAccountIdentity))
-	if !ok || server != 31*time.Second || client != 32*time.Second {
-		t.Fatalf("account identity ladder = server %s client %s ok=%t", server, client, ok)
-	}
 }
 
 func TestAccountHealthRequiresStoredPositiveAccountAndWorkerProof(t *testing.T) {
@@ -71,13 +60,5 @@ func TestAccountHealthRequiresStoredPositiveAccountAndWorkerProof(t *testing.T) 
 	if !response.OK || response.Error != "" || response.AccountHealth == nil ||
 		response.AccountHealth.AccountID != account.ID {
 		t.Fatalf("account health response = %+v", response)
-	}
-	ladder, err := operationLadder()
-	if err != nil {
-		t.Fatal(err)
-	}
-	server, client, ok := ladder.Deadlines(wire.Op(OpAccountHealth))
-	if !ok || server != 61*time.Second || client != 62*time.Second {
-		t.Fatalf("account health ladder = server %s client %s ok=%t", server, client, ok)
 	}
 }

@@ -298,6 +298,23 @@ func (s *Server) armAccountMutationSessionTeardown(session daemonkit.Session) {
 	}()
 }
 
+// releaseAccountMutationOperation closes every session's attachment on one
+// operation: acknowledgement retires the terminal, and a retained attachment
+// would refuse the retirement it is stale against.
+func (s *Server) releaseAccountMutationOperation(operationID store.AccountMutationID) {
+	s.pollMu.Lock()
+	attachments := make([]*pollAttachment, 0, len(s.pollAttachments))
+	for key, pa := range s.pollAttachments {
+		if key.operation == operationID {
+			attachments = append(attachments, pa)
+		}
+	}
+	s.pollMu.Unlock()
+	for _, pa := range attachments {
+		pa.close()
+	}
+}
+
 func (s *Server) releaseAccountMutationSession(id uint64) {
 	s.pollMu.Lock()
 	attachments := make([]*pollAttachment, 0, len(s.pollAttachments))

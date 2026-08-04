@@ -1,9 +1,9 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -22,8 +22,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/cc-pool/internal/testhome"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalogproto"
 )
 
@@ -32,12 +31,12 @@ func TestAccountMutationStartOrAttachCoalescesExactIntentBeforeCredentialIO(t *t
 	request := AccountMutationRequest{
 		Kind: AccountMutationRelogin, Action: AccountMutationStartOrAttach, AccountID: account.ID,
 	}
-	first, err := runAccountMutationTest(t, s, request, nil)
+	first, err := runAccountMutationTest(t, s, request)
 	if err != nil || first.State != AccountMutationAwaitingInput {
 		t.Fatalf("first begin = %+v err=%v", first, err)
 	}
 	touched := len(fake.TouchedServices())
-	second, err := runAccountMutationTest(t, s, request, nil)
+	second, err := runAccountMutationTest(t, s, request)
 	if err != nil || second.OperationID != first.OperationID {
 		t.Fatalf("second begin = %+v err=%v; want operation %x", second, err, first.OperationID)
 	}
@@ -45,7 +44,7 @@ func TestAccountMutationStartOrAttachCoalescesExactIntentBeforeCredentialIO(t *t
 		t.Fatalf("coalesced begin performed credential I/O: touched %d -> %d", touched, got)
 	}
 	request.Label = "different-intent"
-	if _, err := runAccountMutationTest(t, s, request, nil); err == nil {
+	if _, err := runAccountMutationTest(t, s, request); err == nil {
 		t.Fatal("different-label begin attached to active mutation")
 	}
 	if got := len(fake.TouchedServices()); got != touched {
@@ -58,19 +57,19 @@ func TestAccountMutationReceiptReplaysBeforeCredentialIO(t *testing.T) {
 	beginRequest := AccountMutationRequest{
 		Kind: AccountMutationRelogin, Action: AccountMutationStartOrAttach, AccountID: account.ID,
 	}
-	begin, err := runAccountMutationTest(t, s, beginRequest, nil)
+	begin, err := runAccountMutationTest(t, s, beginRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
 	cancel := beginRequest
 	cancel.Action = AccountMutationCancel
 	cancel.Fence = begin.Fence
-	terminal, err := runAccountMutationTest(t, s, cancel, nil)
+	terminal, err := runAccountMutationTest(t, s, cancel)
 	if err != nil || terminal.State != AccountMutationCancelled {
 		t.Fatalf("cancel = %+v err=%v", terminal, err)
 	}
 	touched := len(fake.TouchedServices())
-	replayed, err := runAccountMutationTest(t, s, beginRequest, nil)
+	replayed, err := runAccountMutationTest(t, s, beginRequest)
 	if err != nil || replayed.OperationID != begin.OperationID || replayed.State != AccountMutationCancelled {
 		t.Fatalf("receipt replay = %+v err=%v", replayed, err)
 	}
@@ -78,7 +77,7 @@ func TestAccountMutationReceiptReplaysBeforeCredentialIO(t *testing.T) {
 		t.Fatalf("receipt replay performed credential I/O: touched %d -> %d", touched, got)
 	}
 	beginRequest.Label = "different-intent"
-	if _, err := runAccountMutationTest(t, s, beginRequest, nil); err == nil {
+	if _, err := runAccountMutationTest(t, s, beginRequest); err == nil {
 		t.Fatal("different-label begin replayed an unrelated receipt")
 	}
 	if got := len(fake.TouchedServices()); got != touched {
@@ -91,18 +90,18 @@ func TestAccountMutationAddReceiptZeroScopeReplaysWithoutReservationOrCredential
 	request := AccountMutationRequest{
 		Kind: AccountMutationAdd, Action: AccountMutationStartOrAttach, Label: "new-account",
 	}
-	begin, err := runAccountMutationTest(t, s, request, nil)
+	begin, err := runAccountMutationTest(t, s, request)
 	if err != nil || begin.AccountID <= 0 {
 		t.Fatalf("add begin = %+v err=%v", begin, err)
 	}
 	cancel := request
 	cancel.Action = AccountMutationCancel
 	cancel.Fence = begin.Fence
-	if _, err := runAccountMutationTest(t, s, cancel, nil); err != nil {
+	if _, err := runAccountMutationTest(t, s, cancel); err != nil {
 		t.Fatal(err)
 	}
 	touched := len(fake.TouchedServices())
-	replayed, err := runAccountMutationTest(t, s, request, nil)
+	replayed, err := runAccountMutationTest(t, s, request)
 	if err != nil || replayed.OperationID != begin.OperationID {
 		t.Fatalf("add receipt replay = %+v err=%v", replayed, err)
 	}
@@ -131,7 +130,7 @@ func TestAccountMutationAddCommitsOneImmutablePresentationIdentity(t *testing.T)
 	request := AccountMutationRequest{
 		Kind: AccountMutationAdd, Action: AccountMutationStartOrAttach, Label: "new-account",
 	}
-	begin, err := runAccountMutationTest(t, s, request, nil)
+	begin, err := runAccountMutationTest(t, s, request)
 	if err != nil || begin.State != AccountMutationAwaitingInput {
 		t.Fatalf("add begin = %+v err=%v", begin, err)
 	}
@@ -163,7 +162,7 @@ func TestAccountMutationAddCommitsOneImmutablePresentationIdentity(t *testing.T)
 	if _, ok := fake.Get(creds.ServiceName(mutation.PresentationIdentity.PublicPath), mutation.KeychainAccount); ok {
 		t.Fatal("add probed a presentation-derived credential slot")
 	}
-	replayed, err := runAccountMutationTest(t, s, request, nil)
+	replayed, err := runAccountMutationTest(t, s, request)
 	if err != nil || replayed.OperationID != begin.OperationID || replayed.ConfigDir != wantConfigDir {
 		t.Fatalf("replayed add bind = %+v err=%v", replayed, err)
 	}
@@ -229,7 +228,7 @@ func TestAccountMutationAddCommitsOneImmutablePresentationIdentity(t *testing.T)
 	}
 	request.Action = AccountMutationStartOrAttach
 	request.Fence = AccountMutationFence{}
-	replayed, err = runAccountMutationTest(t, s, request, nil)
+	replayed, err = runAccountMutationTest(t, s, request)
 	if err != nil || !replayed.Completed || replayed.OperationID != begin.OperationID {
 		t.Fatalf("receipt replay = %+v err=%v", replayed, err)
 	}
@@ -246,7 +245,7 @@ func TestAccountMutationAddStableIdentitySurvivesStoreReopen(t *testing.T) {
 	request := AccountMutationRequest{
 		Kind: AccountMutationAdd, Action: AccountMutationStartOrAttach, Label: "restart-account",
 	}
-	begin, err := runAccountMutationTest(t, s, request, nil)
+	begin, err := runAccountMutationTest(t, s, request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,7 +299,7 @@ func TestAccountMutationAddExecutionConflictRetainsStableReplayState(t *testing.
 	request := AccountMutationRequest{
 		Kind: AccountMutationAdd, Action: AccountMutationStartOrAttach, Label: "failed-account",
 	}
-	if _, err := runAccountMutationTest(t, s, request, nil); err == nil {
+	if _, err := runAccountMutationTest(t, s, request); err == nil {
 		t.Fatal("add bind unexpectedly replaced a foreign execution link")
 	}
 	mutation, err := s.m.Store.ActiveAccountMutation(1)
@@ -336,7 +335,7 @@ func TestAccountMutationAddExecutionConflictRetainsStableReplayState(t *testing.
 	if err := os.Remove(configDir); err != nil {
 		t.Fatal(err)
 	}
-	replayed, err := runAccountMutationTest(t, s, request, nil)
+	replayed, err := runAccountMutationTest(t, s, request)
 	if err != nil || replayed.OperationID != [32]byte(mutation.OperationID) ||
 		replayed.State != AccountMutationAwaitingInput || replayed.ConfigDir != configDir {
 		t.Fatalf("replayed bind = %+v err=%v", replayed, err)
@@ -380,9 +379,7 @@ func TestAccountMutationAddRetiresUnboundPresentationBeforeCancellation(t *testi
 	request := AccountMutationRequest{
 		Kind: AccountMutationAdd, Action: AccountMutationStartOrAttach, Label: "cancel-account",
 	}
-	input := make(chan wire.Chunk)
-	close(input)
-	if _, err := s.runAccountMutation(ctx, request, input, make(chan []byte, 8)); err == nil {
+	if _, err := s.runAccountMutation(ctx, daemonkit.Session{}, request); err == nil {
 		t.Fatal("invalid presentation bind unexpectedly succeeded")
 	}
 	if retired.ID != 1 {
@@ -413,7 +410,7 @@ func TestAccountMutationCancelUnknownFenceDoesNotReserveOrReadCredential(t *test
 		Kind: AccountMutationAdd, Action: AccountMutationCancel,
 		Fence: AccountMutationFence{CanonicalOperationID: [32]byte{1}},
 	}
-	if _, err := runAccountMutationTest(t, s, request, nil); err == nil {
+	if _, err := runAccountMutationTest(t, s, request); err == nil {
 		t.Fatal("cancel with an unknown fence succeeded")
 	}
 	if got := len(fake.TouchedServices()); got != 0 {
@@ -433,7 +430,7 @@ func TestAccountMutationAttachRequiresExactFenceBeforeInput(t *testing.T) {
 	var loginCalls atomic.Int64
 	s.accountMutationTerminal = accountMutationTerminalRunnerFunc(func(
 		context.Context, store.AccountMutation, accountterminal.TerminalInput, accountterminal.TerminalSize,
-		<-chan wire.Chunk, func(context.Context, []byte) error,
+		func(context.Context, []byte) error,
 	) error {
 		loginCalls.Add(1)
 		return nil
@@ -441,7 +438,7 @@ func TestAccountMutationAttachRequiresExactFenceBeforeInput(t *testing.T) {
 	beginRequest := AccountMutationRequest{
 		Kind: AccountMutationRelogin, Action: AccountMutationStartOrAttach, AccountID: account.ID,
 	}
-	begin, err := runAccountMutationTest(t, s, beginRequest, nil)
+	begin, err := runAccountMutationTest(t, s, beginRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -449,16 +446,12 @@ func TestAccountMutationAttachRequiresExactFenceBeforeInput(t *testing.T) {
 	attach.Action = AccountMutationProvideInput
 	attach.Fence = begin.Fence
 	attach.Fence.RegistrySequence++
-	input := make(chan wire.Chunk, 1)
-	input <- accountMutationInputChunk(t, []byte("input that must remain unread"))
-	if _, err := runAccountMutationTest(t, s, attach, input); err == nil {
+	attach.Input = accountMutationInputPayload(t, []byte("input that must remain unread"))
+	if _, err := runAccountMutationTest(t, s, attach); err == nil {
 		t.Fatal("attach accepted a mismatched fence")
 	}
 	if loginCalls.Load() != 0 {
 		t.Fatalf("mismatched fence started %d terminal workers", loginCalls.Load())
-	}
-	if len(input) != 1 {
-		t.Fatal("mismatched fence consumed terminal input")
 	}
 	if got := len(fake.TouchedServices()); got == 0 {
 		t.Fatal("begin did not establish the credential baseline")
@@ -470,7 +463,7 @@ func TestAccountMutationDisconnectBeforeInputLeavesAwaitingInput(t *testing.T) {
 	var loginCalls atomic.Int64
 	s.accountMutationTerminal = accountMutationTerminalRunnerFunc(func(
 		context.Context, store.AccountMutation, accountterminal.TerminalInput, accountterminal.TerminalSize,
-		<-chan wire.Chunk, func(context.Context, []byte) error,
+		func(context.Context, []byte) error,
 	) error {
 		loginCalls.Add(1)
 		return nil
@@ -478,16 +471,15 @@ func TestAccountMutationDisconnectBeforeInputLeavesAwaitingInput(t *testing.T) {
 	request := AccountMutationRequest{
 		Kind: AccountMutationRelogin, Action: AccountMutationStartOrAttach, AccountID: account.ID,
 	}
-	begin, err := runAccountMutationTest(t, s, request, nil)
+	begin, err := runAccountMutationTest(t, s, request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	touched := len(fake.TouchedServices())
 	request.Action = AccountMutationProvideInput
 	request.Fence = begin.Fence
-	closed := make(chan wire.Chunk)
-	close(closed)
-	result, err := runAccountMutationTest(t, s, request, closed)
+	request.Input = accountMutationEOFPayload(t)
+	result, err := runAccountMutationTest(t, s, request)
 	if err != nil || result.State != AccountMutationAwaitingInput {
 		t.Fatalf("pre-input disconnect = %+v err=%v", result, err)
 	}
@@ -506,7 +498,7 @@ func TestAccountMutationDuplicateTerminalAttachRunsOneSemanticOperation(t *testi
 	var loginCalls atomic.Int64
 	s.accountMutationTerminal = accountMutationTerminalRunnerFunc(func(
 		context.Context, store.AccountMutation, accountterminal.TerminalInput, accountterminal.TerminalSize,
-		<-chan wire.Chunk, func(context.Context, []byte) error,
+		func(context.Context, []byte) error,
 	) error {
 		if loginCalls.Add(1) == 1 {
 			close(started)
@@ -517,21 +509,16 @@ func TestAccountMutationDuplicateTerminalAttachRunsOneSemanticOperation(t *testi
 	request := AccountMutationRequest{
 		Kind: AccountMutationRelogin, Action: AccountMutationStartOrAttach, AccountID: account.ID,
 	}
-	begin, err := runAccountMutationTest(t, s, request, nil)
+	begin, err := runAccountMutationTest(t, s, request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	request.Action = AccountMutationProvideInput
 	request.Fence = begin.Fence
-	input := func() <-chan wire.Chunk {
-		chunks := make(chan wire.Chunk, 1)
-		chunks <- accountMutationInputChunk(t, []byte("\n"))
-		close(chunks)
-		return chunks
-	}
+	request.Input = accountMutationInputPayload(t, []byte("\n"))
 	firstDone := make(chan error, 1)
 	go func() {
-		_, err := runAccountMutationTest(t, s, request, input())
+		_, err := runAccountMutationTest(t, s, request)
 		firstDone <- err
 	}()
 	select {
@@ -539,319 +526,22 @@ func TestAccountMutationDuplicateTerminalAttachRunsOneSemanticOperation(t *testi
 	case <-time.After(time.Second):
 		t.Fatal("first terminal did not start")
 	}
-	secondCtx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	secondCtx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
-	_, secondErr := s.runAccountMutation(secondCtx, request, input(), make(chan []byte, 8))
-	if !errors.Is(secondErr, context.DeadlineExceeded) {
-		t.Fatalf("duplicate attach = %v, want wait on shared operation until context deadline", secondErr)
+	second, secondErr := s.runAccountMutation(secondCtx, daemonkit.Session{}, request)
+	if secondErr != nil || second.OperationID != request.Fence.CanonicalOperationID {
+		close(release)
+		t.Fatalf("duplicate provide-input = %+v err=%v, want the shared operation", second, secondErr)
 	}
 	close(release)
-	if err := <-firstDone; err == nil {
+	if err := <-firstDone; err != nil {
+		t.Fatalf("primary provide-input = %v, want the run started", err)
+	}
+	if _, err := driveSettledAccountMutation(t, s, request); err == nil {
 		t.Fatal("primary unchanged terminal unexpectedly reported success")
 	}
 	if loginCalls.Load() != 1 {
 		t.Fatalf("duplicate attach started %d terminal workers, want 1", loginCalls.Load())
-	}
-}
-
-func TestAccountMutationObserverReceivesOutputAndTakesControlAfterDisconnect(t *testing.T) {
-	terminal := newTestAccountMutationTerminal()
-	started := make(chan struct{})
-	terminal.start = func(accountterminal.TerminalInput) { close(started) }
-	running := &accountMutationRun{
-		ready: make(chan struct{}), done: make(chan struct{}), terminal: terminal,
-	}
-	close(running.ready)
-
-	primary, controller, err := claimAccountMutationAttachment(t.Context(), running, nil)
-	if err != nil || !controller {
-		t.Fatalf("primary attachment = controller %t, err %v", controller, err)
-	}
-	primaryCtx, cancelPrimary := context.WithCancel(t.Context())
-	primaryInput := make(chan wire.Chunk, 1)
-	primaryInput <- accountMutationInputChunk(t, []byte("first-input"))
-	primaryOutput := make(chan []byte, 1)
-	primaryDone := make(chan error, 1)
-	server := &Server{}
-	go func() {
-		_, err := server.relayAccountMutationRun(
-			primaryCtx, running, primary, true, primaryInput, primaryOutput,
-		)
-		primaryDone <- err
-	}()
-	select {
-	case <-started:
-	case <-time.After(time.Second):
-		t.Fatal("primary attachment did not start terminal input")
-	}
-	terminal.publish([]byte("shared-output"))
-	select {
-	case frame := <-primaryOutput:
-		if string(frame[8:]) != "shared-output" {
-			t.Fatalf("primary output = %q", frame[8:])
-		}
-	case <-time.After(time.Second):
-		t.Fatal("primary attachment did not receive terminal output")
-	}
-
-	secondary, controller, err := claimAccountMutationAttachment(t.Context(), running, nil)
-	if err != nil || controller {
-		t.Fatalf("secondary attachment = controller %t, err %v", controller, err)
-	}
-	secondaryInput := make(chan wire.Chunk, 1)
-	secondaryInput <- accountMutationInputChunk(t, []byte("second-input"))
-	secondaryOutput := make(chan []byte, 1)
-	secondaryDone := make(chan error, 1)
-	go func() {
-		_, err := server.relayAccountMutationRun(
-			t.Context(), running, secondary, false, secondaryInput, secondaryOutput,
-		)
-		secondaryDone <- err
-	}()
-	select {
-	case frame := <-secondaryOutput:
-		if string(frame[8:]) != "shared-output" {
-			t.Fatalf("secondary replay = %q", frame[8:])
-		}
-	case <-time.After(time.Second):
-		t.Fatal("observer did not receive retained terminal output")
-	}
-
-	cancelPrimary()
-	if err := <-primaryDone; !errors.Is(err, context.Canceled) {
-		t.Fatalf("primary disconnect = %v, want context canceled", err)
-	}
-	deadline := time.Now().Add(time.Second)
-	for {
-		terminal.mu.Lock()
-		inputs := append([]accountterminal.TerminalInput(nil), terminal.inputs...)
-		terminal.mu.Unlock()
-		if len(inputs) == 2 {
-			if string(inputs[1].Data) != "second-input" {
-				t.Fatalf("handoff input = %q", inputs[1].Data)
-			}
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("secondary never took control; inputs = %#v", inputs)
-		}
-		time.Sleep(time.Millisecond)
-	}
-
-	terminal.settle(accountterminal.TerminalOutcome{
-		Kind: accountterminal.TerminalExited, Digest: [32]byte{1},
-	}, nil)
-	running.result = AccountMutationResult{State: AccountMutationCompleted, Completed: true}
-	close(running.done)
-	if err := <-secondaryDone; err != nil {
-		t.Fatalf("secondary settlement = %v", err)
-	}
-}
-
-func TestAccountMutationTerminalDisconnectReplaysFromExactCursor(t *testing.T) {
-	s, _, account := newAccountMutationTestServer(t, true)
-	started := make(chan struct{})
-	release := make(chan struct{})
-	var loginCalls atomic.Int64
-	s.accountMutationTerminal = accountMutationTerminalRunnerFunc(func(
-		ctx context.Context,
-		_ store.AccountMutation,
-		_ accountterminal.TerminalInput,
-		_ accountterminal.TerminalSize,
-		_ <-chan wire.Chunk,
-		emit func(context.Context, []byte) error,
-	) error {
-		loginCalls.Add(1)
-		if err := emit(ctx, []byte("first")); err != nil {
-			return err
-		}
-		close(started)
-		<-release
-		if err := emit(ctx, []byte("second")); err != nil {
-			return err
-		}
-		return errors.New("terminal exited after replay test")
-	})
-	request := AccountMutationRequest{
-		Kind: AccountMutationRelogin, Action: AccountMutationStartOrAttach, AccountID: account.ID,
-	}
-	begin, err := runAccountMutationTest(t, s, request, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	request.Action = AccountMutationProvideInput
-	request.Fence = begin.Fence
-	firstCtx, cancelFirst := context.WithCancel(t.Context())
-	firstInput := make(chan wire.Chunk, 1)
-	firstInput <- accountMutationInputChunk(t, []byte("\n"))
-	close(firstInput)
-	firstOutput := make(chan []byte, 2)
-	firstDone := make(chan error, 1)
-	go func() {
-		_, err := s.runAccountMutation(firstCtx, request, firstInput, firstOutput)
-		firstDone <- err
-	}()
-	select {
-	case <-started:
-	case <-time.After(time.Second):
-		t.Fatal("terminal did not start")
-	}
-	var firstFrame []byte
-	select {
-	case firstFrame = <-firstOutput:
-	case <-time.After(time.Second):
-		t.Fatal("first terminal frame was not delivered")
-	}
-	if got := binary.BigEndian.Uint64(firstFrame[:8]); got != 0 || string(firstFrame[8:]) != "first" {
-		t.Fatalf("first frame = sequence %d data %q", got, firstFrame[8:])
-	}
-	cancelFirst()
-	if err := <-firstDone; !errors.Is(err, context.Canceled) {
-		t.Fatalf("disconnected attach = %v, want context canceled", err)
-	}
-
-	cursor := uint64(1)
-	request.TerminalCursor = &cursor
-	secondInput := make(chan wire.Chunk)
-	close(secondInput)
-	secondOutput := make(chan []byte, 2)
-	secondDone := make(chan error, 1)
-	go func() {
-		_, err := s.runAccountMutation(t.Context(), request, secondInput, secondOutput)
-		secondDone <- err
-	}()
-	deadline := time.Now().Add(time.Second)
-	for {
-		s.accountMutationMu.Lock()
-		running := s.accountMutationRuns[store.AccountMutationID(begin.OperationID)]
-		s.accountMutationMu.Unlock()
-		attached := false
-		if running != nil {
-			terminal := running.terminal.(*testAccountMutationTerminal)
-			terminal.mu.Lock()
-			for attachment := range terminal.attachments {
-				if attachment.cursor == cursor {
-					attached = true
-					break
-				}
-			}
-			terminal.mu.Unlock()
-		}
-		if attached {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("reconnected terminal did not attach at requested cursor")
-		}
-		time.Sleep(time.Millisecond)
-	}
-	close(release)
-	var secondFrame []byte
-	select {
-	case secondFrame = <-secondOutput:
-	case err := <-secondDone:
-		t.Fatalf("reconnected terminal ended before replay: %v", err)
-	case <-time.After(time.Second):
-		t.Fatal("reconnected terminal frame was not delivered")
-	}
-	if got := binary.BigEndian.Uint64(secondFrame[:8]); got != 1 || string(secondFrame[8:]) != "second" {
-		t.Fatalf("second frame = sequence %d data %q", got, secondFrame[8:])
-	}
-	if err := <-secondDone; err == nil {
-		t.Fatal("unchanged replay terminal unexpectedly succeeded")
-	}
-	if loginCalls.Load() != 1 {
-		t.Fatalf("reconnect started %d terminal workers, want 1", loginCalls.Load())
-	}
-}
-
-func TestAccountMutationTerminalReplaysSettledReceiptBeforeAcknowledgement(t *testing.T) {
-	s, fake, account := newAccountMutationTestServer(t, true)
-	emitted := make(chan struct{})
-	release := make(chan struct{})
-	s.accountMutationTerminal = accountMutationTerminalRunnerFunc(func(
-		ctx context.Context,
-		mutation store.AccountMutation,
-		_ accountterminal.TerminalInput,
-		_ accountterminal.TerminalSize,
-		_ <-chan wire.Chunk,
-		emit func(context.Context, []byte) error,
-	) error {
-		if err := emit(ctx, []byte("before-drop")); err != nil {
-			return err
-		}
-		close(emitted)
-		<-release
-		if err := emit(ctx, []byte("after-drop")); err != nil {
-			return err
-		}
-		fake.Put(mutation.KeychainService, mutation.KeychainAccount, &creds.Credential{})
-		return errors.New("terminal failed after retained output")
-	})
-	request := AccountMutationRequest{
-		Kind: AccountMutationRelogin, Action: AccountMutationStartOrAttach, AccountID: account.ID,
-	}
-	begin, err := runAccountMutationTest(t, s, request, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	request.Action = AccountMutationProvideInput
-	request.Fence = begin.Fence
-	firstCtx, cancelFirst := context.WithCancel(t.Context())
-	firstInput := make(chan wire.Chunk, 1)
-	firstInput <- accountMutationInputChunk(t, []byte("\n"))
-	close(firstInput)
-	firstOutput := make(chan []byte, 2)
-	firstDone := make(chan error, 1)
-	go func() {
-		_, err := s.runAccountMutation(firstCtx, request, firstInput, firstOutput)
-		firstDone <- err
-	}()
-	select {
-	case <-emitted:
-	case <-time.After(time.Second):
-		t.Fatal("terminal did not emit before disconnect")
-	}
-	select {
-	case <-firstOutput:
-	case <-time.After(time.Second):
-		t.Fatal("pre-disconnect output was not delivered")
-	}
-	cancelFirst()
-	if err := <-firstDone; !errors.Is(err, context.Canceled) {
-		t.Fatalf("disconnected attach = %v, want context canceled", err)
-	}
-	close(release)
-	operationID := store.AccountMutationID(begin.OperationID)
-	deadline := time.Now().Add(time.Second)
-	for {
-		if _, err := s.m.Store.AccountMutationReceipt(operationID); err == nil {
-			break
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			t.Fatal(err)
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("terminal receipt was not persisted before reconnect")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	resume := request
-	cursor := uint64(1)
-	resume.TerminalCursor = &cursor
-	resumeInput := make(chan wire.Chunk)
-	close(resumeInput)
-	resumeOutput := make(chan []byte, 2)
-	result, err := s.runAccountMutation(t.Context(), resume, resumeInput, resumeOutput)
-	if err != nil || result.State != AccountMutationQuarantined {
-		t.Fatalf("settled reconnect = %+v err=%v", result, err)
-	}
-	frame := <-resumeOutput
-	if got := binary.BigEndian.Uint64(frame[:8]); got != 1 || string(frame[8:]) != "after-drop" {
-		t.Fatalf("retained frame = sequence %d data %q", got, frame[8:])
-	}
-	if response := s.handleAccountMutationAck(t.Context(), Request{MutationReceipt: &begin.OperationID}); !response.OK {
-		t.Fatalf("ack retained receipt = %+v", response)
 	}
 }
 
@@ -865,18 +555,16 @@ func TestAccountMutationGenerationCancellationCancelsReapsAndJoinsWatcher(t *tes
 	request := AccountMutationRequest{
 		Kind: AccountMutationRelogin, Action: AccountMutationStartOrAttach, AccountID: account.ID,
 	}
-	begin, err := runAccountMutationTest(t, s, request, nil)
+	begin, err := runAccountMutationTest(t, s, request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	request.Action = AccountMutationProvideInput
 	request.Fence = begin.Fence
-	input := make(chan wire.Chunk, 1)
-	input <- accountMutationInputChunk(t, []byte("\n"))
-	close(input)
+	request.Input = accountMutationInputPayload(t, []byte("\n"))
 	done := make(chan error, 1)
 	go func() {
-		_, err := s.runAccountMutation(t.Context(), request, input, make(chan []byte, 2))
+		_, err := driveAccountMutationTest(t, s, request)
 		done <- err
 	}()
 	select {
@@ -927,23 +615,21 @@ func TestAccountMutationTerminalFailureRearmsUnchangedOperation(t *testing.T) {
 	wantErr := errors.New("terminal exited")
 	s.accountMutationTerminal = accountMutationTerminalRunnerFunc(func(
 		context.Context, store.AccountMutation, accountterminal.TerminalInput, accountterminal.TerminalSize,
-		<-chan wire.Chunk, func(context.Context, []byte) error,
+		func(context.Context, []byte) error,
 	) error {
 		return wantErr
 	})
 	request := AccountMutationRequest{
 		Kind: AccountMutationRelogin, Action: AccountMutationStartOrAttach, AccountID: account.ID,
 	}
-	begin, err := runAccountMutationTest(t, s, request, nil)
+	begin, err := runAccountMutationTest(t, s, request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	request.Action = AccountMutationProvideInput
 	request.Fence = begin.Fence
-	input := make(chan wire.Chunk, 1)
-	input <- accountMutationInputChunk(t, []byte("\n"))
-	close(input)
-	if _, err := runAccountMutationTest(t, s, request, input); !errors.Is(err, wantErr) {
+	request.Input = accountMutationInputPayload(t, []byte("\n"))
+	if _, err := driveAccountMutationTest(t, s, request); !errors.Is(err, wantErr) {
 		t.Fatalf("terminal failure = %v, want %v", err, wantErr)
 	}
 	active, err := s.m.Store.AccountMutation(store.AccountMutationID(begin.OperationID))
@@ -960,7 +646,7 @@ func TestAccountMutationOldOwnerFenceCannotAdvanceWithoutRetirementReceipt(t *te
 	request := AccountMutationRequest{
 		Kind: AccountMutationRelogin, Action: AccountMutationStartOrAttach, AccountID: account.ID,
 	}
-	begin, err := runAccountMutationTest(t, s, request, nil)
+	begin, err := runAccountMutationTest(t, s, request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -968,31 +654,26 @@ func TestAccountMutationOldOwnerFenceCannotAdvanceWithoutRetirementReceipt(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	newOwner := proc.Record{
-		RecoveryID: pool.CredentialOwnerRecoveryID,
-		PID:        84, StartTime: "2.0", Boot: "test-boot", Comm: "cc-pool",
-		Generation: daemonTestGeneration("new-daemon-without-receipt"),
+	newOwner, err := store.MintOwnerRecord(time.Now())
+	if err != nil {
+		t.Fatal(err)
 	}
-	s.accountMutationOwner = func() (proc.Record, error) { return newOwner, nil }
+	s.accountMutationOwner = func() (store.OwnerRecord, error) { return newOwner, nil }
 	request.Action = AccountMutationCancel
 	request.Fence = begin.Fence
-	if _, err := runAccountMutationTest(t, s, request, nil); !errors.Is(err, store.ErrAccountMutationRecoveryRequired) {
+	if _, err := runAccountMutationTest(t, s, request); !errors.Is(err, store.ErrAccountMutationRecoveryRequired) {
 		t.Fatalf("old-owner cancel = %v, want recovery required", err)
 	}
 	request.Action = AccountMutationProvideInput
-	input := make(chan wire.Chunk, 1)
-	input <- accountMutationInputChunk(t, []byte("must remain unread"))
-	if _, err := runAccountMutationTest(t, s, request, input); !errors.Is(err, store.ErrAccountMutationRecoveryRequired) {
+	request.Input = accountMutationInputPayload(t, []byte("must remain unread"))
+	if _, err := runAccountMutationTest(t, s, request); !errors.Is(err, store.ErrAccountMutationRecoveryRequired) {
 		t.Fatalf("old-owner attach = %v, want recovery required", err)
-	}
-	if len(input) != 1 {
-		t.Fatal("old-owner attach consumed input before retirement proof")
 	}
 	after, err := s.m.Store.AccountMutation(before.OperationID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if after.Owner != before.Owner || after.OwnerEpoch != before.OwnerEpoch || after.State != before.State {
+	if !bytes.Equal(after.Owner, before.Owner) || after.OwnerEpoch != before.OwnerEpoch || after.State != before.State {
 		t.Fatalf("old-owner fence advanced mutation: before=%+v after=%+v", before, after)
 	}
 }
@@ -1004,7 +685,6 @@ func TestAccountMutationInvalidPostBoundaryCredentialQuarantines(t *testing.T) {
 		mutation store.AccountMutation,
 		_ accountterminal.TerminalInput,
 		_ accountterminal.TerminalSize,
-		_ <-chan wire.Chunk,
 		_ func(context.Context, []byte) error,
 	) error {
 		fake.Put(mutation.KeychainService, mutation.KeychainAccount, &creds.Credential{})
@@ -1013,16 +693,14 @@ func TestAccountMutationInvalidPostBoundaryCredentialQuarantines(t *testing.T) {
 	request := AccountMutationRequest{
 		Kind: AccountMutationRelogin, Action: AccountMutationStartOrAttach, AccountID: account.ID,
 	}
-	begin, err := runAccountMutationTest(t, s, request, nil)
+	begin, err := runAccountMutationTest(t, s, request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	request.Action = AccountMutationProvideInput
 	request.Fence = begin.Fence
-	input := make(chan wire.Chunk, 1)
-	input <- accountMutationInputChunk(t, []byte("\n"))
-	close(input)
-	result, err := runAccountMutationTest(t, s, request, input)
+	request.Input = accountMutationInputPayload(t, []byte("\n"))
+	result, err := driveAccountMutationTest(t, s, request)
 	if err != nil || result.State != AccountMutationQuarantined {
 		t.Fatalf("post-boundary invalid credential = %+v err=%v", result, err)
 	}
@@ -1050,7 +728,6 @@ func TestAccountMutationReceiptIntentSurvivesDerivedLabelPublication(t *testing.
 		mutation store.AccountMutation,
 		_ accountterminal.TerminalInput,
 		_ accountterminal.TerminalSize,
-		_ <-chan wire.Chunk,
 		_ func(context.Context, []byte) error,
 	) error {
 		credential := &creds.Credential{}
@@ -1066,22 +743,20 @@ func TestAccountMutationReceiptIntentSurvivesDerivedLabelPublication(t *testing.
 	request := AccountMutationRequest{
 		Kind: AccountMutationRelogin, Action: AccountMutationStartOrAttach, AccountID: account.ID,
 	}
-	begin, err := runAccountMutationTest(t, s, request, nil)
+	begin, err := runAccountMutationTest(t, s, request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	request.Action = AccountMutationProvideInput
 	request.Fence = begin.Fence
-	input := make(chan wire.Chunk, 1)
-	input <- accountMutationInputChunk(t, []byte("\n"))
-	close(input)
-	completed, err := runAccountMutationTest(t, s, request, input)
+	request.Input = accountMutationInputPayload(t, []byte("\n"))
+	completed, err := driveAccountMutationTest(t, s, request)
 	if err != nil || completed.State != AccountMutationCompleted || completed.Label == "" {
 		t.Fatalf("completed relogin = %+v err=%v", completed, err)
 	}
 	request.Action = AccountMutationStartOrAttach
 	request.Fence = AccountMutationFence{}
-	replayed, err := runAccountMutationTest(t, s, request, nil)
+	replayed, err := runAccountMutationTest(t, s, request)
 	if err != nil || replayed.OperationID != begin.OperationID || replayed.Label != completed.Label {
 		t.Fatalf("derived-label receipt replay = %+v err=%v", replayed, err)
 	}
@@ -1121,7 +796,6 @@ func TestPresentationQuarantinedReloginRepairsPathBeforeOrdinaryLogin(t *testing
 		mutation store.AccountMutation,
 		_ accountterminal.TerminalInput,
 		_ accountterminal.TerminalSize,
-		_ <-chan wire.Chunk,
 		_ func(context.Context, []byte) error,
 	) error {
 		terminalCalls.Add(1)
@@ -1148,7 +822,7 @@ func TestPresentationQuarantinedReloginRepairsPathBeforeOrdinaryLogin(t *testing
 	request := AccountMutationRequest{
 		Kind: AccountMutationRelogin, Action: AccountMutationStartOrAttach, AccountID: account.ID,
 	}
-	begin, err := runAccountMutationTest(t, s, request, nil)
+	begin, err := runAccountMutationTest(t, s, request)
 	if err != nil || begin.Kind != AccountMutationRelogin || begin.State != AccountMutationAwaitingInput ||
 		begin.ConfigDir != account.ConfigDir || begin.Fence.AccountGeneration != account.Generation {
 		t.Fatalf("ordinary relogin begin = %+v err=%v", begin, err)
@@ -1181,10 +855,8 @@ func TestPresentationQuarantinedReloginRepairsPathBeforeOrdinaryLogin(t *testing
 	}
 	request.Action = AccountMutationProvideInput
 	request.Fence = begin.Fence
-	input := make(chan wire.Chunk, 1)
-	input <- accountMutationInputChunk(t, []byte("\n"))
-	close(input)
-	completed, err := runAccountMutationTest(t, s, request, input)
+	request.Input = accountMutationInputPayload(t, []byte("\n"))
+	completed, err := driveAccountMutationTest(t, s, request)
 	if err != nil || !completed.Completed || completed.Kind != AccountMutationRelogin ||
 		completed.State != AccountMutationCompleted || completed.ConfigDir != account.ConfigDir {
 		t.Fatalf("completed relogin = %+v err=%v", completed, err)
@@ -1220,21 +892,19 @@ func newAccountMutationTestServerWithStore(
 ) (*Server, *credstest.Fake, store.Account) {
 	t.Helper()
 	fake := credstest.NewFake()
-	identity, err := proc.CurrentIdentity()
+	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	owner := proc.Record{
-		RecoveryID: pool.CredentialOwnerRecoveryID,
-		PID:        identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
-		Comm: identity.Comm, Executable: identity.Executable,
-		AuditToken: identity.AuditToken, Generation: daemonTestGeneration("account-mutation-test"),
+	owner, err := store.MintOwnerRecord(time.Now())
+	if err != nil {
+		t.Fatal(err)
 	}
 	authority, err := pool.NewWorkerAuthority(
 		accountMutationTestTaskRunner{
 			credentials: fake, refresher: accountMutationTestRefresher{},
 		},
-		identity.Executable, owner,
+		executable, owner,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1252,13 +922,13 @@ func newAccountMutationTestServerWithStore(
 	m.SettleCredentialWrite = func(context.Context, pool.CredentialWriteSettlement) error {
 		return nil
 	}
-	t.Cleanup(func() { _ = m.Close(t.Context()) })
+	t.Cleanup(func() { _ = m.Close() })
 	if _, err := m.Init(); err != nil {
 		t.Fatal(err)
 	}
 	s := &Server{
 		m: m, cl: newClaims(), log: log.New(io.Discard, "", 0), accountMutationLifetime: t.Context(),
-		accountMutationOwner: func() (proc.Record, error) { return owner, nil },
+		accountMutationOwner: func() (store.OwnerRecord, error) { return owner, nil },
 		provisionPresentationIdentity: func(_ context.Context, account store.Account) (store.FileProviderPresentationIdentity, error) {
 			return accountMutationTestPresentation(t, account)
 		},
@@ -1324,18 +994,60 @@ func runAccountMutationTest(
 	t *testing.T,
 	s *Server,
 	request AccountMutationRequest,
-	input <-chan wire.Chunk,
 ) (AccountMutationResult, error) {
 	t.Helper()
-	if input == nil {
-		closed := make(chan wire.Chunk)
-		close(closed)
-		input = closed
-	}
-	return s.runAccountMutation(t.Context(), request, input, make(chan []byte, 8))
+	return s.runAccountMutation(t.Context(), daemonkit.Session{}, request)
 }
 
-func accountMutationInputChunk(t *testing.T, payload []byte) wire.Chunk {
+func accountMutationEOFPayload(t *testing.T) []byte {
+	t.Helper()
+	encoded, err := encodeAccountTerminalInput(accountterminal.TerminalInput{
+		Kind: accountterminal.TerminalInputEOF,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
+// driveAccountMutationTest sends one ProvideInput and waits the run to its
+// terminal result — the settlement the retired streaming call blocked for.
+func driveAccountMutationTest(
+	t *testing.T,
+	s *Server,
+	request AccountMutationRequest,
+) (AccountMutationResult, error) {
+	t.Helper()
+	result, err := runAccountMutationTest(t, s, request)
+	if err != nil || accountMutationTerminalState(result.State) {
+		return result, err
+	}
+	return driveSettledAccountMutation(t, s, request)
+}
+
+func driveSettledAccountMutation(
+	t *testing.T,
+	s *Server,
+	request AccountMutationRequest,
+) (AccountMutationResult, error) {
+	t.Helper()
+	operationID := store.AccountMutationID(request.Fence.CanonicalOperationID)
+	s.accountMutationMu.Lock()
+	running := s.accountMutationRuns[operationID]
+	s.accountMutationMu.Unlock()
+	if running == nil {
+		t.Fatal("account mutation run settled before it could be observed")
+	}
+	select {
+	case <-running.done:
+		return running.result, running.err
+	case <-time.After(5 * time.Second):
+		t.Fatal("account mutation run did not settle")
+		return AccountMutationResult{}, nil
+	}
+}
+
+func accountMutationInputPayload(t *testing.T, payload []byte) []byte {
 	t.Helper()
 	encoded, err := encodeAccountTerminalInput(accountterminal.TerminalInput{
 		Kind: accountterminal.TerminalInputBytes, Data: payload,
@@ -1343,5 +1055,5 @@ func accountMutationInputChunk(t *testing.T, payload []byte) wire.Chunk {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return wire.Chunk{Payload: encoded}
+	return encoded
 }

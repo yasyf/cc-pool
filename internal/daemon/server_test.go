@@ -23,7 +23,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/cc-pool/internal/testhome"
-	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalogproto"
 )
 
@@ -40,19 +39,17 @@ func newDaemonTestManager(
 	credentials pool.Credentials,
 ) *pool.Manager {
 	t.Helper()
-	identity, err := proc.CurrentIdentity()
+	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	owner := proc.Record{
-		RecoveryID: pool.CredentialOwnerRecoveryID,
-		PID:        identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
-		Comm: identity.Comm, Executable: identity.Executable,
-		AuditToken: identity.AuditToken, Generation: daemonTestGeneration("daemon-test"),
+	owner, err := store.MintOwnerRecord(time.Now())
+	if err != nil {
+		t.Fatal(err)
 	}
 	authority, err := pool.NewWorkerAuthority(
 		accountMutationTestTaskRunner{credentials: credentials, refresher: refresher},
-		identity.Executable, owner,
+		executable, owner,
 	)
 	if err != nil {
 		t.Fatal(err)

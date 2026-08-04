@@ -17,8 +17,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/daemonkit/wire"
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/cc-pool/internal/workerexec"
 )
 
 type accountMutationTestTaskRunner struct {
@@ -28,8 +27,8 @@ type accountMutationTestTaskRunner struct {
 
 func (r accountMutationTestTaskRunner) Run(
 	ctx context.Context,
-	task worker.CommandRequest,
-) (worker.CommandResult, error) {
+	task workerexec.CommandRequest,
+) (workerexec.CommandResult, error) {
 	input := bytes.NewReader(task.Stdin)
 	var output bytes.Buffer
 	var err error
@@ -43,7 +42,7 @@ func (r accountMutationTestTaskRunner) Run(
 	default:
 		err = errors.New("unexpected account mutation test worker task")
 	}
-	return worker.CommandResult{Stdout: output.Bytes()}, err
+	return workerexec.CommandResult{Stdout: output.Bytes()}, err
 }
 
 func runDaemonTestCredentialCAS(
@@ -209,7 +208,6 @@ type accountMutationTerminalRunnerFunc func(
 	store.AccountMutation,
 	accountterminal.TerminalInput,
 	accountterminal.TerminalSize,
-	<-chan wire.Chunk,
 	func(context.Context, []byte) error,
 ) error
 
@@ -241,10 +239,8 @@ func (f accountMutationTerminalRunnerFunc) Start(
 ) (accountMutationTerminal, error) {
 	terminal := newTestAccountMutationTerminal()
 	terminal.start = func(first accountterminal.TerminalInput) {
-		input := make(chan wire.Chunk)
-		close(input)
 		err := f(
-			ctx, mutation, first, size, input,
+			ctx, mutation, first, size,
 			func(_ context.Context, payload []byte) error {
 				terminal.publish(payload)
 				return nil

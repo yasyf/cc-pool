@@ -18,7 +18,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/cc-pool/internal/testhome"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/holder"
@@ -834,8 +834,8 @@ func TestInitializeDoesNotRetryRawHolderTransitions(t *testing.T) {
 		name string
 		err  error
 	}{
-		{name: "starting", err: wire.ErrNotReady},
-		{name: "draining", err: wire.ErrDraining},
+		{name: "starting", err: daemonkit.ErrNotReady},
+		{name: "draining", err: daemonkit.ErrDraining},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			st := openDesiredCoordinatorStore(t, 1)

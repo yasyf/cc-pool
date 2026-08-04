@@ -4,8 +4,6 @@ import (
 	"errors"
 	"testing"
 	"time"
-
-	"github.com/yasyf/daemonkit/proc"
 )
 
 // TestLedgersWireSortsDaemonRows pins deterministic policy-then-resource order.
@@ -36,7 +34,7 @@ func TestLedgersWireSortsDaemonRows(t *testing.T) {
 	if got[0].Faulted || got[0].Strikes != 1 {
 		t.Errorf("auth.streak row = %+v, want 1 strike, no fault", got[0])
 	}
-	wantDue := now.Add(proc.Backoff{Base: rateLimitBackoffBase, Cap: rateLimitBackoffCap}.After(1))
+	wantDue := now.Add(backoff{Base: rateLimitBackoffBase, Cap: rateLimitBackoffCap}.After(1))
 	if got[1].Attempts != 1 || !got[1].NextDue.Equal(wantDue) {
 		t.Errorf("ratelimit row = %+v, want 1 attempt due at %v", got[1], wantDue)
 	}

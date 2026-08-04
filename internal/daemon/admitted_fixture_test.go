@@ -9,7 +9,6 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/daemonkit/proc"
 )
 
 func admitDaemonTestAccount(t *testing.T, st *store.Store, requested store.Account) store.Account {
@@ -26,13 +25,9 @@ func admitDaemonTestAccountAtPublicPath(
 	publicPath string,
 ) store.Account {
 	t.Helper()
-	owner := proc.Record{
-		RecoveryID: pool.CredentialOwnerRecoveryID,
-		PID:        42,
-		StartTime:  "1.0",
-		Boot:       "test-boot",
-		Comm:       "cc-pool-test",
-		Generation: daemonTestGeneration(fmt.Sprintf("admitted-account-%d", requested.ID)),
+	owner, err := store.MintOwnerRecord(time.Now())
+	if err != nil {
+		t.Fatal(err)
 	}
 	reservation, err := st.ReserveAccountIndex(owner)
 	if err != nil {

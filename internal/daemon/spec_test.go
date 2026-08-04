@@ -66,7 +66,8 @@ func TestSpecCarriesExactlyTheCurrentSchema(t *testing.T) {
 func TestSpecAcceptsAnInjectedControlRequirement(t *testing.T) {
 	want := daemonkit.Requirement{TeamID: ServiceTeamID, SigningIdentifier: ServiceRoleID}
 	spec := Spec(daemonkit.Program{}, &want)
-	if spec.Trust.Control == nil || *spec.Trust.Control != want {
+	if spec.Trust.Control == nil || spec.Trust.Control.TeamID != want.TeamID ||
+		spec.Trust.Control.SigningIdentifier != want.SigningIdentifier {
 		t.Fatalf("Trust.Control = %+v, want the injected requirement", spec.Trust.Control)
 	}
 }

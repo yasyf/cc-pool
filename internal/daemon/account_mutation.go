@@ -53,6 +53,7 @@ func (s *Server) handleAccountMutationAck(ctx context.Context, request Request) 
 		default:
 			return Response{Error: "account mutation terminal is not settled"}
 		}
+		s.releaseAccountMutationOperation(operationID)
 		if running.terminal != nil {
 			ackCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			err := running.terminal.Acknowledge(ackCtx, running.outcome.Digest)

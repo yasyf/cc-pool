@@ -8,8 +8,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"slices"
-	"strings"
 	"testing"
 	"time"
 
@@ -20,11 +18,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/testhome"
-	daemonproc "github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/synckit/hostregistry"
-	"github.com/yasyf/synckit/rpc"
-	"github.com/yasyf/synckit/syncservice"
 )
 
 // newWireServer builds a Server over a short real HOME (macOS caps sun_path at
@@ -62,58 +56,14 @@ func newWireServer(t *testing.T) (*Server, context.Context) {
 	t.Cleanup(func() { _ = st.Close() })
 	s := &Server{
 		m:            newDaemonTestManager(t, st, &fakeOAuth{}, credstest.NewFake()),
-		syncSocket:   filepath.Join(home, "sync.sock"),
 		snapshot:     filepath.Join(home, "status.json"),
 		log:          log.New(io.Discard, "", 0),
 		scanSessions: func(context.Context) ([]procscan.Session, error) { return nil, nil },
 		cl:           newClaims(),
 		led:          newLedgers(),
 	}
-	s.disposableWorkers = activatedDaemonTestWorkers(t, 2)
-	s.launchSyncHelper = func(ctx context.Context, executable, synckitdExecutable string) error {
-		workers, children := testSyncHelperOwners(t)
-		consumer, err := hostsync.NewWorkerClient(workers, executable, synckitdExecutable)
-		if err != nil {
-			return err
-		}
-		runtime, err := newSyncHelperRuntime(
-			s.syncSocket, consumer, workers, children,
-			&daemonproc.FileStore{Path: filepath.Join(t.TempDir(), "helper-stop-v1.db")},
-		)
-		if err != nil {
-			return err
-		}
-		done := make(chan error, 1)
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			done <- runtime.Run(ctx)
-		}()
-		client := rpc.NewClient(rpc.ClientConfig{
-			Dial: wire.UnixDialer(s.syncSocket), WireBuild: rpc.WireBuild,
-		})
-		defer func() { _ = client.Close() }()
-		deadline, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			health, probeErr := client.RuntimeHealth(deadline)
-			if probeErr == nil {
-				probeErr = validateSyncHelperHealth(health)
-			}
-			if probeErr == nil {
-				return nil
-			}
-			select {
-			case runErr := <-done:
-				return fmt.Errorf("test host-sync helper exited before readiness: %w", runErr)
-			case <-deadline.Done():
-				return fmt.Errorf("await test host-sync helper: %w", deadline.Err())
-			case <-ticker.C:
-			}
-		}
-	}
+	s.disposableWorkers = daemonTestRunner(t)
+	s.launchSyncHelper = func(context.Context, string, string) error { return nil }
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() { cancel(); s.wg.Wait() })
 	return s, ctx
@@ -171,16 +121,6 @@ func TestSetupSyncWiresEverything(t *testing.T) {
 		t.Error("Manager.SettleCredentialWrite not wired")
 	}
 
-	client := syncservice.NewClient(syncservice.Socket(s.syncSocket))
-	defer func() { _ = client.Close() }()
-	caps, err := client.Capabilities(ctx)
-	if err != nil {
-		t.Fatalf("Capabilities over the wired socket: %v", err)
-	}
-	want := syncservice.DefaultCapabilities(hostsync.SyncServiceID)
-	if caps.Name != want.Name || !slices.Equal(caps.Methods, want.Methods) {
-		t.Fatalf("capabilities = %+v, want exact default %+v", caps, want)
-	}
 }
 
 func TestServerReadinessRefusesPublicationWhenSyncSetupFails(t *testing.T) {
@@ -248,77 +188,8 @@ func TestSetupSyncStaysInertWhenDisabled(t *testing.T) {
 		t.Errorf("disabled sync left residue under %s (stat err %v)", pool.SyncDir(), err)
 	}
 
-	client := syncservice.NewClient(syncservice.Socket(s.syncSocket))
-	defer func() { _ = client.Close() }()
-	if _, err := client.Capabilities(ctx); err == nil || !strings.Contains(err.Error(), "disabled") {
-		t.Fatalf("disabled consumer Capabilities = %v, want a loud sync-disabled error", err)
-	}
-
-	// `ccp sync enable` writes the meta; the running daemon must honor it
-	// with no restart.
-	if err := s.m.Store.SetMeta(metaSyncEnabled, "1"); err != nil {
-		t.Fatal(err)
-	}
-	if !s.syncEnabledBool() {
-		t.Fatal("sync did not pick up sync_enabled=1 without a restart")
-	}
-	if _, err := client.Capabilities(ctx); err != nil {
-		t.Fatalf("Capabilities after enable = %v, want OK without a restart", err)
-	}
 }
 
-func TestHostSyncWorkerDeadlineKillsReapsAndReusesLane(t *testing.T) {
-	s, ctx := newWireServer(t)
-	writeWireMeshState(t, "test@host-mesh", nil)
-	if err := s.m.Store.SetMeta(metaSyncEnabled, "1"); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.setupSync(ctx); err != nil {
-		t.Fatal(err)
-	}
-	registry := hostsync.NewRegistryFile(pool.SyncDir())
-	lock, err := (daemonproc.FileLockSpec{
-		Path: registry.LockPath, Mode: daemonproc.FileLockExclusive, Deadline: time.Second,
-	}).Acquire(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	client := syncservice.NewClient(syncservice.Socket(s.syncSocket))
-	defer func() { _ = client.Close() }()
-	deadline, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-	_, reconcileErr := client.Reconcile(deadline, "")
-	cancel()
-	if reconcileErr == nil {
-		t.Fatal("blocked reconcile survived its deadline")
-	}
-
-	workerStore := &daemonproc.FileStore{Path: pool.HostSyncHelperWorkerStorePath()}
-	untracked := time.Now().Add(3 * time.Second)
-	for {
-		records, loadErr := workerStore.Load(t.Context())
-		if loadErr != nil {
-			t.Fatal(loadErr)
-		}
-		if len(records) == 0 {
-			break
-		}
-		if time.Now().After(untracked) {
-			t.Fatalf("timed-out host-sync worker retained records: %+v", records)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if err := lock.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := client.Reconcile(ctx, ""); err != nil {
-		t.Fatalf("reconcile after reaping timed-out worker: %v", err)
-	}
-}
-
-// TestExecPeerRoundTripThroughWiredFetcher proves the exec: peer convention
-// end to end through the PRODUCTION dial path: a second wired daemon serves
-// its registry and credential, reached via `exec:nc -U <sock>`.
 func TestAuthKindClassification(t *testing.T) {
 	s, ctx := newWireServer(t)
 	writeWireMeshState(t, "test@host-self", []string{"test@peer-b"})

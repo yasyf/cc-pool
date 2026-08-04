@@ -45,6 +45,9 @@ func hostSyncTestScope(t *testing.T) daemonkit.Ctx {
 func newLocalsFixture(t *testing.T) *localsFixture {
 	t.Helper()
 	testhome.Sandbox(t, t.TempDir())
+	if err := pool.EnsureStateDir(); err != nil {
+		t.Fatal(err)
+	}
 	m, err := pool.OpenHostSyncWorker(hostSyncTestScope(t))
 	if err != nil {
 		t.Fatal(err)

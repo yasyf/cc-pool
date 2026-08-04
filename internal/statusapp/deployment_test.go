@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/yasyf/cc-pool/internal/holderbridge"
@@ -217,23 +218,39 @@ func TestApplyPackagedAppRejectsACandidateOffTheRelease(t *testing.T) {
 	}
 }
 
-func TestRequireActiveServiceActivatesAndSurfacesRefusals(t *testing.T) {
-	controller := &recordingDeployer{}
-	appPath := useDeploymentMetadata(t, controller)
-	controller.activation = deploy.Activation{Generation: exactTestGeneration(appPath)}
-
+func TestRequireActiveServiceTiesTheServingPIDToTheInstalledRuntime(t *testing.T) {
+	swapDeploymentVar(t, &tenantLaneReady, func(context.Context) (daemonkit.Health, error) {
+		return daemonkit.Health{Phase: daemonkit.PhaseReady, PID: 4242}, nil
+	})
+	swapDeploymentVar(t, &deployInventory, func(...string) (deploy.Survivors, error) {
+		return deploy.Survivors{Live: []deploy.LiveProcess{{PID: 4242}}}, nil
+	})
 	if err := RequireActiveService(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if controller.activateCalls != 1 {
-		t.Fatalf("activate calls = %d, want 1", controller.activateCalls)
+
+	swapDeploymentVar(t, &deployInventory, func(...string) (deploy.Survivors, error) {
+		return deploy.Survivors{Live: []deploy.LiveProcess{{PID: 7}}}, nil
+	})
+	if err := RequireActiveService(t.Context()); err == nil ||
+		!strings.Contains(err.Error(), "does not run the installed application") {
+		t.Fatalf("foreign serving pid = %v, want an installed-runtime refusal", err)
 	}
 
 	want := errors.New("daemon never published readiness")
-	controller.activateErr = want
+	swapDeploymentVar(t, &tenantLaneReady, func(context.Context) (daemonkit.Health, error) {
+		return daemonkit.Health{}, want
+	})
 	if err := RequireActiveService(t.Context()); !errors.Is(err, want) {
-		t.Fatalf("activate error = %v, want %v", err, want)
+		t.Fatalf("readiness error = %v, want %v", err, want)
 	}
+}
+
+func swapDeploymentVar[T any](t *testing.T, target *T, replacement T) {
+	t.Helper()
+	previous := *target
+	*target = replacement
+	t.Cleanup(func() { *target = previous })
 }
 
 func TestUninstallPackagedAppDelegatesTheSealedRemoval(t *testing.T) {

@@ -513,18 +513,25 @@ func (c *Client) pollAccountMutation(
 	if err := decodeStrict(reply.Body, &page); err != nil {
 		return AccountMutationPollResponse{}, fmt.Errorf("decode account mutation poll page: %w", err)
 	}
-	if page.NextCursor != poll.TerminalCursor+uint64(len(page.Chunks)) {
-		return AccountMutationPollResponse{}, fmt.Errorf(
+	if err := validateAccountMutationPollPage(page, poll.TerminalCursor); err != nil {
+		return AccountMutationPollResponse{}, err
+	}
+	return page, nil
+}
+
+func validateAccountMutationPollPage(page AccountMutationPollResponse, cursor uint64) error {
+	if page.NextCursor != cursor+uint64(len(page.Chunks)) {
+		return fmt.Errorf(
 			"daemon poll page cursor %d does not follow %d over %d chunks",
-			page.NextCursor, poll.TerminalCursor, len(page.Chunks),
+			page.NextCursor, cursor, len(page.Chunks),
 		)
 	}
 	for _, chunk := range page.Chunks {
 		if len(chunk) == 0 || len(chunk) > accountterminal.TerminalChunkSize {
-			return AccountMutationPollResponse{}, errors.New("daemon poll chunk is empty or oversized")
+			return errors.New("daemon poll chunk is empty or oversized")
 		}
 	}
-	return page, nil
+	return nil
 }
 
 func validateAccountMutationTerminalResult(

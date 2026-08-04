@@ -35,8 +35,9 @@ var (
 		}
 		return client.Ensure(ctx)
 	}
-	stopDaemonRuntime = func(ctx context.Context) error {
-		if err := daemon.RemoveLegacyDaemon(ctx); err != nil {
+	removeLegacyDaemon = daemon.RemoveLegacyDaemon
+	stopDaemonRuntime  = func(ctx context.Context) error {
+		if err := removeLegacyDaemon(ctx); err != nil {
 			return err
 		}
 		client, err := daemonkit.Open(daemon.Spec(daemonkit.Program{}, nil))
@@ -281,7 +282,7 @@ func installDaemonService(ctx context.Context) (err error) {
 		defer cancel()
 		err = errors.Join(err, holderInstall.Rollback(rollbackCtx))
 	}()
-	if err := daemon.RemoveLegacyDaemon(ctx); err != nil {
+	if err := removeLegacyDaemon(ctx); err != nil {
 		return err
 	}
 	ensureCtx, cancel := budgeted(ctx, daemonServiceEnsureTimeout)

@@ -35,6 +35,15 @@ var (
 	makeInstalledAgents = installedServiceAgents
 	installedAppPath    = pool.WidgetAppPath
 	deployInventory     = deploy.Inventory
+	tenantLaneReady     = func(ctx context.Context) (daemonkit.Health, error) {
+		client, err := daemonkit.Open(tenantfs.Daemon())
+		if err != nil {
+			return daemonkit.Health{}, fmt.Errorf("CCPoolStatus: open the cc-pool tenant lane: %w", err)
+		}
+		readyCtx, cancel := context.WithTimeout(ctx, holderbridge.ReadinessContract().ObservationTimeout())
+		defer cancel()
+		return client.WaitReady(readyCtx)
+	}
 )
 
 // ServiceInstallReceipt binds one landed generation to the activation that
@@ -91,13 +100,7 @@ func ApplyPackagedApp(ctx context.Context, candidateSourcePath string) (ServiceI
 // inventory is what ties the answering PID to the installed application's own
 // runtime binary.
 func RequireActiveService(ctx context.Context) error {
-	client, err := daemonkit.Open(tenantfs.Daemon())
-	if err != nil {
-		return fmt.Errorf("CCPoolStatus: open the cc-pool tenant lane: %w", err)
-	}
-	readyCtx, cancel := context.WithTimeout(ctx, holderbridge.ReadinessContract().ObservationTimeout())
-	defer cancel()
-	health, err := client.WaitReady(readyCtx)
+	health, err := tenantLaneReady(ctx)
 	if err != nil {
 		return fmt.Errorf("CCPoolStatus: require the live FuseKit runtime: %w", err)
 	}
