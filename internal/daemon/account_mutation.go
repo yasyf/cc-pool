@@ -177,8 +177,17 @@ func (s *Server) resolveAccountMutationBeforeStart(
 		active.ExpectedCredentialDigest, nil, time.Now().Add(accountMutationReceiptTTL),
 	)
 	if err != nil {
+		// The row is still resumable, so the size a resize recorded for it
+		// must survive: dropping it here would silently resize the terminal
+		// a later attach starts.
 		return AccountMutationResult{}, err
 	}
+	// Only now is the operation unreachable by a further input — a resize
+	// arriving after this point is answered from the receipt and never
+	// records a size — so the stash can be dropped without leaking an entry.
+	s.accountMutationMu.Lock()
+	delete(s.accountMutationSizes, active.OperationID)
+	s.accountMutationMu.Unlock()
 	s.wakeAccountMutationPolls()
 	return accountMutationReceiptResult(resolved), nil
 }
@@ -213,7 +222,6 @@ func (s *Server) provideAccountMutationInput(
 			s.accountMutationMu.Unlock()
 			return accountMutationActiveResult(active), nil
 		case accountterminal.TerminalInputEOF:
-			delete(s.accountMutationSizes, operationID)
 			s.accountMutationMu.Unlock()
 			return s.resolveAccountMutationBeforeStart(active)
 		}
@@ -243,10 +251,7 @@ func (s *Server) provideAccountMutationInput(
 	if err != nil {
 		return AccountMutationResult{}, err
 	}
-	if err := pa.ensureControl(ctx); err != nil {
-		return AccountMutationResult{}, err
-	}
-	if err := pa.current().Send(ctx, event); err != nil {
+	if err := pa.sendInput(ctx, event); err != nil {
 		return AccountMutationResult{}, err
 	}
 	return accountMutationActiveResult(active), nil

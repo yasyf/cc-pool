@@ -48,6 +48,15 @@ type pollAttachment struct {
 	// duplicated, or misordered terminal output.
 	pageMu sync.Mutex
 
+	// controlMu serializes every transition of the controller lease —
+	// claiming it, renewing it, sending under it, and swapping the
+	// attachment it belongs to. Control state read without it can describe
+	// an attachment other than the one the caller is about to use. It is
+	// deliberately not pageMu: an input must never queue behind a parked
+	// poll. Lock order is pageMu then controlMu; nothing takes them the
+	// other way.
+	controlMu sync.Mutex
+
 	mu         sync.Mutex
 	attachment accountMutationTerminalAttachment
 	controller bool
@@ -81,6 +90,7 @@ func (s *Server) handleAccountMutationPoll(
 			Message: fmt.Sprintf("account mutation poll wait must lie in [0, %d]ms", MaxPollWaitMillis),
 		}
 	}
+	deadline := pollDeadline(ctx, poll.WaitMillis)
 	operationID := store.AccountMutationID(poll.Fence.CanonicalOperationID)
 	fence, state, done, err := s.accountMutationPollAnchor(operationID)
 	if err != nil {
@@ -100,7 +110,7 @@ func (s *Server) handleAccountMutationPoll(
 			})
 		}
 		running, state, done, err = s.awaitAccountMutationStart(
-			ctx, req.Session, operationID, *poll, state, done,
+			ctx, req.Session, operationID, deadline, state, done,
 		)
 		if err != nil {
 			return daemonkit.Reply{}, err
@@ -122,7 +132,7 @@ func (s *Server) handleAccountMutationPoll(
 	if err := pa.reposition(ctx, running, poll.TerminalCursor); err != nil {
 		return daemonkit.Reply{}, &daemonkit.ProductError{Message: err.Error()}
 	}
-	chunks, settled, err := pa.page(s.pollParkContext(ctx, poll.WaitMillis, token))
+	chunks, settled, err := pa.page(s.pollParkContext(ctx, deadline, token))
 	if err != nil {
 		return daemonkit.Reply{}, &daemonkit.ProductError{Message: err.Error()}
 	}
@@ -188,22 +198,28 @@ func (s *Server) awaitAccountMutationStart(
 	ctx context.Context,
 	session pollSession,
 	operationID store.AccountMutationID,
-	poll AccountMutationPollRequest,
+	deadline time.Time,
 	state AccountMutationState,
 	done bool,
 ) (*accountMutationRun, AccountMutationState, bool, error) {
 	key := pollKey{session: session.ID(), operation: operationID}
 	token := s.parkPreStartPoll(key)
 	defer s.unparkPreStartPoll(key, token)
-	parkCtx := s.pollParkContext(ctx, poll.WaitMillis, token)
+	parkCtx := s.pollParkContext(ctx, deadline, token)
 	if parkCtx == nil {
 		return nil, state, done, nil
 	}
 	for {
 		wake := s.accountMutationWakeWait()
-		running, err := s.liveAccountMutationRun(ctx, operationID)
+		// parkCtx, never the outer ctx: a run registered but not yet ready
+		// would otherwise hold a superseded or disconnected poll for the
+		// caller's whole deadline.
+		running, err := s.liveAccountMutationRun(parkCtx, operationID)
 		if err != nil {
-			return nil, state, done, err
+			if ctx.Err() != nil {
+				return nil, state, done, ctx.Err()
+			}
+			return nil, state, done, nil
 		}
 		if running != nil {
 			return running, state, done, nil
@@ -254,28 +270,40 @@ func pollReply(response AccountMutationPollResponse) (daemonkit.Reply, error) {
 	return daemonkit.Reply{Body: body}, nil
 }
 
-// pollParkContext bounds one park: the caller's conveyed deadline, the
-// requested wait capped at the protocol ceiling minus the reply margin, the
-// drain (Ctx.Context cancels at drain-begin), and a superseding poll all
-// release it. nil means the margin left no time to park at all.
-func (s *Server) pollParkContext(
-	ctx context.Context,
-	waitMillis int,
-	superseded <-chan struct{},
-) context.Context {
+// pollDeadline is the one absolute bound a whole poll answers within: the
+// requested wait under the protocol ceiling, or the caller's own conveyed
+// deadline when that is sooner, less the reply margin. A poll can park twice —
+// once before any run exists, once paging — and deriving both from this
+// instant is what keeps the pair inside the wait the client asked for instead
+// of doubling it.
+func pollDeadline(ctx context.Context, waitMillis int) time.Time {
 	wait := time.Duration(waitMillis) * time.Millisecond
 	if wait <= 0 {
 		wait = MaxPollWaitMillis * time.Millisecond
 	}
-	wait -= pollReplyMargin
-	if wait <= 0 {
+	deadline := time.Now().Add(wait)
+	if stated, ok := ctx.Deadline(); ok && stated.Before(deadline) {
+		deadline = stated
+	}
+	return deadline.Add(-pollReplyMargin)
+}
+
+// pollParkContext bounds one park by the poll's own deadline; the drain
+// (Ctx.Context cancels at drain-begin) and a superseding poll also release it.
+// nil means no time is left to park at all.
+func (s *Server) pollParkContext(
+	ctx context.Context,
+	deadline time.Time,
+	superseded <-chan struct{},
+) context.Context {
+	if !time.Now().Before(deadline) {
 		return nil
 	}
 	lifetime := s.accountMutationLifetime
 	if lifetime == nil {
 		return nil
 	}
-	parkCtx, cancel := context.WithTimeout(ctx, wait)
+	parkCtx, cancel := context.WithDeadline(ctx, deadline)
 	go func() {
 		select {
 		case <-superseded:
@@ -512,7 +540,22 @@ func (pa *pollAttachment) reposition(
 	if err != nil {
 		return err
 	}
+	// The whole swap — publish, then reclaim — is one control transition:
+	// a renewal or a send that observed the state between the two would read
+	// the fresh observer as a lost lease.
+	pa.controlMu.Lock()
+	defer pa.controlMu.Unlock()
 	pa.mu.Lock()
+	select {
+	case <-pa.closed:
+		// Teardown released this wrapper while the replacement was being
+		// attached; the replacement is invisible to both sweeps, so it is
+		// this call's to close rather than leak.
+		pa.mu.Unlock()
+		_ = attachment.Close()
+		return errors.New("account mutation attachment is closed")
+	default:
+	}
 	previous := pa.attachment
 	wasController := pa.controller
 	pa.attachment = attachment
@@ -521,7 +564,7 @@ func (pa *pollAttachment) reposition(
 	pa.mu.Unlock()
 	_ = previous.Close()
 	if wasController {
-		return pa.ensureControl(ctx)
+		return pa.claimControlLocked(ctx)
 	}
 	return nil
 }
@@ -604,6 +647,29 @@ func (pa *pollAttachment) page(parkCtx context.Context) (chunks [][]byte, settle
 // ensureControl claims the terminal controller for this attachment, waiting
 // out a still-leased predecessor under the caller's own deadline.
 func (pa *pollAttachment) ensureControl(ctx context.Context) error {
+	pa.controlMu.Lock()
+	defer pa.controlMu.Unlock()
+	return pa.claimControlLocked(ctx)
+}
+
+// sendInput claims control if needed and sends under the same controlMu hold,
+// so the attachment the claim verified is the attachment the input reaches.
+func (pa *pollAttachment) sendInput(
+	ctx context.Context,
+	event accountterminal.TerminalInput,
+) error {
+	pa.controlMu.Lock()
+	defer pa.controlMu.Unlock()
+	if err := pa.claimControlLocked(ctx); err != nil {
+		return err
+	}
+	return pa.current().Send(ctx, event)
+}
+
+// claimControlLocked runs with controlMu held. The controller flag it sets
+// describes the attachment it claimed on, which cannot be swapped underneath
+// it while the lock is held.
+func (pa *pollAttachment) claimControlLocked(ctx context.Context) error {
 	pa.mu.Lock()
 	controller := pa.controller
 	pa.mu.Unlock()
@@ -660,20 +726,37 @@ func (pa *pollAttachment) startControlRenewal() {
 			case <-pa.closed:
 				return
 			case <-renew.C:
-				attachment := pa.current()
+				pa.controlMu.Lock()
+				pa.mu.Lock()
+				attachment, controller := pa.attachment, pa.controller
+				pa.mu.Unlock()
+				if !controller {
+					// Between transitions, or an observer that never held the
+					// lease: there is nothing of ours to renew.
+					pa.controlMu.Unlock()
+					continue
+				}
 				renewCtx, cancel := context.WithTimeout(lifetime, accountMutationProbeWait)
 				_, err := attachment.RenewControl(renewCtx)
 				cancel()
 				if err != nil {
 					pa.mu.Lock()
-					stale := pa.attachment != attachment
+					if pa.attachment == attachment {
+						pa.controller = false
+					}
 					pa.mu.Unlock()
-					if stale {
+					pa.controlMu.Unlock()
+					if errors.Is(err, accountterminal.ErrTerminalNotController) ||
+						errors.Is(err, accountterminal.ErrTerminalControllerAttached) {
+						// The lease moved to another attachment. That is a
+						// state to re-claim from, never a reason to tear down
+						// this session's registration.
 						continue
 					}
 					pa.close()
 					return
 				}
+				pa.controlMu.Unlock()
 			}
 		}
 	}()

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -245,4 +246,69 @@ func TestPreStartPollParksAndEOFResolvesTerminal(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("pre-start poll was not released by the resolution")
 	}
+}
+
+// TestPollDeadlineBoundsTheWholePollOnce covers the doubled-park defect: a
+// poll may park before a run exists and again while paging, and both must
+// derive from one instant, so a 25s poll answers in 25s rather than 50.
+func TestPollDeadlineBoundsTheWholePollOnce(t *testing.T) {
+	t.Run("requested wait, less the reply margin", func(t *testing.T) {
+		got := time.Until(pollDeadline(context.Background(), 25_000))
+		if want := 25*time.Second - pollReplyMargin; got > want || got < want-time.Second {
+			t.Fatalf("deadline in %s, want ~%s", got, want)
+		}
+	})
+	t.Run("zero wait takes the protocol ceiling", func(t *testing.T) {
+		got := time.Until(pollDeadline(context.Background(), 0))
+		if want := MaxPollWaitMillis*time.Millisecond - pollReplyMargin; got > want || got < want-time.Second {
+			t.Fatalf("deadline in %s, want ~%s", got, want)
+		}
+	})
+	t.Run("a sooner caller deadline wins", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		got := time.Until(pollDeadline(ctx, 25_000))
+		if want := 2*time.Second - pollReplyMargin; got > want || got < want-time.Second {
+			t.Fatalf("deadline in %s, want the caller's ~%s", got, want)
+		}
+	})
+	t.Run("an already-spent budget parks not at all", func(t *testing.T) {
+		s := &Server{accountMutationLifetime: t.Context()}
+		if parkCtx := s.pollParkContext(t.Context(), time.Now().Add(-time.Second), nil); parkCtx != nil {
+			t.Fatal("a spent deadline still produced a park context")
+		}
+	})
+}
+
+// TestRepositionAfterTeardownClosesTheReplacement covers the leak where
+// teardown released the wrapper while a replacement attachment was being
+// created: the fresh attachment belongs to no sweep, so reposition must close
+// it itself rather than leave its lease held.
+func TestRepositionAfterTeardownClosesTheReplacement(t *testing.T) {
+	s, terminal, running := newPollTestRun(t)
+	operationID := store.AccountMutationID{3}
+	terminal.publish([]byte("c0"))
+	session := newFakePollSession(9)
+
+	cursor := uint64(0)
+	pa, err := s.accountMutationAttachment(session, operationID, running, &cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pa.close()
+
+	before := terminal.openAttachmentCount()
+	if err := pa.reposition(t.Context(), running, 0); err == nil ||
+		!strings.Contains(err.Error(), "closed") {
+		t.Fatalf("reposition on a closed wrapper = %v, want a closed refusal", err)
+	}
+	if got := terminal.openAttachmentCount(); got != before {
+		t.Fatalf("reposition leaked an attachment: open %d -> %d", before, got)
+	}
+}
+
+func (t *testAccountMutationTerminal) openAttachmentCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.attachments)
 }
