@@ -1951,16 +1951,31 @@ func TestStrandedRetrySettlementIsSingleFlight(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
+	var inFlight, maxInFlight atomic.Int64
+	start := make(chan struct{})
 	results := make([]error, 8)
 	clears := make([]bool, 8)
 	for i := range results {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			<-start
+			current := inFlight.Add(1)
+			for {
+				observed := maxInFlight.Load()
+				if current <= observed || maxInFlight.CompareAndSwap(observed, current) {
+					break
+				}
+			}
 			clears[i], results[i] = recovery.retryStrandedCredentialRecovery(t.Context(), account.ID)
+			inFlight.Add(-1)
 		}()
 	}
+	close(start)
 	wg.Wait()
+	if maxInFlight.Load() < 2 {
+		t.Fatalf("retries never overlapped (max in flight = %d); the race went untested", maxInFlight.Load())
+	}
 	for i, retryErr := range results {
 		if retryErr != nil || !clears[i] {
 			t.Fatalf("concurrent retry %d = cleared=%v err=%v", i, clears[i], retryErr)
