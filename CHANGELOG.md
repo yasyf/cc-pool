@@ -49,9 +49,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Confirming that the helper service is active now also confirms the process
-  answering is the installed application's own binary, by correlating the
-  serving process against the installed bundle. Previously any process running
-  as the same user satisfied the check by listening on the socket.
+  answering is the installed application's own binary: the connection itself
+  requires the installed application's signing identity, and the serving
+  process is additionally pinned to one live instance of the installed bundle
+  across the observation. Previously any process running as the same user
+  satisfied the check by listening on the socket.
 
 ## [0.64.9] - 2026-07-27
 
