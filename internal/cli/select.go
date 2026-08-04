@@ -29,7 +29,7 @@ preparing or materializing its File Provider presentation. It prints the stable 
 identifier and prepared=false. Use ` + "`ccp run`" + ` to prepare and launch Claude Code.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return withManager(cmd.Context(), func(m *pool.Manager) error {
+			return withManager(func(m *pool.Manager) error {
 				if err := requireInit(m); err != nil {
 					return err
 				}

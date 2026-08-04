@@ -18,7 +18,7 @@ func newDoctorCmd() *cobra.Command {
 		Short: "Check the account store, daemon, credentials, and FuseKit readiness",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return withManager(cmd.Context(), func(manager *pool.Manager) error {
+			return withManager(func(manager *pool.Manager) error {
 				if fix {
 					ensureDaemon(cmd)
 				}

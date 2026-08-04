@@ -17,7 +17,7 @@ each with its own ` + "`claude auth login`" + `. Running init is optional; ` + "
 same setup automatically.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return withManager(cmd.Context(), func(m *pool.Manager) error {
+			return withManager(func(m *pool.Manager) error {
 				out := cmd.OutOrStdout()
 				res, err := m.Init()
 				if err != nil {

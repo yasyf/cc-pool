@@ -34,7 +34,7 @@ unique: status and list always disambiguate by acct-NN.`,
 		// Args deliberately ArbitraryArgs: arity depends on --auto, so RunE validates.
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return withManager(cmd.Context(), func(m *pool.Manager) error {
+			return withManager(func(m *pool.Manager) error {
 				if err := requireInit(m); err != nil {
 					return err
 				}
