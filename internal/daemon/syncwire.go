@@ -14,25 +14,36 @@ import (
 	"github.com/yasyf/synckit/syncservice"
 )
 
-// setupSync constructs the host-sync engine and wires it onto the daemon.
-// Always constructed — every acting path re-reads the sync_enabled meta, so
-// enable needs no daemon restart — and it must run before serve admits any
-// handler: handlers read s.syncPull / s.authKind unlocked.
-func (s *Server) setupSync(ctx context.Context) error {
+// syncConsumerPlan carries the two executables the consumer half needs from
+// the publication half, so neither is resolved twice nor parked on Server
+// between the two calls.
+type syncConsumerPlan struct {
+	workerExecutable   string
+	synckitdExecutable string
+}
+
+// setupSyncPublication wires host sync's credential-write publication onto the
+// daemon and settles whatever the previous generation left pending. Always
+// constructed — every acting path re-reads the sync_enabled meta, so enable
+// needs no daemon restart — and it must run before serve admits any handler:
+// handlers read s.authKind unlocked. It opens no socket: the resident helper
+// stays unspawned until startSyncConsumer, so the foreign-lane claim scan that
+// runs between the two halves cannot observe a reservation of ours.
+func (s *Server) setupSyncPublication(ctx context.Context) (syncConsumerPlan, error) {
 	self, err := s.resolveSyncSelf(ctx)
 	if err != nil {
-		return err
+		return syncConsumerPlan{}, err
 	}
 	synckitdExecutable, err := resolveSynckitdExecutable()
 	if err != nil {
-		return err
+		return syncConsumerPlan{}, err
 	}
 	if s.disposableWorkers == nil {
-		return errors.New("sync requires daemon disposable workers")
+		return syncConsumerPlan{}, errors.New("sync requires daemon disposable workers")
 	}
 	workerExecutable, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("resolve credential settlement worker executable: %w", err)
+		return syncConsumerPlan{}, fmt.Errorf("resolve credential settlement worker executable: %w", err)
 	}
 
 	registry := hostsync.NewRegistryFile(pool.SyncDir())
@@ -58,25 +69,34 @@ func (s *Server) setupSync(ctx context.Context) error {
 	s.m.BuildCredentialWritePublication = credentialWritePublicationBuilder(self)
 	s.m.SettleCredentialWrite = settler.Settle
 	if err := s.m.SettlePendingCredentialWrites(ctx); err != nil {
-		return fmt.Errorf("settle pending credential writes: %w", err)
+		return syncConsumerPlan{}, fmt.Errorf("settle pending credential writes: %w", err)
 	}
 
 	worker, err := hostsync.NewWorkerClient(s.disposableWorkers, workerExecutable, synckitdExecutable)
 	if err != nil {
-		return err
+		return syncConsumerPlan{}, err
 	}
-	if err := s.startSyncHelper(ctx, workerExecutable, synckitdExecutable); err != nil {
+	s.syncSelf = self
+	s.syncAuthKind = worker.AuthKind
+	wired = true
+	return syncConsumerPlan{
+		workerExecutable:   workerExecutable,
+		synckitdExecutable: synckitdExecutable,
+	}, nil
+}
+
+// startSyncConsumer spawns the resident helper and publishes the converge
+// path, which handlers read unlocked through s.syncPull. Readiness is
+// exposure: synckitd's watcher drives a converge the moment the helper
+// answers, and that converge's disposable worker mints an owner of its own —
+// so every foreign lane must already be claimed when this runs, or the claim
+// scan retires a live worker's pending add as a dead predecessor's.
+func (s *Server) startSyncConsumer(ctx context.Context, plan syncConsumerPlan) error {
+	if err := s.startSyncHelper(ctx, plan.workerExecutable, plan.synckitdExecutable); err != nil {
 		return err
 	}
 	client := syncservice.NewClient(syncservice.Resident(hostsync.SyncServiceID))
-	defer func() {
-		if !wired {
-			_ = client.Close()
-		}
-	}()
 	s.syncClient = client
-	s.syncSelf = self
-	s.syncAuthKind = worker.AuthKind
 	s.syncPull = func(ctx context.Context) error {
 		enabled, err := s.syncEnabled()
 		if err != nil {
@@ -88,7 +108,6 @@ func (s *Server) setupSync(ctx context.Context) error {
 		_, err = client.Reconcile(ctx, "")
 		return err
 	}
-	wired = true
 	return nil
 }
 

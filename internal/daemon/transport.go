@@ -141,15 +141,17 @@ func (s *Server) publishHealth() {
 
 // startProductRuntime opens business admission in the one order the exclusion
 // argument needs: the owner is minted, the cross-era gate has already proven
-// no pre-cut daemon survives, foreign lanes are claimed, retired mutations are
-// recovered, and only then does the scheduler run.
+// no pre-cut daemon survives, foreign lanes are claimed and retired mutations
+// recovered while no worker of ours can hold a reservation, and only then do
+// the resident sync helper and the scheduler go live.
 func (s *Server) startProductRuntime(ctx context.Context) error {
 	execCtx, cancel := context.WithCancel(ctx)
 	s.execMu.Lock()
 	s.execCancel = cancel
 	s.execMu.Unlock()
 
-	if err := s.setupSync(execCtx); err != nil {
+	plan, err := s.setupSyncPublication(execCtx)
+	if err != nil {
 		cancel()
 		return fmt.Errorf("setup host sync publication: %w", err)
 	}
@@ -172,6 +174,10 @@ func (s *Server) startProductRuntime(ctx context.Context) error {
 	if err := s.recoverPendingAccountMutationPublications(execCtx); err != nil {
 		cancel()
 		return fmt.Errorf("recover account mutation publications: %w", err)
+	}
+	if err := s.startSyncConsumer(execCtx, plan); err != nil {
+		cancel()
+		return fmt.Errorf("start host sync consumer: %w", err)
 	}
 	s.log.Printf("daemon %s started; socket=%s", version.String(), s.socket)
 	s.wg.Add(1)

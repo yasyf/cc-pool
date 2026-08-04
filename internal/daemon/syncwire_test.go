@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -69,6 +70,18 @@ func newWireServer(t *testing.T) (*Server, context.Context) {
 	return s, ctx
 }
 
+// wireSync runs both halves of daemon sync setup back to back, the shape a
+// test that only wants the wired result needs; startProductRuntime is what
+// pins the foreign-lane claim that belongs between them.
+func wireSync(ctx context.Context, t *testing.T, s *Server) error {
+	t.Helper()
+	plan, err := s.setupSyncPublication(ctx)
+	if err != nil {
+		return err
+	}
+	return s.startSyncConsumer(ctx, plan)
+}
+
 // writeWireMeshState writes the shared synckit state.json under the fixture's
 // XDG_CONFIG_HOME so SynckitMesh resolves the given self and peers.
 func writeWireMeshState(t *testing.T, self string, hosts []string) {
@@ -95,7 +108,7 @@ func writeWireMeshState(t *testing.T, self string, hosts []string) {
 	}
 }
 
-// TestSetupSyncWiresEverything pins that one setupSync call constructs the
+// TestSetupSyncWiresEverything pins that the two setup halves construct the
 // mutation publisher, mesh identity, heal worker, credential settlement, and
 // helper-backed consumer socket without retaining an in-process converge path.
 func TestSetupSyncWiresEverything(t *testing.T) {
@@ -104,41 +117,116 @@ func TestSetupSyncWiresEverything(t *testing.T) {
 	if err := s.m.Store.SetMeta(metaSyncEnabled, "1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.setupSync(ctx); err != nil {
-		t.Fatalf("setupSync: %v", err)
-	}
-
-	if s.syncClient == nil || !s.syncEnabledBool() {
-		t.Fatal("sync not wired or not active with sync_enabled=1")
+	plan, err := s.setupSyncPublication(ctx)
+	if err != nil {
+		t.Fatalf("setupSyncPublication: %v", err)
 	}
 	if s.syncSelf != "test@host-mesh" {
 		t.Errorf("sync self = %q, want the mesh-resolved test@host-mesh", s.syncSelf)
 	}
-	if s.syncPull == nil {
-		t.Error("syncPull not wired")
-	}
 	if s.m.SettleCredentialWrite == nil {
 		t.Error("Manager.SettleCredentialWrite not wired")
 	}
-
+	if s.syncClient != nil || s.syncPull != nil {
+		t.Fatal("the publication half published a converge path before the helper is live")
+	}
+	if err := s.startSyncConsumer(ctx, plan); err != nil {
+		t.Fatalf("startSyncConsumer: %v", err)
+	}
+	if s.syncClient == nil || !s.syncEnabledBool() {
+		t.Fatal("sync not wired or not active with sync_enabled=1")
+	}
+	if s.syncPull == nil {
+		t.Error("syncPull not wired")
+	}
 }
 
 func TestServerReadinessRefusesPublicationWhenSyncSetupFails(t *testing.T) {
 	s, ctx := newWireServer(t)
-	s.m.BuildCredentialWritePublication = nil
-	s.m.SettleCredentialWrite = nil
 	s.launchSyncHelper = func(context.Context, string, string) error {
 		return errors.New("helper launch unavailable")
 	}
-	err := s.setupSync(ctx)
-	if err == nil {
-		t.Fatal("setupSync accepted an unavailable helper socket")
+	plan, err := s.setupSyncPublication(ctx)
+	if err != nil {
+		t.Fatalf("setupSyncPublication: %v", err)
 	}
-	if s.syncClient != nil {
-		t.Fatal("failed sync setup retained helper client")
+	if err := s.startSyncConsumer(ctx, plan); err == nil {
+		t.Fatal("startSyncConsumer accepted an unavailable helper socket")
+	}
+	if s.syncClient != nil || s.syncPull != nil {
+		t.Fatal("failed consumer start retained a converge path")
+	}
+}
+
+// TestSetupSyncPublicationUnwiresPublicationOnFailure pins that a publication
+// half that fails after installing the hooks restores what it found: the
+// manager it half-wired is the same one the caller aborts start on.
+func TestSetupSyncPublicationUnwiresPublicationOnFailure(t *testing.T) {
+	s, ctx := newWireServer(t)
+	s.m.BuildCredentialWritePublication = nil
+	s.m.SettleCredentialWrite = nil
+	s.disposableWorkers = nil
+	if _, err := s.setupSyncPublication(ctx); err == nil {
+		t.Fatal("setupSyncPublication accepted a daemon without disposable workers")
 	}
 	if s.m.BuildCredentialWritePublication != nil || s.m.SettleCredentialWrite != nil {
 		t.Fatal("failed setup retained partial credential publication wiring")
+	}
+}
+
+// TestStartProductRuntimeClaimsForeignLanesBeforeTheHelperGoesLive pins the
+// startup order the pending-add ownership argument rests on. Every host-sync
+// worker mints an owner of its own, so a reservation one holds reads as
+// foreign to a claim scan that classifies on owner bytes alone — and the scan
+// retires what it classifies. It may therefore only run while no resident
+// helper is reachable for synckitd's watcher to drive a converge through.
+func TestStartProductRuntimeClaimsForeignLanesBeforeTheHelperGoesLive(t *testing.T) {
+	s, ctx := newWireServer(t)
+	s.holderSessionDone = make(chan struct{})
+
+	deadOwner, err := store.MintOwnerRecord(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan, err := s.m.Store.ReserveAccountIndex(deadOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var live store.PendingAccountReservation
+	s.launchSyncHelper = func(context.Context, string, string) error {
+		workerOwner, mintErr := store.MintOwnerRecord(time.Now())
+		if mintErr != nil {
+			return mintErr
+		}
+		var reserveErr error
+		live, reserveErr = s.m.Store.ReserveAccountIndex(workerOwner)
+		return reserveErr
+	}
+
+	var retired []int
+	s.m.RetirePendingAdd = func(
+		_ context.Context,
+		reservation store.PendingAccountReservation,
+	) (pool.PendingAddRetirementProof, error) {
+		retired = append(retired, reservation.ID)
+		return pool.PendingAddRetirementProof{}, errors.New("fixture retires no presentation")
+	}
+
+	if err := s.startProductRuntime(ctx); err != nil {
+		t.Fatalf("startProductRuntime: %v", err)
+	}
+	if live.ID == 0 {
+		t.Fatal("the helper stub never reserved a pending add")
+	}
+	if !slices.Contains(retired, orphan.ID) {
+		t.Errorf("retired = %v, want the dead predecessor's acct-%02d reservation claimed", retired, orphan.ID)
+	}
+	if slices.Contains(retired, live.ID) {
+		t.Fatalf(
+			"retired = %v: the claim scan retired live host-sync worker reservation acct-%02d",
+			retired, live.ID,
+		)
 	}
 }
 
@@ -148,8 +236,8 @@ func TestServerReadinessRefusesPublicationWhenSyncSetupFails(t *testing.T) {
 func TestSetupSyncStaysInertWhenDisabled(t *testing.T) {
 	s, ctx := newWireServer(t)
 	// No mesh state: self falls back to the hostname without failing setup.
-	if err := s.setupSync(ctx); err != nil {
-		t.Fatalf("setupSync: %v", err)
+	if err := wireSync(ctx, t, s); err != nil {
+		t.Fatalf("wire sync: %v", err)
 	}
 	if s.syncClient == nil || s.syncSelf == "" {
 		t.Fatal("sync not wired, or self empty on the hostname fallback")
@@ -170,6 +258,7 @@ func TestSetupSyncStaysInertWhenDisabled(t *testing.T) {
 	credential := creds.Credential{}
 	credential.ClaudeAiOauth.AccessToken = "disabled-access"
 	credential.ClaudeAiOauth.RefreshToken = "disabled-refresh"
+	credential.ClaudeAiOauth.ExpiresAt = 2
 	payload, err := s.m.BuildCredentialWritePublication(
 		store.Account{ID: 1, AccountUUID: "u1"},
 		&credential,
@@ -188,6 +277,49 @@ func TestSetupSyncStaysInertWhenDisabled(t *testing.T) {
 		t.Errorf("disabled sync left residue under %s (stat err %v)", pool.SyncDir(), err)
 	}
 
+	registryFile := hostsync.NewRegistryFile(pool.SyncDir())
+	publisher := &hostsync.Service{Registry: registryFile, StampDir: pool.SyncStampsDir()}
+	if err := publisher.PublishAccount(ctx, hostsync.AccountValue{
+		UUID: "u1", Chain: hostsync.ChainStamp{Origin: s.syncSelf, ExpiresAt: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	settle := func() {
+		t.Helper()
+		if err := s.m.SettleCredentialWrite(ctx, pool.CredentialWriteSettlement{
+			OperationID: store.CredentialOperationID{1}, PublicationPayload: payload,
+		}); err != nil {
+			t.Fatalf("credential settlement = %v", err)
+		}
+	}
+	publishedChain := func() hostsync.ChainStamp {
+		t.Helper()
+		registry, err := registryFile.Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		entry, present := registry["u1"]
+		if !present || !entry.Present() {
+			t.Fatalf("registry = %+v, want a present u1 entry", registry)
+		}
+		return entry.Value.Chain
+	}
+	settle()
+	if chain := publishedChain(); chain.ExpiresAt != 1 {
+		t.Fatalf("disabled settlement published %+v over a registered account", chain)
+	}
+
+	if err := s.m.Store.SetMeta(metaSyncEnabled, "1"); err != nil {
+		t.Fatal(err)
+	}
+	if !s.syncEnabledBool() {
+		t.Fatal("sync inert after the meta flipped, with no daemon restart between")
+	}
+	settle()
+	chain := publishedChain()
+	if chain.ExpiresAt != 2 || chain.Origin != s.syncSelf || chain.RotatedAt != 1_700_000_000_000 {
+		t.Fatalf("enabled settlement published %+v, want this host's rotated chain", chain)
+	}
 }
 
 func TestAuthKindClassification(t *testing.T) {
@@ -205,8 +337,8 @@ func TestAuthKindClassification(t *testing.T) {
 			AccountUUID: uuid,
 		})
 	}
-	if err := s.setupSync(ctx); err != nil {
-		t.Fatalf("setupSync: %v", err)
+	if err := wireSync(ctx, t, s); err != nil {
+		t.Fatalf("wire sync: %v", err)
 	}
 	if s.syncSelf != "test@host-self" {
 		t.Fatalf("syncSelf = %q, want test@host-self", s.syncSelf)
