@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
-	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit"
 )
 
 const (
@@ -35,11 +35,16 @@ const (
 
 	defaultTerminalRows uint16 = 24
 	defaultTerminalCols uint16 = 80
-	terminationGrace           = 500 * time.Millisecond
-)
 
-// RecoveryID is the sole durable process class owned by account terminals.
-const RecoveryID proc.RecoveryID = "com.yasyf.cc-pool.account-terminal.v1"
+	// adoptBudget is this package's default deadline for Adopt — daemonkit
+	// verbs refuse a context carrying none — bounding the record fsync and
+	// process-table probe, never the terminal's life.
+	adoptBudget = 5 * time.Second
+	// settleBudget is this package's default deadline for Stop, covering the
+	// terminate ladder and absence proof that the v0.20 Grace and Settlement
+	// knobs used to bound separately.
+	settleBudget = 3 * time.Second
+)
 
 var (
 	// ErrTerminalControllerAttached means a terminal already has an input controller.
@@ -67,16 +72,6 @@ var (
 	// ErrTerminalDetachExpired means the terminal exceeded its no-controller deadline.
 	ErrTerminalDetachExpired = errors.New("terminal detached deadline expired")
 )
-
-const terminalWrapper = `
-printf r >&3
-exec 3>&-
-if ! IFS= read -r _ <&4; then
-    exit 125
-fi
-exec 4<&-
-exec "$@"
-`
 
 // TerminalSize is a PTY's character-cell geometry.
 type TerminalSize struct {
@@ -106,14 +101,13 @@ type TerminalSpec struct {
 	Retention     time.Duration
 }
 
-// Manager bounds account-login PTYs and owns their crash recovery boundary.
+// Manager bounds account-login PTYs, each adopted into one daemonkit
+// ownership scope whose open already reclaimed the prior generation.
 type Manager struct {
 	capacity int
-	reaper   *proc.Reaper
+	scope    daemonkit.Ctx
 
 	mu         sync.Mutex
-	recovered  bool
-	recovering bool
 	closed     bool
 	nextID     uint64
 	active     map[uint64]context.CancelFunc
@@ -121,54 +115,17 @@ type Manager struct {
 	changed    chan struct{}
 }
 
-// NewManager constructs an idle account-terminal manager.
-func NewManager(capacity int, reaper *proc.Reaper) (*Manager, error) {
+// NewManager constructs an idle account-terminal manager over scope.
+func NewManager(capacity int, scope daemonkit.Ctx) (*Manager, error) {
 	if capacity <= 0 {
 		return nil, errors.New("account terminal: capacity must be positive")
 	}
-	if reaper == nil {
-		return nil, errors.New("account terminal: reaper is required")
-	}
 	return &Manager{
 		capacity: capacity,
-		reaper:   reaper,
+		scope:    scope,
 		active:   make(map[uint64]context.CancelFunc),
 		changed:  make(chan struct{}),
 	}, nil
-}
-
-// Recover settles every account terminal retained by an earlier process generation.
-func (m *Manager) Recover(ctx context.Context) error {
-	m.mu.Lock()
-	switch {
-	case m.closed:
-		m.mu.Unlock()
-		return errors.New("account terminal: manager is closed")
-	case m.recovered:
-		m.mu.Unlock()
-		return nil
-	case m.recovering:
-		m.mu.Unlock()
-		return errors.New("account terminal: recovery is already running")
-	case len(m.active) != 0:
-		m.mu.Unlock()
-		return errors.New("account terminal: recovery requires an idle manager")
-	}
-	m.recovering = true
-	m.mu.Unlock()
-
-	err := m.reaper.Reap(ctx)
-	m.mu.Lock()
-	m.recovering = false
-	if err == nil {
-		m.recovered = true
-	}
-	m.notifyLocked()
-	m.mu.Unlock()
-	if err != nil {
-		return fmt.Errorf("account terminal: recover retained processes: %w", err)
-	}
-	return nil
 }
 
 // Close stops admission, cancels every live PTY, and joins exact settlement.
@@ -188,19 +145,18 @@ func (m *Manager) Close(ctx context.Context) error {
 	} else {
 		m.mu.Unlock()
 	}
-	recoveryErr := m.recoverForClose(ctx)
 
 	done := ctx.Done()
 	var ctxErr error
 	for {
 		m.mu.Lock()
-		if len(m.active) == 0 && !m.recovering {
+		if len(m.active) == 0 {
 			errs := append([]error(nil), m.settleErrs...)
 			m.mu.Unlock()
 			if ctxErr == nil {
 				ctxErr = ctx.Err()
 			}
-			return errors.Join(append(errs, recoveryErr, ctxErr)...)
+			return errors.Join(append(errs, ctxErr)...)
 		}
 		changed := m.changed
 		m.mu.Unlock()
@@ -208,42 +164,6 @@ func (m *Manager) Close(ctx context.Context) error {
 		case <-changed:
 		case <-done:
 			ctxErr = fmt.Errorf("account terminal: close: %w", ctx.Err())
-			done = nil
-		}
-	}
-}
-
-func (m *Manager) recoverForClose(ctx context.Context) error {
-	done := ctx.Done()
-	var ctxErr error
-	for {
-		m.mu.Lock()
-		if m.recovered {
-			m.mu.Unlock()
-			return ctxErr
-		}
-		if !m.recovering {
-			m.recovering = true
-			m.mu.Unlock()
-			err := m.reaper.Reap(context.WithoutCancel(ctx))
-			m.mu.Lock()
-			m.recovering = false
-			if err == nil {
-				m.recovered = true
-			}
-			m.notifyLocked()
-			m.mu.Unlock()
-			if err != nil {
-				return errors.Join(fmt.Errorf("account terminal: settle retained processes during close: %w", err), ctxErr)
-			}
-			return ctxErr
-		}
-		changed := m.changed
-		m.mu.Unlock()
-		select {
-		case <-changed:
-		case <-done:
-			ctxErr = fmt.Errorf("account terminal: close recovery: %w", ctx.Err())
 			done = nil
 		}
 	}
@@ -335,7 +255,7 @@ type TerminalOutcome struct {
 	Kind     TerminalOutcomeKind
 	ExitCode int
 	Signal   syscall.Signal
-	Record   proc.Record
+	PID      int
 	Digest   [32]byte
 }
 
@@ -343,11 +263,12 @@ type TerminalOutcome struct {
 // multiple observers, and one exact-fenced input controller.
 type Terminal struct {
 	manager   *Manager
-	record    proc.Record
+	pid       int
+	tracked   *daemonkit.Tracked
 	sessionID uint64
 	cancel    context.CancelFunc
 	master    *os.File
-	gate      *os.File
+	gate      *daemonkit.Gate
 	write     func([]byte) error
 
 	input      chan terminalInputRequest
@@ -358,7 +279,6 @@ type Terminal struct {
 	outDone    chan struct{}
 	done       chan struct{}
 
-	gateOnce         sync.Once
 	mu               sync.Mutex
 	nextID           uint64
 	nextFence        uint64
@@ -453,67 +373,49 @@ func (m *Manager) Start(startup context.Context, spec TerminalSpec) (*Terminal, 
 		}
 	}()
 
-	args := make([]string, 0, len(spec.Args)+4)
-	args = append(args, "-c", terminalWrapper, "daemonkit-terminal", spec.Path)
-	args = append(args, spec.Args...)
-	// #nosec G204 -- the fixed shell executes a fixed wrapper; Path and Args remain positional data.
-	cmd := exec.Command("/bin/sh", args...)
-	cmd.Dir = spec.Dir
-	cmd.Env = spec.Env
-	readyR, readyW, err := os.Pipe()
+	gate, err := daemonkit.NewGate(append([]string{spec.Path}, spec.Args...))
 	if err != nil {
-		return nil, fmt.Errorf("account terminal: terminal readiness pipe: %w", err)
-	}
-	gateR, gateW, err := os.Pipe()
-	if err != nil {
-		_ = readyR.Close()
-		_ = readyW.Close()
 		return nil, fmt.Errorf("account terminal: terminal dispatch gate: %w", err)
 	}
-	cmd.ExtraFiles = []*os.File{readyW, gateR}
+	argv := gate.Argv()
+	// #nosec G204 -- the gate execs a fixed wrapper; Path and Args remain positional data.
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Dir = spec.Dir
+	cmd.Env = spec.Env
+	cmd.ExtraFiles = gate.Files()
 	size := spec.Size.normalized()
 	master, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: size.Rows, Cols: size.Cols})
 	if err != nil {
-		_ = readyR.Close()
-		_ = readyW.Close()
-		_ = gateR.Close()
-		_ = gateW.Close()
+		_ = gate.Close()
 		return nil, fmt.Errorf("account terminal: start terminal: %w", err)
 	}
-	_ = readyW.Close()
-	_ = gateR.Close()
-	if err := awaitWrapperReady(startupCtx, readyR); err != nil {
-		_ = gateW.Close()
+	if err := gate.Ready(startupCtx); err != nil {
+		_ = gate.Close()
 		_ = master.Close()
 		killErr := killUntrackedGroup(cmd.Process.Pid)
 		cleanupErr = killErr
 		waitErr := cmd.Wait()
 		return nil, errors.Join(fmt.Errorf("account terminal: await terminal readiness: %w", err), killErr, unexpectedWaitError(waitErr))
 	}
-	record, err := m.reaper.TrackGroup(terminalCtx, cmd.Process.Pid, RecoveryID)
+	adoptCtx, cancelAdopt := budgeted(terminalCtx, adoptBudget)
+	tracked, err := m.scope.Adopt(adoptCtx, cmd.Process.Pid)
+	cancelAdopt()
 	if err != nil {
-		_ = gateW.Close()
+		_ = gate.Close()
 		_ = master.Close()
 		killErr := killUntrackedGroup(cmd.Process.Pid)
 		cleanupErr = killErr
 		waitErr := cmd.Wait()
 		return nil, errors.Join(fmt.Errorf("account terminal: track terminal: %w", err), killErr, unexpectedWaitError(waitErr))
 	}
-	if recordErr := record.Validate(); recordErr != nil || record.PID != cmd.Process.Pid || !record.ProcessGroup || record.SessionID != record.PID {
-		_ = gateW.Close()
-		_ = master.Close()
-		killErr := killUntrackedGroup(cmd.Process.Pid)
-		waitErr := cmd.Wait()
-		untrackErr := m.reaper.Untrack(context.WithoutCancel(terminalCtx), record)
-		cleanupErr = errors.Join(killErr, untrackErr)
-		return nil, errors.Join(errors.New("account terminal: registry returned an invalid terminal process record"), recordErr, untrackErr, killErr, unexpectedWaitError(waitErr))
-	}
 	waited := make(chan error, 1)
 	go func() { waited <- cmd.Wait() }()
 	if err := startupCtx.Err(); err != nil {
-		_ = gateW.Close()
+		_ = gate.Close()
 		_ = master.Close()
-		settleErr := m.reaper.TerminateWithin(context.WithoutCancel(terminalCtx), record, terminationGrace)
+		stopCtx, cancelStop := budgeted(context.WithoutCancel(terminalCtx), settleBudget)
+		_, settleErr := tracked.Stop(stopCtx)
+		cancelStop()
 		cleanupErr = settleErr
 		waitErr := <-waited
 		return nil, errors.Join(
@@ -524,7 +426,7 @@ func (m *Manager) Start(startup context.Context, spec TerminalSpec) (*Terminal, 
 	}
 
 	t := &Terminal{
-		manager: m, record: record, sessionID: sessionID, cancel: cancel, master: master, gate: gateW,
+		manager: m, pid: cmd.Process.Pid, tracked: tracked, sessionID: sessionID, cancel: cancel, master: master, gate: gate,
 		input: make(chan terminalInputRequest, TerminalQueueDepth), ioErr: make(chan error, 1),
 		ioStop: make(chan struct{}), inDone: make(chan struct{}), outDone: make(chan struct{}), done: make(chan struct{}),
 		attachments: make(map[uint64]*terminalAttachmentState), retention: retention, retired: make(chan struct{}),
@@ -549,9 +451,6 @@ func (m *Manager) acquire(
 		case m.closed:
 			m.mu.Unlock()
 			return nil, 0, nil, errors.New("account terminal: manager is closed")
-		case !m.recovered:
-			m.mu.Unlock()
-			return nil, 0, nil, errors.New("account terminal: recovery has not completed")
 		case len(m.active) < m.capacity:
 			terminalCtx, cancel := context.WithCancel(lifetime)
 			m.nextID++
@@ -589,8 +488,8 @@ func (m *Manager) notifyLocked() {
 	m.changed = make(chan struct{})
 }
 
-// Record returns the immutable process-group identity recorded before dispatch.
-func (t *Terminal) Record() proc.Record { return t.record }
+// PID returns the terminal process id recorded before dispatch.
+func (t *Terminal) PID() int { return t.pid }
 
 // Attach adds one bounded observer or claims the single input-controller fence.
 // The task dispatches only after a controller is attached or claimed.
@@ -1115,10 +1014,7 @@ func (t *Terminal) expireController(id, fence uint64) {
 }
 
 func (t *Terminal) releaseDispatchGate() error {
-	var gateErr error
-	t.gateOnce.Do(func() {
-		gateErr = writePayload(t.gate, []byte("start\n"))
-	})
+	gateErr := t.gate.Release()
 	if gateErr == nil {
 		return nil
 	}
@@ -1186,23 +1082,19 @@ func (t *Terminal) run(ctx context.Context, waited <-chan error) {
 	canceled := false
 	select {
 	case waitErr := <-waited:
-		outcome = terminalOutcome(t.record, waitErr, false)
-		resultErr = t.manager.reaper.TerminateWithin(
-			context.WithoutCancel(ctx), t.record, terminationGrace,
-		)
+		outcome = terminalOutcome(t.pid, waitErr, false)
+		resultErr = t.settleTracked(ctx)
 		var exitErr *exec.ExitError
 		if waitErr != nil && !errors.As(waitErr, &exitErr) {
 			resultErr = errors.Join(resultErr, fmt.Errorf("account terminal: wait for terminal process: %w", waitErr))
 		}
 	case <-ctx.Done():
 		canceled = true
-		t.gateOnce.Do(func() { _ = t.gate.Close() })
+		_ = t.gate.Close()
 		t.stopIO()
-		resultErr = t.manager.reaper.TerminateWithin(
-			context.WithoutCancel(ctx), t.record, terminationGrace,
-		)
+		resultErr = t.settleTracked(ctx)
 		waitErr := <-waited
-		outcome = terminalOutcome(t.record, waitErr, true)
+		outcome = terminalOutcome(t.pid, waitErr, true)
 		select {
 		case ioErr := <-t.ioErr:
 			resultErr = errors.Join(resultErr, ioErr)
@@ -1239,6 +1131,13 @@ func (t *Terminal) stopIO() {
 		close(t.ioStop)
 		_ = t.master.Close()
 	})
+}
+
+func (t *Terminal) settleTracked(ctx context.Context) error {
+	stopCtx, cancel := budgeted(context.WithoutCancel(ctx), settleBudget)
+	defer cancel()
+	_, err := t.tracked.Stop(stopCtx)
+	return err
 }
 
 func (t *Terminal) expireRetention() {
@@ -1407,8 +1306,8 @@ func notifyTerminalAttachment(state *terminalAttachmentState) {
 	}
 }
 
-func terminalOutcome(record proc.Record, err error, canceled bool) TerminalOutcome {
-	out := TerminalOutcome{Record: record, ExitCode: -1}
+func terminalOutcome(pid int, err error, canceled bool) TerminalOutcome {
+	out := TerminalOutcome{PID: pid, ExitCode: -1}
 	if canceled {
 		out.Kind = TerminalCanceled
 		return out
@@ -1437,8 +1336,8 @@ func terminalOutcomeDigest(out TerminalOutcome) [32]byte {
 		Kind     TerminalOutcomeKind `json:"kind"`
 		ExitCode int                 `json:"exit_code"`
 		Signal   syscall.Signal      `json:"signal"`
-		Record   proc.Record         `json:"record"`
-	}{Kind: out.Kind, ExitCode: out.ExitCode, Signal: out.Signal, Record: out.Record})
+		PID      int                 `json:"pid"`
+	}{Kind: out.Kind, ExitCode: out.ExitCode, Signal: out.Signal, PID: out.PID})
 	if err != nil {
 		panic(err)
 	}
@@ -1451,27 +1350,6 @@ func cloneTerminalInput(event TerminalInput) TerminalInput {
 	return clone
 }
 
-func awaitWrapperReady(ctx context.Context, ready *os.File) error {
-	result := make(chan error, 1)
-	go func() {
-		var marker [1]byte
-		_, err := io.ReadFull(ready, marker[:])
-		if err == nil && marker[0] != 'r' {
-			err = fmt.Errorf("unexpected marker %q", marker[0])
-		}
-		result <- err
-	}()
-	select {
-	case err := <-result:
-		_ = ready.Close()
-		return err
-	case <-ctx.Done():
-		_ = ready.Close()
-		<-result
-		return ctx.Err()
-	}
-}
-
 func killUntrackedGroup(pid int) error {
 	err := syscall.Kill(-pid, syscall.SIGKILL)
 	if err == nil || errors.Is(err, syscall.ESRCH) {
@@ -1480,15 +1358,19 @@ func killUntrackedGroup(pid int) error {
 	return fmt.Errorf("account terminal: kill untracked process group: %w", err)
 }
 
-func writePayload(writer io.WriteCloser, payload []byte) error {
-	_, writeErr := writer.Write(payload)
-	closeErr := writer.Close()
-	return errors.Join(writeErr, closeErr)
-}
-
 func unexpectedWaitError(err error) error {
 	if err == nil {
 		return errors.New("account terminal: terminated process exited successfully")
 	}
 	return nil
+}
+
+// budgeted states budget as ctx's deadline when ctx carries none. A caller
+// that stated its own keeps it: the budget is this package's default, never
+// an override of a deadline the caller chose.
+func budgeted(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	if _, stated := ctx.Deadline(); stated {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, budget)
 }
