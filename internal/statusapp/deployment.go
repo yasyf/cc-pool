@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/yasyf/cc-pool/internal/holderbridge"
 	"github.com/yasyf/cc-pool/internal/pool"
@@ -105,18 +106,21 @@ func ApplyPackagedApp(ctx context.Context, candidateSourcePath string) (ServiceI
 	return ServiceInstallReceipt{Generation: generation, Activation: activation}, nil
 }
 
+// bracketRetryCadence paces bracket re-observation while a launchd restart
+// transient converges, so an unconverged check waits rather than spinning.
+const bracketRetryCadence = 250 * time.Millisecond
+
 // RequireActiveService proves the installed application's FuseKit runtime is
 // serving. It only observes: landing a generation is ApplyPackagedApp's to
 // perform and launchd's to sustain, so requiring the service never activates
-// one. WaitReady alone proves live-and-ready under the tenant lane's
-// same-user floor, which any same-UID listener clears — the executable-scoped
-// inventory is what ties the answering PID to the installed application's own
-// runtime binary. The health observation is bracketed between two inventories
+// one. The connection itself requires the installed application's signing
+// identity, and the health observation is bracketed between two inventories
 // that must both pin the answering PID to one process instance
-// ({Start, Boot}), so a reused PID cannot correlate; an exec within one
-// instance keeps its triple and is not excluded. A holder that first appears
-// during the observation — a restart launchd was still completing — re-runs
-// the complete bracket within ctx instead of being refused.
+// ({Start, Boot}): only a stable signed, inventory-pinned instance succeeds.
+// Everything short of that retries the complete bracket within ctx — a
+// holder appearing mid-observation, disappearing and being replaced, and
+// re-pinning under a reused PID are one family of legitimate launchd restart
+// transients, refused only when ctx runs out, never admitted early.
 func RequireActiveService(ctx context.Context) error {
 	executable := bundle.ExePath(installedAppPath(), holderbridge.ExecutableName)
 	before, err := deployInventory(executable)
@@ -137,13 +141,15 @@ func RequireActiveService(ctx context.Context) error {
 		if held && serving && first.Start == second.Start && first.Boot == second.Boot {
 			return nil
 		}
-		if held || !serving || ctx.Err() != nil {
+		before = after
+		select {
+		case <-ctx.Done():
 			return fmt.Errorf(
 				"CCPoolStatus: the process serving the tenant lane (pid %d) does not run the installed application",
 				health.PID,
 			)
+		case <-time.After(bracketRetryCadence):
 		}
-		before = after
 	}
 }
 

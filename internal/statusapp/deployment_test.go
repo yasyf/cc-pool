@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yasyf/cc-pool/internal/holderbridge"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
@@ -234,7 +235,9 @@ func TestRequireActiveServiceTiesTheServingPIDToTheInstalledRuntime(t *testing.T
 	swapDeploymentVar(t, &deployInventory, func(...string) (deploy.Survivors, error) {
 		return deploy.Survivors{Live: []deploy.LiveProcess{{PID: 7}}}, nil
 	})
-	if err := RequireActiveService(t.Context()); err == nil ||
+	foreignCtx, cancelForeign := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancelForeign()
+	if err := RequireActiveService(foreignCtx); err == nil ||
 		!strings.Contains(err.Error(), "does not run the installed application") {
 		t.Fatalf("foreign serving pid = %v, want an installed-runtime refusal", err)
 	}
@@ -248,46 +251,68 @@ func TestRequireActiveServiceTiesTheServingPIDToTheInstalledRuntime(t *testing.T
 	}
 }
 
-func TestRequireActiveServiceRefusesAPIDNotPinnedAcrossTheObservation(t *testing.T) {
+func TestRequireActiveServiceRefusesAnUnpinnableServerAtTheDeadline(t *testing.T) {
 	swapDeploymentVar(t, &tenantLaneReady, func(context.Context) (daemonkit.Health, error) {
 		return daemonkit.Health{Phase: daemonkit.PhaseReady, PID: 4242}, nil
 	})
-	tests := []struct {
-		name        string
-		inventories []deploy.Survivors
-	}{
-		{
-			"the pid crossed the observation as two instances",
-			[]deploy.Survivors{
-				{Live: []deploy.LiveProcess{{PID: 4242, Start: 1, Boot: 1}}},
-				{Live: []deploy.LiveProcess{{PID: 4242, Start: 2, Boot: 1}}},
-			},
-		},
-		{
-			"the pid kept arriving as a fresh instance across the retried bracket",
-			[]deploy.Survivors{
-				{},
-				{Live: []deploy.LiveProcess{{PID: 4242, Start: 2, Boot: 1}}},
-				{Live: []deploy.LiveProcess{{PID: 4242, Start: 3, Boot: 1}}},
-			},
-		},
+	swapDeploymentVar(t, &deployInventory, func(...string) (deploy.Survivors, error) {
+		return deploy.Survivors{}, nil
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if err := RequireActiveService(ctx); err == nil ||
+		!strings.Contains(err.Error(), "does not run the installed application") {
+		t.Fatalf("unpinnable server = %v, want an installed-runtime refusal at the deadline", err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			calls := 0
-			swapDeploymentVar(t, &deployInventory, func(...string) (deploy.Survivors, error) {
-				next := tt.inventories[calls]
-				calls++
-				return next, nil
-			})
-			if err := RequireActiveService(t.Context()); err == nil ||
-				!strings.Contains(err.Error(), "does not run the installed application") {
-				t.Fatalf("unpinned pid = %v, want an installed-runtime refusal", err)
-			}
-			if calls != len(tt.inventories) {
-				t.Fatalf("inventory bracket ran %d calls, want %d", calls, len(tt.inventories))
-			}
-		})
+}
+
+func TestRequireActiveServiceRetriesTheBracketForAHolderReplacedMidObservation(t *testing.T) {
+	pids := []int{42, 7}
+	observations := 0
+	swapDeploymentVar(t, &tenantLaneReady, func(context.Context) (daemonkit.Health, error) {
+		pid := pids[min(observations, len(pids)-1)]
+		observations++
+		return daemonkit.Health{Phase: daemonkit.PhaseReady, PID: pid}, nil
+	})
+	inventories := []deploy.Survivors{
+		{Live: []deploy.LiveProcess{{PID: 42, Start: 1, Boot: 1}}},
+		{Live: []deploy.LiveProcess{{PID: 7, Start: 9, Boot: 1}}},
+		{Live: []deploy.LiveProcess{{PID: 7, Start: 9, Boot: 1}}},
+	}
+	calls := 0
+	swapDeploymentVar(t, &deployInventory, func(...string) (deploy.Survivors, error) {
+		next := inventories[calls]
+		calls++
+		return next, nil
+	})
+	if err := RequireActiveService(t.Context()); err != nil {
+		t.Fatalf("replaced holder = %v, want a retried pass", err)
+	}
+	if calls != 3 || observations != 2 {
+		t.Fatalf("bracket retry ran %d inventories and %d observations, want 3 and 2", calls, observations)
+	}
+}
+
+func TestRequireActiveServiceRetriesTheBracketForAPIDReusedByTheReplacement(t *testing.T) {
+	swapDeploymentVar(t, &tenantLaneReady, func(context.Context) (daemonkit.Health, error) {
+		return daemonkit.Health{Phase: daemonkit.PhaseReady, PID: 42}, nil
+	})
+	inventories := []deploy.Survivors{
+		{Live: []deploy.LiveProcess{{PID: 42, Start: 1, Boot: 1}}},
+		{Live: []deploy.LiveProcess{{PID: 42, Start: 2, Boot: 1}}},
+		{Live: []deploy.LiveProcess{{PID: 42, Start: 2, Boot: 1}}},
+	}
+	calls := 0
+	swapDeploymentVar(t, &deployInventory, func(...string) (deploy.Survivors, error) {
+		next := inventories[calls]
+		calls++
+		return next, nil
+	})
+	if err := RequireActiveService(t.Context()); err != nil {
+		t.Fatalf("reused pid = %v, want the replacement pinned on the retried bracket", err)
+	}
+	if calls != 3 {
+		t.Fatalf("bracket retry ran %d inventories, want 3", calls)
 	}
 }
 
