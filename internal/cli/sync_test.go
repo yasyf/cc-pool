@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -16,8 +17,10 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/testhome"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/synckit/codec"
 	"github.com/yasyf/synckit/cregistry"
+	"github.com/yasyf/synckit/helperruntime"
 	"github.com/yasyf/synckit/hostregistry"
 	"github.com/yasyf/synckit/manifest"
 	"github.com/yasyf/synckit/rpc"
@@ -28,8 +31,7 @@ import (
 // temp store with an in-memory credential fake.
 func syncTestEnv(t *testing.T) *pool.Manager {
 	t.Helper()
-	home := t.TempDir()
-	testhome.Sandbox(t, home)
+	home := tempHome(t)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
 	if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
 		t.Fatal(err)
@@ -104,14 +106,61 @@ func (c cliTestSyncConsumer) Reconcile(context.Context, string) (syncservice.Rec
 	return c.reconcile, nil
 }
 
-// startCLITestSyncHelper served the retired socket-configurable helper; the
-// v0.37 resident helper derives its socket from the passwd home, so an
-// in-test helper needs the fleet's serve sandbox first — cc-notes 6ef1e56.
-func startCLITestSyncHelper(t *testing.T, socket string, consumer syncservice.SyncConsumer) {
+// startCLITestSyncHelper serves the resident helper in-process on the
+// label-derived socket under a short sandboxed home (macOS caps sun_path at
+// 104 bytes, and daemonkit refuses a longer path typed). Readiness rides the
+// business lane — Capabilities retried until the socket answers — because the
+// control lane refuses an in-process self-attach by design.
+func startCLITestSyncHelper(t *testing.T, consumer syncservice.SyncConsumer) {
 	t.Helper()
-	_ = socket
-	_ = consumer
-	t.Skip("resident-helper tests await the daemonkit serve sandbox (cc-notes 6ef1e56)")
+	if os.Getenv(testhome.EnvOverride) == "" {
+		tempHome(t)
+	}
+	dispatcher := rpc.NewDispatcher()
+	syncservice.RegisterConsumer(dispatcher, consumer)
+	runtime, err := helperruntime.New(helperruntime.Config{
+		App:        helperruntime.App{Name: hostsync.SyncServiceID},
+		Dispatcher: dispatcher,
+		Prepare: func(daemonkit.Ctx) (helperruntime.Product, error) {
+			return cliTestSyncProduct{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runtime.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("serve test sync helper: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Error("test sync helper did not drain")
+		}
+	})
+	probe := syncservice.NewClient(syncservice.Resident(hostsync.SyncServiceID))
+	t.Cleanup(func() { _ = probe.Close() })
+	readyCtx, cancelReady := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelReady()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	var lastErr error
+	for {
+		if _, lastErr = probe.Capabilities(readyCtx); lastErr == nil {
+			return
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("test sync helper exited before readiness: %v", errors.Join(err, lastErr))
+		case <-readyCtx.Done():
+			t.Fatalf("await test sync helper readiness: %v", errors.Join(readyCtx.Err(), lastErr))
+		case <-ticker.C:
+		}
+	}
 }
 
 func writeMeshState(t *testing.T, self string, hosts []string) {
@@ -334,14 +383,7 @@ func TestRPCServeBridgesPersistentSessionByteExact(t *testing.T) {
 }
 
 func TestSyncConvergeReportsResult(t *testing.T) {
-	base, err := os.MkdirTemp("", "ccp")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(base) })
-	sock := filepath.Join(base, "c.sock")
-
-	startCLITestSyncHelper(t, sock, cliTestSyncConsumer{
+	startCLITestSyncHelper(t, cliTestSyncConsumer{
 		reconcile: syncservice.ReconcileResult{Converged: 3, SkippedBusy: 1},
 	})
 	ctx := context.Background()
@@ -385,7 +427,7 @@ func TestStatusRendersMesh(t *testing.T) {
 	service.CredentialSnapshot = func(context.Context, hostsync.Registry) (map[string]hostsync.CredentialEnvelope, error) {
 		return map[string]hostsync.CredentialEnvelope{}, nil
 	}
-	startCLITestSyncHelper(t, pool.SyncSocketPath(), hostsync.NewConsumer(service, nil))
+	startCLITestSyncHelper(t, hostsync.NewConsumer(service, nil))
 
 	admitCLITestAccount(t, m.Store, store.Account{
 		ID: 1, ConfigDir: t.TempDir(), Label: "Work", AccountUUID: "u-1",
