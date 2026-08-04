@@ -1115,11 +1115,12 @@ func TestCredentialOperationRejectsSecretBearingStructuralFields(t *testing.T) {
 	}
 }
 
-func TestCredentialOperationOwnerPagingBoundary(t *testing.T) {
+func TestCredentialOperationForeignPagingBoundary(t *testing.T) {
 	s := openTest(t)
 	now := time.Unix(1_900_000_000, 0)
 	s.now = func() time.Time { return now }
 	owner := credentialOperationTestOwner("page-owner")
+	viewer := credentialOperationTestOwner("page-viewer")
 	for id := 1; id <= CredentialOperationPageLimit+1; id++ {
 		account := credentialOperationTestAccountID(t, s, id)
 		request := credentialOperationTestRequest(
@@ -1131,12 +1132,12 @@ func TestCredentialOperationOwnerPagingBoundary(t *testing.T) {
 			t.Fatalf("begin account %d = %+v err=%v", id, begin, err)
 		}
 	}
-	first, more, err := s.CredentialOperationsOwnedBy(owner, 0, CredentialOperationPageLimit)
+	first, more, err := s.CredentialOperationsNotOwnedBy(viewer, 0, CredentialOperationPageLimit)
 	if err != nil || len(first) != CredentialOperationPageLimit || !more {
 		t.Fatalf("first page len=%d more=%v err=%v", len(first), more, err)
 	}
-	second, more, err := s.CredentialOperationsOwnedBy(
-		owner, first[len(first)-1].AccountID, CredentialOperationPageLimit,
+	second, more, err := s.CredentialOperationsNotOwnedBy(
+		viewer, first[len(first)-1].AccountID, CredentialOperationPageLimit,
 	)
 	if err != nil || len(second) != 1 || more {
 		t.Fatalf("second page len=%d more=%v err=%v", len(second), more, err)
@@ -1144,7 +1145,7 @@ func TestCredentialOperationOwnerPagingBoundary(t *testing.T) {
 	if second[0].AccountID != CredentialOperationPageLimit+1 {
 		t.Fatalf("second page account=%d", second[0].AccountID)
 	}
-	if _, _, err := s.CredentialOperationsOwnedBy(owner, 0, CredentialOperationPageLimit+1); err == nil {
+	if _, _, err := s.CredentialOperationsNotOwnedBy(viewer, 0, CredentialOperationPageLimit+1); err == nil {
 		t.Fatal("oversized owner page was accepted")
 	}
 }

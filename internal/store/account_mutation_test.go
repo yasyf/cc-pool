@@ -852,7 +852,7 @@ func TestAccountMutationAgeAloneCannotTakeover(t *testing.T) {
 	}
 }
 
-func TestAccountMutationsOwnedByPagesExactOwner(t *testing.T) {
+func TestAccountMutationsNotOwnedByExcludesExactOwner(t *testing.T) {
 	s := openTest(t)
 	now := time.Unix(1_900_000_000, 0)
 	s.now = func() time.Time { return now }
@@ -871,15 +871,15 @@ func TestAccountMutationsOwnedByPagesExactOwner(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	page, more, err := s.AccountMutationsOwnedBy(owner, 0, 2)
+	page, more, err := s.AccountMutationsNotOwnedBy(other, 0, 2)
 	if err != nil || !more || len(page) != 2 || page[0].AccountID != 1 || page[1].AccountID != 2 {
-		t.Fatalf("first owner page = %+v more=%v err=%v", page, more, err)
+		t.Fatalf("first foreign page = %+v more=%v err=%v", page, more, err)
 	}
-	page, more, err = s.AccountMutationsOwnedBy(owner, page[len(page)-1].AccountID, 2)
+	page, more, err = s.AccountMutationsNotOwnedBy(other, page[len(page)-1].AccountID, 2)
 	if err != nil || more || len(page) != 1 || page[0].AccountID != 4 {
-		t.Fatalf("second owner page = %+v more=%v err=%v", page, more, err)
+		t.Fatalf("second foreign page = %+v more=%v err=%v", page, more, err)
 	}
-	if _, _, err := s.AccountMutationsOwnedBy(owner, 0, 0); !errors.Is(err, ErrAccountMutationState) {
+	if _, _, err := s.AccountMutationsNotOwnedBy(other, 0, 0); !errors.Is(err, ErrAccountMutationState) {
 		t.Fatalf("invalid owner page admitted: %v", err)
 	}
 }

@@ -521,26 +521,10 @@ func (s *Store) ActiveAccountMutationByKind(kind AccountMutationKind) (AccountMu
 	return accountMutationByKind(s.db, kind)
 }
 
-// AccountMutationsOwnedBy returns one bounded stable account-id page for an exact owner.
-func (s *Store) AccountMutationsOwnedBy(
-	owner OwnerRecord,
-	afterAccountID, limit int,
-) (mutations []AccountMutation, more bool, err error) {
-	return s.accountMutationsPage(owner, true, afterAccountID, limit)
-}
-
 // AccountMutationsNotOwnedBy returns one bounded stable account-id page of
 // lanes whose stored owner bytes differ from owner — the successor's claim scan.
 func (s *Store) AccountMutationsNotOwnedBy(
 	owner OwnerRecord,
-	afterAccountID, limit int,
-) (mutations []AccountMutation, more bool, err error) {
-	return s.accountMutationsPage(owner, false, afterAccountID, limit)
-}
-
-func (s *Store) accountMutationsPage(
-	owner OwnerRecord,
-	owned bool,
 	afterAccountID, limit int,
 ) (mutations []AccountMutation, more bool, err error) {
 	if err := owner.Validate(); err != nil {
@@ -551,7 +535,7 @@ func (s *Store) accountMutationsPage(
 	}
 	rows, err := s.db.Query(
 		`SELECT `+accountMutationColumns+` FROM account_mutations
-		 WHERE `+ownerPredicate(owned)+` AND account_id>?
+		 WHERE owner_record<>? AND account_id>?
 		 ORDER BY account_id LIMIT ?`,
 		[]byte(owner), afterAccountID, limit+1,
 	)

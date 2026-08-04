@@ -318,27 +318,11 @@ func (s *Store) ResolveReservedSyncedPromotion(
 	return Account{}, false, nil
 }
 
-// PendingAddReservationsOwnedBy returns one bounded stable account-id page.
-func (s *Store) PendingAddReservationsOwnedBy(
-	owner OwnerRecord,
-	afterAccountID, limit int,
-) (reservations []PendingAccountReservation, more bool, err error) {
-	return s.pendingAddReservationsPage(owner, true, afterAccountID, limit)
-}
-
 // PendingAddReservationsNotOwnedBy returns one bounded stable account-id page
 // of reservations whose stored owner bytes differ from owner — the successor's
 // claim scan.
 func (s *Store) PendingAddReservationsNotOwnedBy(
 	owner OwnerRecord,
-	afterAccountID, limit int,
-) (reservations []PendingAccountReservation, more bool, err error) {
-	return s.pendingAddReservationsPage(owner, false, afterAccountID, limit)
-}
-
-func (s *Store) pendingAddReservationsPage(
-	owner OwnerRecord,
-	owned bool,
 	afterAccountID, limit int,
 ) (reservations []PendingAccountReservation, more bool, err error) {
 	if err := owner.Validate(); err != nil {
@@ -349,7 +333,7 @@ func (s *Store) pendingAddReservationsPage(
 	}
 	rows, err := s.db.Query(
 		`SELECT id,instance_id,generation,owner_record,created_at FROM pending_adds
-		 WHERE `+ownerPredicate(owned)+` AND id>?
+		 WHERE owner_record<>? AND id>?
 		 AND NOT EXISTS (SELECT 1 FROM account_mutations WHERE account_id=pending_adds.id AND account_instance_id=pending_adds.instance_id AND account_generation=pending_adds.generation)
 		 AND NOT EXISTS (SELECT 1 FROM account_mutation_receipts WHERE account_id=pending_adds.id AND account_instance_id=pending_adds.instance_id AND account_generation=pending_adds.generation)
 		 ORDER BY id LIMIT ?`,

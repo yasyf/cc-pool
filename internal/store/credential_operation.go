@@ -717,26 +717,10 @@ func credentialOperationMatchesEvidence(
 		operation.IntentDigest == query.IntentDigest
 }
 
-// CredentialOperationsOwnedBy returns one bounded stable account-id page.
-func (s *Store) CredentialOperationsOwnedBy(
-	owner OwnerRecord,
-	afterAccountID, limit int,
-) (operations []CredentialOperation, more bool, err error) {
-	return s.credentialOperationsPage(owner, true, afterAccountID, limit)
-}
-
 // CredentialOperationsNotOwnedBy returns one bounded stable account-id page of
 // lanes whose stored owner bytes differ from owner — the successor's claim scan.
 func (s *Store) CredentialOperationsNotOwnedBy(
 	owner OwnerRecord,
-	afterAccountID, limit int,
-) (operations []CredentialOperation, more bool, err error) {
-	return s.credentialOperationsPage(owner, false, afterAccountID, limit)
-}
-
-func (s *Store) credentialOperationsPage(
-	owner OwnerRecord,
-	owned bool,
 	afterAccountID, limit int,
 ) (operations []CredentialOperation, more bool, err error) {
 	if err := owner.Validate(); err != nil {
@@ -748,7 +732,7 @@ func (s *Store) credentialOperationsPage(
 	rows, err := s.db.Query(
 		`SELECT `+operationSelectColumns+`
 		 FROM credential_operations
-		 WHERE `+ownerPredicate(owned)+` AND account_id>?
+		 WHERE owner_record<>? AND account_id>?
 		 ORDER BY account_id LIMIT ?`,
 		[]byte(owner), afterAccountID, limit+1,
 	)

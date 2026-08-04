@@ -757,7 +757,7 @@ func TestClaimForeignLanesAdoptsVZeroTwentyNineRows(t *testing.T) {
 		!bytes.Equal(credentialReceipt.Owner, recovery.owner) {
 		t.Fatalf("claimed golden lane receipt = %+v", credentialReceipt)
 	}
-	pendingRows, _, err := st.PendingAddReservationsOwnedBy(golden, 0, 1)
+	pendingRows, _, err := st.PendingAddReservationsNotOwnedBy(recovery.owner, 0, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -817,8 +817,9 @@ func TestClaimForeignLanesRetainsPendingAddWhenRetirementIsAmbiguous(t *testing.
 	if err := recovery.ClaimForeignLanes(t.Context()); err != nil {
 		t.Fatalf("ambiguous retirement failed the claim pass: %v", err)
 	}
-	pending, _, err := st.PendingAddReservationsOwnedBy(old.owner, 0, 1)
-	if err != nil || len(pending) != 1 || pending[0].ID != reservation.ID {
+	pending, _, err := st.PendingAddReservationsNotOwnedBy(recovery.owner, 0, 1)
+	if err != nil || len(pending) != 1 || pending[0].ID != reservation.ID ||
+		!bytes.Equal(pending[0].Owner, old.owner) {
 		t.Fatalf("retained reservation = %+v err=%v", pending, err)
 	}
 	next, err := st.ReserveAccountIndex(recovery.owner)
