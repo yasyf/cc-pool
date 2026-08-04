@@ -13,8 +13,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/yasyf/daemonkit/proc"
 )
 
 func TestCredentialOperationLifecycleAndPostCommitAdmission(t *testing.T) {
@@ -24,7 +22,8 @@ func TestCredentialOperationLifecycleAndPostCommitAdmission(t *testing.T) {
 	account := credentialOperationTestAccount(t, s)
 	request := credentialOperationTestRequest(
 		t, account, CredentialOperationEnsureFresh, CredentialTargetKeychain,
-		credentialOperationTestState("before", ""), "refresh-request", credentialOperationTestOwner("owner"))
+		credentialOperationTestState("before", ""), "refresh-request", credentialOperationTestOwner("owner"),
+	)
 
 	begin, err := s.BeginCredentialOperation(request)
 	if err != nil || !begin.Created || begin.Active == nil || begin.Receipt != nil {
@@ -501,10 +500,7 @@ func TestCredentialFailureClassExactIdempotency(t *testing.T) {
 	}
 
 	recoveryOwner := credentialOperationTestOwner("failure-resolve")
-	retirement, verifier := credentialOperationTestRetirement(t, applied.Owner, recoveryOwner)
-	taken, err := s.TakeoverCredentialOperation(
-		t.Context(), applied.Fence(), recoveryOwner, retirement, verifier,
-	)
+	taken, err := s.TakeoverCredentialOperation(applied.Fence(), recoveryOwner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -550,10 +546,7 @@ func TestResolveCredentialOperationPublicationPayloadReplayIsExact(t *testing.T)
 		t.Fatal(err)
 	}
 	recoveryOwner := credentialOperationTestOwner("resolve-recovery")
-	retirement, verifier := credentialOperationTestRetirement(t, applying.Owner, recoveryOwner)
-	taken, err := s.TakeoverCredentialOperation(
-		t.Context(), applying.Fence(), recoveryOwner, retirement, verifier,
-	)
+	taken, err := s.TakeoverCredentialOperation(applying.Fence(), recoveryOwner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -636,13 +629,13 @@ func TestCredentialOperationOwnerEpochSurvivesArbitraryAge(t *testing.T) {
 	other := credentialOperationTestOwner("owner-b")
 	request := credentialOperationTestRequest(
 		t, account, CredentialOperationInstallSynced, CredentialTargetKeychain,
-		credentialOperationTestState("source", ""), "move-file", owner)
+		credentialOperationTestState("source", ""), "move-file", owner,
+	)
 	begin, err := s.BeginCredentialOperation(request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	operation := *begin.Active
-	retirement, verifier := credentialOperationTestRetirement(t, owner, other)
 	wrongFence := CredentialOperationFence{Token: operation.Token, Owner: other, Epoch: operation.OwnerEpoch}
 	if _, err := s.MarkCredentialOperationApplying(wrongFence, nil); !errors.Is(err, ErrCredentialOperationOwner) {
 		t.Fatalf("wrong owner transition = %v", err)
@@ -650,25 +643,19 @@ func TestCredentialOperationOwnerEpochSurvivesArbitraryAge(t *testing.T) {
 	if err := s.AbandonPreparedCredentialOperation(wrongFence); !errors.Is(err, ErrCredentialOperationOwner) {
 		t.Fatalf("wrong owner abandon = %v", err)
 	}
-	if _, err := s.TakeoverCredentialOperation(
-		t.Context(), operation.Fence(), other, proc.ReapReceipt{}, nil,
-	); !errors.Is(err, ErrCredentialOperationOwner) {
-		t.Fatalf("takeover without exact retirement proof = %v", err)
+	if _, err := s.TakeoverCredentialOperation(wrongFence, other); !errors.Is(err, ErrCredentialOperationOwner) {
+		t.Fatalf("takeover without the row's exact owner bytes = %v", err)
 	}
-	taken, err := s.TakeoverCredentialOperation(
-		t.Context(), operation.Fence(), other, retirement, verifier,
-	)
-	if err != nil || taken.OwnerEpoch != operation.OwnerEpoch+1 || !sameCredentialOwner(taken.Owner, other) {
-		t.Fatalf("immediate verified takeover = %+v err=%v", taken, err)
+	taken, err := s.TakeoverCredentialOperation(operation.Fence(), other)
+	if err != nil || taken.OwnerEpoch != operation.OwnerEpoch+1 || !bytes.Equal(taken.Owner, other) {
+		t.Fatalf("immediate takeover = %+v err=%v", taken, err)
 	}
-	if _, err := s.TakeoverCredentialOperation(
-		t.Context(), operation.Fence(), other, retirement, verifier,
-	); !errors.Is(err, ErrCredentialOperationOwner) {
+	if _, err := s.TakeoverCredentialOperation(operation.Fence(), other); !errors.Is(err, ErrCredentialOperationOwner) {
 		t.Fatalf("stale takeover fence = %v", err)
 	}
 	recoveredTakeover, err := s.CredentialOperationByToken(operation.Token)
 	if err != nil || recoveredTakeover.OwnerEpoch != taken.OwnerEpoch ||
-		!sameCredentialOwner(recoveredTakeover.Owner, other) {
+		!bytes.Equal(recoveredTakeover.Owner, other) {
 		t.Fatalf("lost takeover response recovery = %+v err=%v", recoveredTakeover, err)
 	}
 	if _, err := s.MarkCredentialOperationApplying(operation.Fence(), nil); !errors.Is(err, ErrCredentialOperationOwner) {
@@ -699,17 +686,21 @@ func TestCredentialOperationAgeAloneCannotTakeover(t *testing.T) {
 	owner := credentialOperationTestOwner("expired-owner")
 	request := credentialOperationTestRequest(
 		t, account, CredentialOperationInstallSynced, CredentialTargetKeychain,
-		credentialOperationTestState("source", ""), "expired-move", owner)
+		credentialOperationTestState("source", ""), "expired-move", owner,
+	)
 	begin, err := s.BeginCredentialOperation(request)
 	if err != nil {
 		t.Fatal(err)
 	}
+	stale := begin.Active.Fence()
+	if _, err := s.TakeoverCredentialOperation(stale, credentialOperationTestOwner("new-owner")); err != nil {
+		t.Fatal(err)
+	}
 	now = now.Add(36 * time.Minute)
 	if _, err := s.TakeoverCredentialOperation(
-		t.Context(), begin.Active.Fence(), credentialOperationTestOwner("new-owner"),
-		proc.ReapReceipt{}, nil,
+		stale, credentialOperationTestOwner("late-owner"),
 	); !errors.Is(err, ErrCredentialOperationOwner) {
-		t.Fatalf("aged lane takeover without proof = %v", err)
+		t.Fatalf("aged stale-fence takeover = %v", err)
 	}
 }
 
@@ -740,7 +731,8 @@ func TestCredentialOperationGenerationAndLocatorDriftPreservesEvidence(t *testin
 			account := credentialOperationTestAccount(t, s)
 			request := credentialOperationTestRequest(
 				t, account, CredentialOperationInstallSynced, CredentialTargetKeychain,
-				credentialOperationTestState("before", ""), "install", credentialOperationTestOwner("owner"))
+				credentialOperationTestState("before", ""), "install", credentialOperationTestOwner("owner"),
+			)
 			begin, err := s.BeginCredentialOperation(request)
 			if err != nil {
 				t.Fatal(err)
@@ -770,10 +762,7 @@ func TestCredentialOperationGenerationAndLocatorDriftPreservesEvidence(t *testin
 			}
 			now = now.Add(time.Minute)
 			recoveryOwner := credentialOperationTestOwner("recovery")
-			retirement, verifier := credentialOperationTestRetirement(t, operation.Owner, recoveryOwner)
-			taken, err := s.TakeoverCredentialOperation(
-				t.Context(), operation.Fence(), recoveryOwner, retirement, verifier,
-			)
+			taken, err := s.TakeoverCredentialOperation(operation.Fence(), recoveryOwner)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -807,7 +796,8 @@ func TestDeleteAccountRejectsActiveAndUnacknowledgedEvidence(t *testing.T) {
 	account := credentialOperationTestAccount(t, s)
 	request := credentialOperationTestRequest(
 		t, account, CredentialOperationCompensate, CredentialTargetKeychain,
-		credentialOperationTestState("same", ""), "adopt", credentialOperationTestOwner("owner"))
+		credentialOperationTestState("same", ""), "adopt", credentialOperationTestOwner("owner"),
+	)
 	begin, err := s.BeginCredentialOperation(request)
 	if err != nil {
 		t.Fatal(err)
@@ -868,7 +858,8 @@ func TestCredentialOperationAcknowledgementPreservesMultiwaiterLostResponse(t *t
 	account := credentialOperationTestAccount(t, first)
 	request := credentialOperationTestRequest(
 		t, account, CredentialOperationEnsureFresh, CredentialTargetKeychain,
-		credentialOperationTestState("same", ""), "refresh", credentialOperationTestOwner("owner"))
+		credentialOperationTestState("same", ""), "refresh", credentialOperationTestOwner("owner"),
+	)
 	begin, err := first.BeginCredentialOperation(request)
 	if err != nil {
 		t.Fatal(err)
@@ -985,7 +976,8 @@ func TestCredentialOperationConcurrentConflictingSettlementIsImmutable(t *testin
 	account := credentialOperationTestAccount(t, first)
 	request := credentialOperationTestRequest(
 		t, account, CredentialOperationInstallSynced, CredentialTargetKeychain,
-		credentialOperationTestState("before", ""), "install", credentialOperationTestOwner("owner"))
+		credentialOperationTestState("before", ""), "install", credentialOperationTestOwner("owner"),
+	)
 	begin, err := first.BeginCredentialOperation(request)
 	if err != nil {
 		t.Fatal(err)
@@ -1068,14 +1060,16 @@ func TestCredentialOperationRejectsSecretBearingStructuralFields(t *testing.T) {
 	const canary = "sk-ant-secret-canary"
 	request := credentialOperationTestRequest(
 		t, account, CredentialOperationEnsureFresh, CredentialTargetKeychain,
-		credentialOperationTestState("before", ""), "refresh", credentialOperationTestOwner("owner"))
+		credentialOperationTestState("before", ""), "refresh", credentialOperationTestOwner("owner"),
+	)
 	request.Kind = CredentialOperationKind(canary)
 	if _, err := s.BeginCredentialOperation(request); err == nil {
 		t.Fatal("secret-bearing operation kind was accepted")
 	}
 	request = credentialOperationTestRequest(
 		t, account, CredentialOperationEnsureFresh, CredentialTargetKeychain,
-		credentialOperationTestState("before", ""), "refresh", credentialOperationTestOwner("owner"))
+		credentialOperationTestState("before", ""), "refresh", credentialOperationTestOwner("owner"),
+	)
 	begin, err := s.BeginCredentialOperation(request)
 	if err != nil {
 		t.Fatal(err)
@@ -1131,7 +1125,8 @@ func TestCredentialOperationOwnerPagingBoundary(t *testing.T) {
 		request := credentialOperationTestRequest(
 			t, account, CredentialOperationCompensate, CredentialTargetKeychain,
 			credentialOperationTestState(fmt.Sprintf("credential-%d", id), ""),
-			fmt.Sprintf("drop-%d", id), owner)
+			fmt.Sprintf("drop-%d", id), owner,
+		)
 		if begin, err := s.BeginCredentialOperation(request); err != nil || !begin.Created {
 			t.Fatalf("begin account %d = %+v err=%v", id, begin, err)
 		}
@@ -1208,7 +1203,8 @@ func TestCredentialOperationReceiptGCIsBounded(t *testing.T) {
 		request := credentialOperationTestRequest(
 			t, account, CredentialOperationCompensate, CredentialTargetKeychain,
 			credentialOperationTestState(fmt.Sprintf("credential-%d", id), ""),
-			fmt.Sprintf("adopt-%d", id), credentialOperationTestOwner("gc-owner"))
+			fmt.Sprintf("adopt-%d", id), credentialOperationTestOwner("gc-owner"),
+		)
 		begin, err := s.BeginCredentialOperation(request)
 		if err != nil {
 			t.Fatal(err)
@@ -1240,7 +1236,8 @@ func TestCredentialOperationReceiptGCIsBounded(t *testing.T) {
 	request := credentialOperationTestRequest(
 		t, account, CredentialOperationCompensate, CredentialTargetKeychain,
 		credentialOperationTestState("unacknowledged", ""), "unacknowledged",
-		credentialOperationTestOwner("gc-owner"))
+		credentialOperationTestOwner("gc-owner"),
+	)
 	begin, err := s.BeginCredentialOperation(request)
 	if err != nil {
 		t.Fatal(err)
@@ -1281,7 +1278,8 @@ func TestPendingAddCredentialCompensationAdmissionAndCommit(t *testing.T) {
 		t.Fatalf("active compensation evidence = %+v %+v err=%v", activeEvidence, receiptEvidence, err)
 	}
 	operation, err := s.MarkCredentialOperationApplying(
-		begin.Active.Fence(), nil)
+		begin.Active.Fence(), nil,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1524,7 +1522,7 @@ func credentialOperationTestRequest(
 	target CredentialTarget,
 	expected CredentialExternalState,
 	intent string,
-	owner proc.Record,
+	owner OwnerRecord,
 ) BeginCredentialOperationRequest {
 	t.Helper()
 	locator := CredentialKeychainLocatorDigest(account.KeychainService, account.KeychainAccount)
@@ -1567,36 +1565,8 @@ func credentialOperationTestDigest(value string) CredentialDigest {
 	return CredentialDigest(digest)
 }
 
-func credentialOperationTestOwner(generation string) proc.Record {
-	digest := sha256.Sum256([]byte(generation))
-	var ownerGeneration proc.OwnerGeneration
-	copy(ownerGeneration[:], digest[:len(ownerGeneration)])
-	return proc.Record{
-		RecoveryID: "com.yasyf.cc-pool.store-test.v1",
-		PID:        42, StartTime: "1.0", Boot: "test-boot", Comm: "cc-pool", Generation: ownerGeneration,
-	}
-}
-
-func credentialOperationTestRetirement(
-	t *testing.T,
-	owner proc.Record,
-	newOwner proc.Record,
-) (proc.ReapReceipt, *proc.Reaper) {
-	t.Helper()
-	store := &proc.FileStore{Path: filepath.Join(t.TempDir(), "recovery.db")}
-	if err := store.Add(t.Context(), owner); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.BeginReap(t.Context(), owner, newOwner.Generation); err != nil {
-		t.Fatal(err)
-	}
-	receipt, err := store.CommitReap(
-		t.Context(), owner, newOwner.Generation, proc.ReapAbsent,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return receipt, &proc.Reaper{Store: store, Generation: newOwner.Generation}
+func credentialOperationTestOwner(generation string) OwnerRecord {
+	return OwnerRecord(`{"v":2,"nonce":"` + generation + `"}`)
 }
 
 func storeDatabasePath(t *testing.T, s *Store) string {

@@ -5,14 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/workerexec"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/daemonkit"
 )
 
 // Refresher is the slice of *oauth.Client the Manager needs.
@@ -21,30 +21,12 @@ type Refresher interface {
 	Usage(ctx context.Context, accessToken string) (*oauth.Usage, error)
 }
 
-func (m *Manager) credentialOwnerRecord() (proc.Record, error) {
-	if m.workerAuthority == nil {
-		return proc.Record{}, errors.New("credential mutation requires exact worker authority")
+// MutationOwner returns the singleton daemon generation's credential authority.
+func (m *Manager) MutationOwner() (store.OwnerRecord, error) {
+	if err := m.owner.Validate(); err != nil {
+		return nil, errors.New("credential mutation requires daemon worker ownership")
 	}
-	identity, err := proc.CurrentIdentity()
-	if err != nil {
-		return proc.Record{}, err
-	}
-	if err := validateCurrentWorkerOwner(m.workerAuthority.owner, identity); err != nil {
-		return proc.Record{}, err
-	}
-	if m.workerAuthority.owner.RecoveryID != CredentialOwnerRecoveryID ||
-		m.workerAuthority.owner.ProcessGroup {
-		return proc.Record{}, errors.New("credential worker authority kind changed")
-	}
-	return m.workerAuthority.owner, nil
-}
-
-// MutationOwner returns the singleton daemon's durable credential authority.
-func (m *Manager) MutationOwner() (proc.Record, error) {
-	if m.workers == nil && m.workerAuthority == nil {
-		return proc.Record{}, errors.New("credential mutation requires daemon worker ownership")
-	}
-	return m.credentialOwnerRecord()
+	return m.owner, nil
 }
 
 // Credentials resolves an account's candidate credential stores; injectable
@@ -110,14 +92,12 @@ type Manager struct {
 	credentialMu      sync.Mutex
 	credentialFlights map[int]*credentialFlight
 
+	owner            store.OwnerRecord
 	workers          *workerRuntime
 	workerAuthority  *WorkerAuthority
 	taskRunner       workerexec.Runner
 	workerExecutable string
 	credentialCAS    credentialCASFunc
-	recoveryMu       sync.Mutex
-	recoveryCancel   context.CancelFunc
-	recoveryDone     chan struct{}
 }
 
 // CredentialMutationClaim acquires one account's credential-write exclusion.
@@ -137,8 +117,9 @@ func credentialMutationClaim(ctx context.Context, fallback CredentialMutationCla
 	return fallback
 }
 
-// OpenDaemon ensures state exists and creates the singleton daemon's durable worker runtime.
-func OpenDaemon(ctx context.Context) (*Manager, error) {
+// OpenDaemon ensures state exists and binds the singleton daemon's worker
+// runtime to the process scope Serve handed Start.
+func OpenDaemon(scope daemonkit.Ctx) (*Manager, error) {
 	if err := EnsureStateDir(); err != nil {
 		return nil, fmt.Errorf("ensure state dir: %w", err)
 	}
@@ -146,20 +127,28 @@ func OpenDaemon(ctx context.Context) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	workers, scanner, err := newWorkerRuntime(ctx)
+	workers, err := newWorkerRuntime(scope)
 	if err != nil {
 		_ = st.Close()
 		return nil, err
 	}
-	authority, err := NewWorkerAuthority(workers.pool, workers.executable, workers.owner)
+	scanner, err := procscan.NewWorkerScanner(workers, workers.executable)
 	if err != nil {
-		_ = workers.close(ctx)
+		_ = st.Close()
+		return nil, err
+	}
+	owner, err := store.MintOwnerRecord(time.Now())
+	if err != nil {
+		_ = st.Close()
+		return nil, err
+	}
+	authority, err := NewWorkerAuthority(workers, workers.executable, owner)
+	if err != nil {
 		_ = st.Close()
 		return nil, err
 	}
 	manager, err := NewManager(st, oauth.New(), scanner.Scan, authority)
 	if err != nil {
-		_ = workers.close(ctx)
 		_ = st.Close()
 		return nil, err
 	}
@@ -191,7 +180,6 @@ func (m *Manager) scanSessions(ctx context.Context) ([]procscan.Session, error) 
 // Close releases resources within a cleanup context derived from ctx.
 func (m *Manager) Close(ctx context.Context) error {
 	var result error
-	m.stopCredentialOwnerRecovery()
 	if m.workers != nil {
 		result = m.workers.close(ctx)
 	}
@@ -199,22 +187,6 @@ func (m *Manager) Close(ctx context.Context) error {
 		result = errors.Join(result, m.Store.Close())
 	}
 	return result
-}
-
-// DisposableWorkers returns the runtime-owned daemonkit worker pool.
-func (m *Manager) DisposableWorkers() *worker.Pool {
-	if m.workers == nil {
-		return nil
-	}
-	return m.workers.pool
-}
-
-// RuntimeChildren returns the runtime-owned bounded child manager.
-func (m *Manager) RuntimeChildren() *proc.Manager {
-	if m.workers == nil {
-		return nil
-	}
-	return m.workers.children
 }
 
 // Meta keys recording pool-level state in the store's meta table.

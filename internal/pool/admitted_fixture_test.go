@@ -11,21 +11,15 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/testhome"
-	"github.com/yasyf/daemonkit/proc"
 )
 
 func admitPoolTestAccount(t *testing.T, st *store.Store, requested store.Account) store.Account {
 	t.Helper()
 	var fillers []store.Account
 	for {
-		owner := proc.Record{
-			RecoveryID: CredentialOwnerRecoveryID,
-			PID:        42,
-			StartTime:  "1.0",
-			Boot:       "test-boot",
-			Comm:       "cc-pool-test",
-			Generation: poolTestGeneration(fmt.Sprintf("admitted-account-%d", requested.ID)),
-		}
+		owner := store.OwnerRecord(fmt.Sprintf(
+			`{"v":2,"nonce":"admitted-account-%d"}`, requested.ID,
+		))
 		reservation, err := st.ReserveAccountIndex(owner)
 		if err != nil {
 			t.Fatal(err)
@@ -56,7 +50,7 @@ func commitPoolTestAccount(
 	st *store.Store,
 	requested store.Account,
 	reservation store.PendingAccountReservation,
-	owner proc.Record,
+	owner store.OwnerRecord,
 ) store.Account {
 	return commitPoolTestAccountAtPresentation(t, st, requested, reservation, owner, "")
 }
@@ -66,7 +60,7 @@ func commitPoolTestAccountAtPresentation(
 	st *store.Store,
 	requested store.Account,
 	reservation store.PendingAccountReservation,
-	owner proc.Record,
+	owner store.OwnerRecord,
 	publicPath string,
 ) store.Account {
 	t.Helper()

@@ -6,11 +6,8 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"time"
-
-	"github.com/yasyf/daemonkit/proc"
 )
 
 // AccountMutationID is the stable semantic identity of one registry mutation.
@@ -78,7 +75,7 @@ var (
 // AccountMutationFence authorizes one exact daemon owner epoch.
 type AccountMutationFence struct {
 	OperationID AccountMutationID
-	Owner       proc.Record
+	Owner       OwnerRecord
 	OwnerEpoch  uint64
 }
 
@@ -105,7 +102,7 @@ type AccountMutation struct {
 	AccountUUID              string
 	PresentationIdentity     FileProviderPresentationIdentity
 	HasPresentationIdentity  bool
-	Owner                    proc.Record
+	Owner                    OwnerRecord
 	OwnerEpoch               uint64
 	CreatedAt                time.Time
 	UpdatedAt                time.Time
@@ -144,7 +141,7 @@ type AccountMutationReceipt struct {
 	AccountUUID              string
 	PresentationIdentity     FileProviderPresentationIdentity
 	HasPresentationIdentity  bool
-	Owner                    proc.Record
+	Owner                    OwnerRecord
 	OwnerEpoch               uint64
 	PublicationPending       bool
 	CommittedAt              time.Time
@@ -193,7 +190,7 @@ type BeginAccountMutationRequest struct {
 	KeychainAccount          string
 	Label                    string
 	AccountUUID              string
-	Owner                    proc.Record
+	Owner                    OwnerRecord
 }
 
 // BeginAccountMutationResult returns one active lane or immutable receipt.
@@ -273,10 +270,6 @@ func (s *Store) BeginAccountMutation(
 ) (BeginAccountMutationResult, error) {
 	now := s.now()
 	if err := validateAccountMutationRequest(request); err != nil {
-		return BeginAccountMutationResult{}, err
-	}
-	owner, err := json.Marshal(request.Owner)
-	if err != nil {
 		return BeginAccountMutationResult{}, err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -372,7 +365,7 @@ func (s *Store) BeginAccountMutation(
 		request.AccountInstanceID, request.AccountGeneration, request.LocatorDigest[:],
 		request.ExpectedCredentialDigest[:], request.IntentDigest[:], request.ConfigDir,
 		request.KeychainService, request.KeychainAccount, request.Label, request.AccountUUID,
-		owner, now.UnixNano(), now.UnixNano(),
+		[]byte(request.Owner), now.UnixNano(), now.UnixNano(),
 	); err != nil {
 		if request.Kind == AccountMutationAdd {
 			current, currentErr := accountMutationByKind(tx, AccountMutationAdd)
@@ -440,10 +433,6 @@ func (s *Store) BindAccountMutationPresentation(
 		}
 		return AccountMutationFence{}, err
 	}
-	owner, err := json.Marshal(fence.Owner)
-	if err != nil {
-		return AccountMutationFence{}, err
-	}
 	result, err := s.db.Exec(
 		`UPDATE account_mutations SET state='awaiting-input',
 		 config_dir=?,keychain_service=?,keychain_account=?,locator_digest=?,
@@ -454,7 +443,7 @@ func (s *Store) BindAccountMutationPresentation(
 		 AND kind='add' AND state='awaiting-presentation'`,
 		configDir, keychainService, keychainAccount, locator[:], expected[:],
 		identity.TenantID, identity.DomainID, identity.Generation, identity.PublicPath, s.now().UnixNano(),
-		fence.OperationID[:], owner, fence.OwnerEpoch,
+		fence.OperationID[:], []byte(fence.Owner), fence.OwnerEpoch,
 	)
 	if err != nil {
 		return AccountMutationFence{}, err
@@ -492,7 +481,7 @@ func (s *Store) CancelUnboundAccountMutation(fence AccountMutationFence) error {
 	result, err := tx.Exec(
 		`DELETE FROM account_mutations WHERE operation_id=? AND owner_record=? AND owner_epoch=?
 		 AND kind='add' AND state='awaiting-presentation'`,
-		fence.OperationID[:], mustEncodeCredentialOwner(fence.Owner), fence.OwnerEpoch,
+		fence.OperationID[:], []byte(fence.Owner), fence.OwnerEpoch,
 	)
 	if err != nil {
 		return err
@@ -503,7 +492,7 @@ func (s *Store) CancelUnboundAccountMutation(fence AccountMutationFence) error {
 	result, err = tx.Exec(
 		`DELETE FROM pending_adds WHERE id=? AND instance_id=? AND generation=? AND owner_record=?`,
 		mutation.AccountID, mutation.AccountInstanceID, mutation.AccountGeneration,
-		mustEncodeCredentialOwner(fence.Owner),
+		[]byte(fence.Owner),
 	)
 	if err != nil {
 		return err
@@ -534,7 +523,24 @@ func (s *Store) ActiveAccountMutationByKind(kind AccountMutationKind) (AccountMu
 
 // AccountMutationsOwnedBy returns one bounded stable account-id page for an exact owner.
 func (s *Store) AccountMutationsOwnedBy(
-	owner proc.Record,
+	owner OwnerRecord,
+	afterAccountID, limit int,
+) (mutations []AccountMutation, more bool, err error) {
+	return s.accountMutationsPage(owner, true, afterAccountID, limit)
+}
+
+// AccountMutationsNotOwnedBy returns one bounded stable account-id page of
+// lanes whose stored owner bytes differ from owner — the successor's claim scan.
+func (s *Store) AccountMutationsNotOwnedBy(
+	owner OwnerRecord,
+	afterAccountID, limit int,
+) (mutations []AccountMutation, more bool, err error) {
+	return s.accountMutationsPage(owner, false, afterAccountID, limit)
+}
+
+func (s *Store) accountMutationsPage(
+	owner OwnerRecord,
+	owned bool,
 	afterAccountID, limit int,
 ) (mutations []AccountMutation, more bool, err error) {
 	if err := owner.Validate(); err != nil {
@@ -543,15 +549,11 @@ func (s *Store) AccountMutationsOwnedBy(
 	if afterAccountID < 0 || limit <= 0 || limit > CredentialOperationPageLimit {
 		return nil, false, ErrAccountMutationState
 	}
-	ownerRecord, err := encodeCredentialOwner(owner)
-	if err != nil {
-		return nil, false, err
-	}
 	rows, err := s.db.Query(
 		`SELECT `+accountMutationColumns+` FROM account_mutations
-		 WHERE owner_record=? AND account_id>?
+		 WHERE (owner_record=?)=? AND account_id>?
 		 ORDER BY account_id LIMIT ?`,
-		ownerRecord, afterAccountID, limit+1,
+		[]byte(owner), owned, afterAccountID, limit+1,
 	)
 	if err != nil {
 		return nil, false, err
@@ -572,13 +574,14 @@ func (s *Store) AccountMutationsOwnedBy(
 	return mutations, more, rows.Err()
 }
 
-// TakeoverAccountMutation transfers a provably retired lane into a new owner epoch.
+// TakeoverAccountMutation transfers a foreign lane into a new owner epoch. The
+// fence's owner is the row's stored bytes echoed into the CAS; exclusion
+// against a live owner is Serve's flock, so the epoch CAS alone fences the
+// impossible straggler.
 func (s *Store) TakeoverAccountMutation(
 	ctx context.Context,
 	expected AccountMutationFence,
-	newOwner proc.Record,
-	receipt proc.ReapReceipt,
-	verifier ProcessRetirementVerifier,
+	newOwner OwnerRecord,
 ) (AccountMutation, error) {
 	if err := expected.Owner.Validate(); err != nil {
 		return AccountMutation{}, err
@@ -586,21 +589,12 @@ func (s *Store) TakeoverAccountMutation(
 	if err := newOwner.Validate(); err != nil {
 		return AccountMutation{}, err
 	}
-	if err := verifyProcessRetirement(ctx, expected.Owner, newOwner, receipt, verifier); err != nil {
-		return AccountMutation{}, errors.Join(ErrAccountMutationFence, err)
-	}
 	now := s.now()
 	if expected.OperationID == (AccountMutationID{}) || expected.OwnerEpoch == 0 {
 		return AccountMutation{}, ErrAccountMutationFence
 	}
-	oldOwner, err := json.Marshal(expected.Owner)
-	if err != nil {
-		return AccountMutation{}, err
-	}
-	encodedNewOwner, err := json.Marshal(newOwner)
-	if err != nil {
-		return AccountMutation{}, err
-	}
+	oldOwner := []byte(expected.Owner)
+	encodedNewOwner := []byte(newOwner)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return AccountMutation{}, err
@@ -703,7 +697,7 @@ func (s *Store) RearmAccountMutationInput(
 	if err != nil {
 		return AccountMutationFence{}, err
 	}
-	if sameCredentialOwner(mutation.Owner, fence.Owner) &&
+	if bytes.Equal(mutation.Owner, fence.Owner) &&
 		mutation.OwnerEpoch == fence.OwnerEpoch+1 &&
 		mutation.State == AccountMutationAwaitingInput &&
 		mutation.ExpectedCredentialDigest == observed {
@@ -726,7 +720,7 @@ func (s *Store) RearmAccountMutationInput(
 		`UPDATE account_mutations SET state='awaiting-input',owner_epoch=owner_epoch+1,updated_at=?
 		 WHERE operation_id=? AND owner_record=? AND owner_epoch=?
 		 AND state='applying'`,
-		now.UnixNano(), fence.OperationID[:], mustEncodeCredentialOwner(fence.Owner),
+		now.UnixNano(), fence.OperationID[:], []byte(fence.Owner),
 		fence.OwnerEpoch,
 	)
 	if err != nil {
@@ -781,16 +775,12 @@ func (s *Store) SetAccountMutationMetadata(
 	if mutation.Kind != AccountMutationAdd && mutation.Kind != AccountMutationRelogin {
 		return AccountMutationFence{}, ErrAccountMutationState
 	}
-	owner, err := json.Marshal(fence.Owner)
-	if err != nil {
-		return AccountMutationFence{}, err
-	}
 	now := s.now()
 	result, err := s.db.Exec(
 		`UPDATE account_mutations SET label=?,account_uuid=?,owner_epoch=owner_epoch+1,updated_at=?
 		 WHERE operation_id=? AND owner_record=? AND owner_epoch=?
 		 AND state IN ('applying','applied')`,
-		label, accountUUID, now.UnixNano(), fence.OperationID[:], owner, fence.OwnerEpoch,
+		label, accountUUID, now.UnixNano(), fence.OperationID[:], []byte(fence.Owner), fence.OwnerEpoch,
 	)
 	if err != nil {
 		return AccountMutationFence{}, err
@@ -821,10 +811,6 @@ func (s *Store) advanceAccountMutation(
 	if fence.OperationID == (AccountMutationID{}) || fence.OwnerEpoch == 0 {
 		return AccountMutationFence{}, ErrAccountMutationFence
 	}
-	owner, err := json.Marshal(fence.Owner)
-	if err != nil {
-		return AccountMutationFence{}, err
-	}
 	now := s.now()
 	result, err := s.db.Exec(
 		`UPDATE account_mutations SET state=?,owner_epoch=owner_epoch+1,updated_at=?,
@@ -833,7 +819,7 @@ func (s *Store) advanceAccountMutation(
 		 credential_written=CASE WHEN ? THEN 1 ELSE credential_written END
 		 WHERE operation_id=? AND owner_record=? AND owner_epoch=? AND state=?`,
 		to, now.UnixNano(), hasInput, input[:], credentialWritten, written[:], credentialWritten,
-		fence.OperationID[:], owner, fence.OwnerEpoch, from,
+		fence.OperationID[:], []byte(fence.Owner), fence.OwnerEpoch, from,
 	)
 	if err != nil {
 		return AccountMutationFence{}, err
@@ -967,7 +953,7 @@ func transitionAccountMutationCompensating(
 	result, err := tx.Exec(
 		`UPDATE account_mutations SET state='compensating',owner_epoch=owner_epoch+1,updated_at=?
 		 WHERE operation_id=? AND owner_record=? AND owner_epoch=? AND state='publishing'`,
-		now.UnixNano(), mutation.OperationID[:], mustEncodeCredentialOwner(mutation.Owner), mutation.OwnerEpoch,
+		now.UnixNano(), mutation.OperationID[:], []byte(mutation.Owner), mutation.OwnerEpoch,
 	)
 	if err != nil {
 		return err
@@ -1356,7 +1342,7 @@ func validateAccountMutationSubject(tx *sql.Tx, request BeginAccountMutationRequ
 			return err
 		}
 		if instanceID != request.AccountInstanceID || generation != request.AccountGeneration ||
-			!bytes.Equal(owner, mustEncodeCredentialOwner(request.Owner)) {
+			!bytes.Equal(owner, request.Owner) {
 			return ErrAccountGenerationChanged
 		}
 		return nil
@@ -1477,9 +1463,7 @@ func scanAccountMutation(row interface{ Scan(...any) error }) (AccountMutation, 
 		mutation.HasInput = true
 	}
 	copy(mutation.WrittenCredentialDigest[:], written)
-	if err := json.Unmarshal(owner, &mutation.Owner); err != nil {
-		return mutation, err
-	}
+	mutation.Owner = OwnerRecord(owner)
 	mutation.CredentialWritten = credentialWritten != 0
 	mutation.HasPresentationIdentity = mutation.PresentationIdentity.TenantID != ""
 	mutation.CreatedAt = time.Unix(0, createdAt)
@@ -1564,9 +1548,7 @@ func scanAccountMutationReceipt(row interface{ Scan(...any) error }) (AccountMut
 		copy(receipt.ResolutionObservedDigest[:], resolutionObserved)
 		receipt.ResolvedAt = time.Unix(0, resolvedAt.Int64)
 	}
-	if err := json.Unmarshal(owner, &receipt.Owner); err != nil {
-		return receipt, err
-	}
+	receipt.Owner = OwnerRecord(owner)
 	receipt.CredentialWritten = credentialWritten != 0
 	receipt.PublicationPending = publicationPending != 0
 	receipt.HasPresentationIdentity = receipt.PresentationIdentity.TenantID != ""
@@ -1623,7 +1605,7 @@ func insertAccountMutationReceipt(
 		mutation.ExpectedCredentialDigest[:], mutation.IntentDigest[:], input, written, mutation.CredentialWritten,
 		outcome[:], terminal, quarantineReason,
 		mutation.ConfigDir, mutation.KeychainService, mutation.KeychainAccount,
-		mutation.Label, mutation.AccountUUID, mustEncodeCredentialOwner(mutation.Owner), mutation.OwnerEpoch,
+		mutation.Label, mutation.AccountUUID, []byte(mutation.Owner), mutation.OwnerEpoch,
 		mutation.PresentationIdentity.TenantID, mutation.PresentationIdentity.DomainID,
 		mutation.PresentationIdentity.Generation, mutation.PresentationIdentity.PublicPath,
 		terminal == AccountMutationCommitted && mutation.Kind == AccountMutationAdd,
@@ -1829,7 +1811,7 @@ func sameAccountMutationReceiptIntent(
 
 func sameAccountMutationFence(mutation AccountMutation, fence AccountMutationFence) bool {
 	return mutation.OperationID == fence.OperationID && mutation.OwnerEpoch == fence.OwnerEpoch &&
-		sameCredentialOwner(mutation.Owner, fence.Owner)
+		bytes.Equal(mutation.Owner, fence.Owner)
 }
 
 func accountMutationReceiptFenceMatches(
@@ -1837,5 +1819,5 @@ func accountMutationReceiptFenceMatches(
 	fence AccountMutationFence,
 ) bool {
 	return receipt.OperationID == fence.OperationID && receipt.OwnerEpoch == fence.OwnerEpoch &&
-		sameCredentialOwner(receipt.Owner, fence.Owner)
+		bytes.Equal(receipt.Owner, fence.Owner)
 }

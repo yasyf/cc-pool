@@ -9,7 +9,6 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/testhome"
-	"github.com/yasyf/daemonkit/proc"
 )
 
 func TestReconcileAccountPresentationRetargetsOnlyStableLink(t *testing.T) {
@@ -154,10 +153,7 @@ func stablePresentationTestAccount(
 	if err != nil {
 		t.Fatal(err)
 	}
-	owner := proc.Record{
-		RecoveryID: CredentialOwnerRecoveryID, PID: 42, StartTime: "1.0",
-		Boot: "test-boot", Comm: "cc-pool-test", Generation: poolTestGeneration("stable-presentation"),
-	}
+	owner := store.OwnerRecord(`{"v":2,"nonce":"stable-presentation"}`)
 	reservation, err := st.ReserveAccountIndex(owner)
 	if err != nil {
 		t.Fatal(err)

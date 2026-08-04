@@ -55,18 +55,21 @@ type credentialLockTarget struct {
 }
 
 type credentialLockJournal struct {
-	Schema    int                    `json:"schema"`
-	AccountID int                    `json:"account_id"`
-	Nonce     string                 `json:"nonce"`
-	Worker    store.OwnerRecord      `json:"worker"`
-	Targets   []credentialLockTarget `json:"targets"`
+	Schema    int    `json:"schema"`
+	AccountID int    `json:"account_id"`
+	Nonce     string `json:"nonce"`
+	// Worker is carried-and-echoed raw JSON, never decoded: a v0.20.x
+	// journal's proc.Record object recovers under the same marker byte
+	// equality as a v2 owner record.
+	Worker  json.RawMessage        `json:"worker"`
+	Targets []credentialLockTarget `json:"targets"`
 }
 
 type credentialLockMarker struct {
 	Schema      int                       `json:"schema"`
 	AccountID   int                       `json:"account_id"`
 	Nonce       string                    `json:"nonce"`
-	Worker      store.OwnerRecord         `json:"worker"`
+	Worker      json.RawMessage           `json:"worker"`
 	Target      string                    `json:"target"`
 	Fingerprint credentialLockFingerprint `json:"fingerprint"`
 }
@@ -105,6 +108,10 @@ func acquireCredentialRefreshLocks(
 	accountID int,
 	configDir string,
 ) (*credentialLockLease, error) {
+	worker, err := credentialLockWorkerValue(owner)
+	if err != nil {
+		return nil, err
+	}
 	paths, err := credentialRefreshLockPaths(configDir)
 	if err != nil {
 		return nil, err
@@ -136,7 +143,7 @@ func acquireCredentialRefreshLocks(
 	}
 	lease.journal = credentialLockJournal{
 		Schema: credentialLockJournalSchema, AccountID: accountID,
-		Nonce: nonce, Worker: owner, Targets: make([]credentialLockTarget, len(paths)),
+		Nonce: nonce, Worker: worker, Targets: make([]credentialLockTarget, len(paths)),
 	}
 	for index, path := range paths {
 		lease.journal.Targets[index] = credentialLockTarget{
@@ -476,6 +483,17 @@ func recoverCredentialLockJournal(
 	return nil
 }
 
+func credentialLockWorkerValue(owner store.OwnerRecord) (json.RawMessage, error) {
+	if err := owner.Validate(); err != nil {
+		return nil, err
+	}
+	encoded, err := json.Marshal(owner)
+	if err != nil {
+		return nil, err
+	}
+	return encoded, nil
+}
+
 func newCredentialLockNonce() (string, error) {
 	var raw [16]byte
 	if _, err := rand.Read(raw[:]); err != nil {
@@ -578,8 +596,8 @@ func validateCredentialLockJournal(
 	if _, err := hex.DecodeString(journal.Nonce); err != nil {
 		return errors.New("credential lock journal nonce is invalid")
 	}
-	if err := journal.Worker.Validate(); err != nil {
-		return err
+	if len(journal.Worker) == 0 {
+		return errors.New("credential lock journal worker is invalid")
 	}
 	for index, target := range journal.Targets {
 		if target.Path != paths[index] ||

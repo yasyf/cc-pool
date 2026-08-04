@@ -6,8 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"time"
-
-	"github.com/yasyf/daemonkit/proc"
 )
 
 // PendingAccountReservation is the exact prospective account identity reserved
@@ -16,7 +14,7 @@ type PendingAccountReservation struct {
 	ID         int
 	InstanceID string
 	Generation uint64
-	Owner      proc.Record
+	Owner      OwnerRecord
 	CreatedAt  time.Time
 }
 
@@ -27,7 +25,7 @@ var ErrSyncedPromotionAmbiguous = errors.New("synced account promotion state is 
 // ReserveAccountIndex atomically allocates the smallest unused account index
 // (>= 1, gap-filling): the free-index computation and insert are one SQL
 // statement, so two concurrent callers can never be handed the same index.
-func (s *Store) ReserveAccountIndex(owner proc.Record) (PendingAccountReservation, error) {
+func (s *Store) ReserveAccountIndex(owner OwnerRecord) (PendingAccountReservation, error) {
 	if err := owner.Validate(); err != nil {
 		return PendingAccountReservation{}, err
 	}
@@ -36,10 +34,6 @@ func (s *Store) ReserveAccountIndex(owner proc.Record) (PendingAccountReservatio
 		return PendingAccountReservation{}, err
 	}
 	createdAt := s.now()
-	ownerRecord, err := encodeCredentialOwner(owner)
-	if err != nil {
-		return PendingAccountReservation{}, err
-	}
 	var createdAtUnix int64
 	var reservation PendingAccountReservation
 	err = s.db.QueryRow(`
@@ -50,7 +44,7 @@ func (s *Store) ReserveAccountIndex(owner proc.Record) (PendingAccountReservatio
 		      SELECT id+1 FROM (SELECT id FROM accounts UNION SELECT id FROM pending_adds))
 		WHERE candidate NOT IN (SELECT id FROM accounts UNION SELECT id FROM pending_adds)
 		RETURNING id,instance_id,generation,created_at`,
-		instanceID, ownerRecord, createdAt.UnixNano()).Scan(
+		instanceID, []byte(owner), createdAt.UnixNano()).Scan(
 		&reservation.ID, &reservation.InstanceID, &reservation.Generation, &createdAtUnix,
 	)
 	if err != nil {
@@ -69,7 +63,7 @@ func (s *Store) ReleaseAccountIndex(reservation PendingAccountReservation) error
 	result, err := s.db.Exec(
 		`DELETE FROM pending_adds WHERE id=? AND instance_id=? AND generation=? AND owner_record=?`,
 		reservation.ID, reservation.InstanceID, reservation.Generation,
-		mustEncodeCredentialOwner(reservation.Owner),
+		[]byte(reservation.Owner),
 	)
 	if err != nil {
 		return fmt.Errorf("release account index %d: %w", reservation.ID, err)
@@ -88,7 +82,7 @@ func consumeReservation(e rowExecer, reservation PendingAccountReservation) erro
 	res, err := e.Exec(
 		`DELETE FROM pending_adds WHERE id=? AND instance_id=? AND generation=? AND owner_record=?`,
 		reservation.ID, reservation.InstanceID, reservation.Generation,
-		mustEncodeCredentialOwner(reservation.Owner),
+		[]byte(reservation.Owner),
 	)
 	if err != nil {
 		return fmt.Errorf("consume account index %d: %w", reservation.ID, err)
@@ -326,7 +320,25 @@ func (s *Store) ResolveReservedSyncedPromotion(
 
 // PendingAddReservationsOwnedBy returns one bounded stable account-id page.
 func (s *Store) PendingAddReservationsOwnedBy(
-	owner proc.Record,
+	owner OwnerRecord,
+	afterAccountID, limit int,
+) (reservations []PendingAccountReservation, more bool, err error) {
+	return s.pendingAddReservationsPage(owner, true, afterAccountID, limit)
+}
+
+// PendingAddReservationsNotOwnedBy returns one bounded stable account-id page
+// of reservations whose stored owner bytes differ from owner — the successor's
+// claim scan.
+func (s *Store) PendingAddReservationsNotOwnedBy(
+	owner OwnerRecord,
+	afterAccountID, limit int,
+) (reservations []PendingAccountReservation, more bool, err error) {
+	return s.pendingAddReservationsPage(owner, false, afterAccountID, limit)
+}
+
+func (s *Store) pendingAddReservationsPage(
+	owner OwnerRecord,
+	owned bool,
 	afterAccountID, limit int,
 ) (reservations []PendingAccountReservation, more bool, err error) {
 	if err := owner.Validate(); err != nil {
@@ -337,11 +349,11 @@ func (s *Store) PendingAddReservationsOwnedBy(
 	}
 	rows, err := s.db.Query(
 		`SELECT id,instance_id,generation,owner_record,created_at FROM pending_adds
-		 WHERE owner_record=? AND id>?
+		 WHERE (owner_record=?)=? AND id>?
 		 AND NOT EXISTS (SELECT 1 FROM account_mutations WHERE account_id=pending_adds.id AND account_instance_id=pending_adds.instance_id AND account_generation=pending_adds.generation)
 		 AND NOT EXISTS (SELECT 1 FROM account_mutation_receipts WHERE account_id=pending_adds.id AND account_instance_id=pending_adds.instance_id AND account_generation=pending_adds.generation)
 		 ORDER BY id LIMIT ?`,
-		mustEncodeCredentialOwner(owner), afterAccountID, limit+1,
+		[]byte(owner), owned, afterAccountID, limit+1,
 	)
 	if err != nil {
 		return nil, false, err
@@ -408,12 +420,11 @@ func scanPendingAccountReservation(row interface{ Scan(...any) error }) (Pending
 	); err != nil {
 		return PendingAccountReservation{}, err
 	}
-	if err := decodeCredentialOwner(owner, &reservation.Owner); err != nil {
-		return PendingAccountReservation{}, err
-	}
+	reservation.Owner = OwnerRecord(owner)
 	reservation.CreatedAt = time.Unix(0, createdAt)
 	if reservation.ID <= 0 || validateAccountInstanceID(reservation.InstanceID) != nil ||
-		reservation.Generation != 1 || reservation.CreatedAt.IsZero() {
+		reservation.Generation != 1 || reservation.Owner.Validate() != nil ||
+		reservation.CreatedAt.IsZero() {
 		return PendingAccountReservation{}, errors.New("pending add reservation is corrupt")
 	}
 	return reservation, nil
@@ -421,7 +432,7 @@ func scanPendingAccountReservation(row interface{ Scan(...any) error }) (Pending
 
 func samePendingAccountReservation(left, right PendingAccountReservation) bool {
 	return left.ID == right.ID && left.InstanceID == right.InstanceID &&
-		left.Generation == right.Generation && sameCredentialOwner(left.Owner, right.Owner) &&
+		left.Generation == right.Generation && bytes.Equal(left.Owner, right.Owner) &&
 		left.CreatedAt.Equal(right.CreatedAt)
 }
 

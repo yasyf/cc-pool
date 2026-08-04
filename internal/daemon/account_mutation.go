@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -15,7 +16,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
-	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/wire"
 )
 
@@ -953,7 +953,7 @@ func (s *Server) retireAndCancelUnboundAccountMutation(
 	return errors.Join(cause, s.m.Store.CancelUnboundAccountMutation(mutation.Fence()))
 }
 
-func (s *Server) currentAccountMutationOwner() (proc.Record, error) {
+func (s *Server) currentAccountMutationOwner() (store.OwnerRecord, error) {
 	if s.accountMutationOwner != nil {
 		return s.accountMutationOwner()
 	}
@@ -965,7 +965,7 @@ func (s *Server) requireCurrentAccountMutationOwner(mutation store.AccountMutati
 	if err != nil {
 		return err
 	}
-	if mutation.Owner != owner {
+	if !bytes.Equal(mutation.Owner, owner) {
 		return store.ErrAccountMutationRecoveryRequired
 	}
 	return nil

@@ -18,15 +18,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
 	_ "modernc.org/sqlite" // pure-Go "sqlite" driver
 )
 
 // Store wraps the sqlite connection.
 type Store struct {
-	db            *sql.DB
-	lifecycleLock *proc.FileLockHandle
-	now           func() time.Time
+	db  *sql.DB
+	now func() time.Time
 }
 
 const schema = `
@@ -437,23 +435,13 @@ func open(path string, readOnly bool) (*Store, error) {
 		if err := requireSingleLinkDatabase(path); err != nil {
 			return nil, err
 		}
-		if _, err := os.Lstat(path + ".lifecycle.lock"); err != nil {
-			return nil, fmt.Errorf("open read-only store lifecycle: %w", err)
-		}
-	}
-	lifecycleLock, err := proc.FileLockSpec{
-		Path: path + ".lifecycle.lock", Mode: proc.FileLockShared, Deadline: time.Second,
-	}.TryAcquire()
-	if err != nil {
-		return nil, fmt.Errorf("open store lifecycle: %w", err)
 	}
 	db, err := sql.Open("sqlite", storeDSN(path, readOnly))
 	if err != nil {
-		_ = lifecycleLock.Close()
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	db.SetMaxOpenConns(1) // serialize writes
-	s := &Store{db: db, lifecycleLock: lifecycleLock, now: time.Now}
+	s := &Store{db: db, now: time.Now}
 	if readOnly {
 		err = verifySchema(db)
 	} else {
@@ -461,12 +449,10 @@ func open(path string, readOnly bool) (*Store, error) {
 	}
 	if err != nil {
 		_ = db.Close()
-		_ = lifecycleLock.Close()
 		return nil, err
 	}
 	if err := requireSingleLinkDatabase(path); err != nil {
 		_ = db.Close()
-		_ = lifecycleLock.Close()
 		return nil, err
 	}
 	return s, nil
@@ -632,9 +618,7 @@ func (s *Store) SetMeta(key, value string) error {
 
 // Close closes the database.
 func (s *Store) Close() error {
-	dbErr := s.db.Close()
-	lockErr := s.lifecycleLock.Close()
-	return errors.Join(dbErr, lockErr)
+	return s.db.Close()
 }
 
 // rowExecer is the write subset shared by *sql.DB and *sql.Tx.

@@ -1,10 +1,10 @@
 package pool
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,107 +18,45 @@ import (
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/testhome"
-	"github.com/yasyf/daemonkit/proc"
 )
 
-func TestRecoverRetiredCredentialOwnersCancellationReentryJoinsWedgedGeneration(t *testing.T) {
-	manager := &Manager{}
-	oldCtx, oldCancel := context.WithCancel(context.Background())
-	oldDone := make(chan struct{})
-	releasedOld := false
-	defer func() {
-		if !releasedOld {
-			close(oldDone)
-		}
-	}()
-	manager.recoveryCancel = oldCancel
-	manager.recoveryDone = oldDone
-
-	firstResult := make(chan error, 1)
-	go func() {
-		firstResult <- manager.RecoverRetiredCredentialOwners(t.Context())
-	}()
-	select {
-	case <-oldCtx.Done():
-	case <-time.After(time.Second):
-		t.Fatal("first recovery did not cancel the wedged generation")
+func TestClaimForeignLanesHonorsCancellationAndRepresentsForeignRows(t *testing.T) {
+	st := openTestStore(t)
+	account := persistTestAccount(t, st, store.Account{
+		ID: 1, ConfigDir: t.TempDir(), KeychainService: "service-claim-cancel", KeychainAccount: "account-claim-cancel",
+	})
+	credentials := credstest.NewFake()
+	old := credentialRecoveryManager(t, st, credentials, "claim-cancel-old")
+	recovery := credentialRecoveryManager(t, st, credentials, "claim-cancel-new")
+	before, err := old.credentialObservation(t.Context(), account)
+	if err != nil {
+		t.Fatal(err)
 	}
+	kind := store.CredentialOperationAdoptRotated
+	operation := beginCredentialOperation(
+		t, old, account, kind, store.CredentialTargetKeychain,
+		credentialIntentDigest(kind, "claim-cancel"), before,
+	)
 
-	manager.recoveryMu.Lock()
-	firstDone := manager.recoveryDone
-	manager.recoveryMu.Unlock()
-	if firstDone == nil || firstDone == oldDone {
-		t.Fatal("first recovery generation was not published")
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := recovery.ClaimForeignLanes(cancelled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled claim pass = %v, want context.Canceled", err)
 	}
-
-	secondResult := make(chan error, 1)
-	go func() {
-		secondResult <- manager.RecoverRetiredCredentialOwners(t.Context())
-	}()
-	deadline := time.Now().Add(time.Second)
-	var secondDone chan struct{}
-	for time.Now().Before(deadline) {
-		manager.recoveryMu.Lock()
-		secondDone = manager.recoveryDone
-		manager.recoveryMu.Unlock()
-		if secondDone != nil && secondDone != firstDone {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
-	if secondDone == nil || secondDone == firstDone {
-		t.Fatal("replacement recovery generation was not published")
+	untouched, err := st.CredentialOperationByToken(operation.Token)
+	if err != nil || untouched.OwnerEpoch != operation.OwnerEpoch ||
+		!bytes.Equal(untouched.Owner, operation.Owner) {
+		t.Fatalf("cancelled claim mutated lane = %+v err=%v", untouched, err)
 	}
 
-	lockAcquired := make(chan struct{})
-	go func() {
-		manager.recoveryMu.Lock()
-		close(lockAcquired)
-		manager.recoveryMu.Unlock()
-	}()
-	select {
-	case <-lockAcquired:
-	case <-time.After(time.Second):
-		t.Fatal("recovery mutex remained held while joining the wedged generation")
+	if err := recovery.ClaimForeignLanes(t.Context()); err != nil {
+		t.Fatal(err)
 	}
-	for name, result := range map[string]<-chan error{
-		"first": firstResult, "second": secondResult,
-	} {
-		select {
-		case err := <-result:
-			t.Fatalf("%s recovery returned before the predecessor joined: %v", name, err)
-		default:
-		}
+	if _, err := st.CredentialOperationByToken(operation.Token); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("re-presented prepared lane after claim = %v, want abandoned", err)
 	}
-
-	close(oldDone)
-	releasedOld = true
-	for name, result := range map[string]<-chan error{
-		"first": firstResult, "second": secondResult,
-	} {
-		select {
-		case err := <-result:
-			if err != nil {
-				t.Fatalf("%s recovery: %v", name, err)
-			}
-		case <-time.After(time.Second):
-			t.Fatalf("%s recovery did not finish after the predecessor joined", name)
-		}
-	}
-	select {
-	case <-firstDone:
-	default:
-		t.Fatal("superseded recovery generation did not finish")
-	}
-	select {
-	case <-secondDone:
-	default:
-		t.Fatal("active recovery generation did not finish")
-	}
-	manager.recoveryMu.Lock()
-	defer manager.recoveryMu.Unlock()
-	if manager.recoveryCancel != nil || manager.recoveryDone != nil {
-		t.Fatal("finished recovery generation remained published")
+	if _, err := st.CredentialOperationReceipt(operation.Token); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("abandoned prepared lane left a receipt: %v", err)
 	}
 }
 
@@ -379,11 +317,7 @@ func TestCredentialRemovalRecoversOwnerDeathAfterDelete(t *testing.T) {
 	recovery.ClaimCredentialMutation = func(int) (func(), error) {
 		return func() {}, nil
 	}
-	retirement, verifier := credentialRetirementReceipt(
-		t, operation.Owner, recovery.workers.owner.Generation,
-	)
-	recovery.workers.reaper = verifier
-	if err := recovery.recoverCredentialOperation(t.Context(), operation, retirement); err != nil {
+	if err := recovery.recoverCredentialOperation(t.Context(), operation); err != nil {
 		t.Fatalf("recover exact delete: %v", err)
 	}
 	terminal, err := st.CredentialOperationReceipt(operation.Token)
@@ -450,7 +384,7 @@ func TestCredentialOperationLiveOwnerReopenOnlyJoins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if current.State != store.CredentialOperationApplying || current.Owner != owner.workers.owner {
+	if current.State != store.CredentialOperationApplying || !bytes.Equal(current.Owner, owner.owner) {
 		t.Fatalf("live operation mutated = %+v", current)
 	}
 	if _, err := st.CredentialOperationReceipt(operation.Token); !errors.Is(err, sql.ErrNoRows) {
@@ -458,7 +392,7 @@ func TestCredentialOperationLiveOwnerReopenOnlyJoins(t *testing.T) {
 	}
 }
 
-func TestCredentialOperationExpiredLiveOwnerIsNeverTakenOverWithoutReceipt(t *testing.T) {
+func TestCredentialOperationExpiredLiveOwnerLaneIsNeverClaimedByJoiners(t *testing.T) {
 	st := openTestStore(t)
 	account := persistTestAccount(t, st, store.Account{
 		ID: 1, ConfigDir: t.TempDir(), KeychainService: "service-stale-owner", KeychainAccount: "account-stale-owner",
@@ -506,7 +440,7 @@ func TestCredentialOperationExpiredLiveOwnerIsNeverTakenOverWithoutReceipt(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if current.OwnerEpoch != operation.OwnerEpoch || !reflect.DeepEqual(current.Owner, owner.workers.owner) {
+	if current.OwnerEpoch != operation.OwnerEpoch || !bytes.Equal(current.Owner, owner.owner) {
 		t.Fatalf("expired live-owner lane changed = %+v", current)
 	}
 	if _, err := st.CredentialOperationReceipt(operation.Token); !errors.Is(err, sql.ErrNoRows) {
@@ -514,13 +448,13 @@ func TestCredentialOperationExpiredLiveOwnerIsNeverTakenOverWithoutReceipt(t *te
 	}
 }
 
-func TestCredentialOperationMismatchedRetirementReceiptCannotTakeOver(t *testing.T) {
+func TestCredentialOperationStaleFenceClaimCannotTakeOver(t *testing.T) {
 	st := openTestStore(t)
 	account := persistTestAccount(t, st, store.Account{
-		ID: 1, ConfigDir: t.TempDir(), KeychainService: "service-mismatched-receipt", KeychainAccount: "account-mismatched-receipt",
+		ID: 1, ConfigDir: t.TempDir(), KeychainService: "service-stale-fence", KeychainAccount: "account-stale-fence",
 	})
-	owner := credentialRecoveryManager(t, st, credstest.NewFake(), "receipt-owner")
-	recovery := credentialRecoveryManager(t, st, owner.Creds, "receipt-recovery")
+	owner := credentialRecoveryManager(t, st, credstest.NewFake(), "stale-fence-owner")
+	recovery := credentialRecoveryManager(t, st, owner.Creds, "stale-fence-recovery")
 	before, err := owner.credentialObservation(t.Context(), account)
 	if err != nil {
 		t.Fatal(err)
@@ -532,34 +466,36 @@ func TestCredentialOperationMismatchedRetirementReceiptCannotTakeOver(t *testing
 		account,
 		kind,
 		store.CredentialTargetKeychain,
-		credentialIntentDigest(kind, "mismatched-receipt"),
+		credentialIntentDigest(kind, "stale-fence"),
 		before,
 	)
-	wrongOwner := operation.Owner
-	wrongOwner.Generation = poolTestGeneration("mismatched-receipt-other")
-	receipt, verifier := credentialRetirementReceipt(
-		t, wrongOwner, recovery.workers.owner.Generation,
-	)
-	recovery.workers.reaper = verifier
-	if err := recovery.recoverCredentialOperation(t.Context(), operation, receipt); !errors.Is(err, store.ErrCredentialOperationOwner) {
-		t.Fatalf("mismatched retirement receipt = %v, want owner rejection", err)
+	interloper, err := store.MintOwnerRecord(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := st.TakeoverCredentialOperation(operation.Fence(), interloper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recovery.recoverCredentialOperation(t.Context(), operation); !errors.Is(err, store.ErrCredentialOperationOwner) {
+		t.Fatalf("stale-fence claim = %v, want owner rejection", err)
 	}
 	current, err := st.CredentialOperationByToken(operation.Token)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if current.OwnerEpoch != operation.OwnerEpoch || !reflect.DeepEqual(current.Owner, operation.Owner) {
-		t.Fatalf("mismatched receipt mutated lane = %+v", current)
+	if current.OwnerEpoch != claimed.OwnerEpoch || !bytes.Equal(current.Owner, interloper) {
+		t.Fatalf("stale-fence claim mutated lane = %+v", current)
 	}
 }
 
-func TestCredentialOperationRetirementReceiptTakesOverImmediately(t *testing.T) {
+func TestCredentialOperationClaimTakesOverImmediately(t *testing.T) {
 	st := openTestStore(t)
 	account := persistTestAccount(t, st, store.Account{
-		ID: 1, ConfigDir: t.TempDir(), KeychainService: "service-immediate-receipt", KeychainAccount: "account-immediate-receipt",
+		ID: 1, ConfigDir: t.TempDir(), KeychainService: "service-immediate-claim", KeychainAccount: "account-immediate-claim",
 	})
-	owner := credentialRecoveryManager(t, st, credstest.NewFake(), "immediate-receipt-owner")
-	recovery := credentialRecoveryManager(t, st, owner.Creds, "immediate-receipt-recovery")
+	owner := credentialRecoveryManager(t, st, credstest.NewFake(), "immediate-claim-owner")
+	recovery := credentialRecoveryManager(t, st, owner.Creds, "immediate-claim-recovery")
 	before, err := owner.credentialObservation(t.Context(), account)
 	if err != nil {
 		t.Fatal(err)
@@ -571,7 +507,7 @@ func TestCredentialOperationRetirementReceiptTakesOverImmediately(t *testing.T) 
 		account,
 		kind,
 		store.CredentialTargetKeychain,
-		credentialIntentDigest(kind, "immediate-receipt"),
+		credentialIntentDigest(kind, "immediate-claim"),
 		before,
 	)
 	operation, err = st.MarkCredentialOperationApplying(
@@ -590,15 +526,11 @@ func TestCredentialOperationRetirementReceiptTakesOverImmediately(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if unchanged.Owner != operation.Owner || unchanged.OwnerEpoch != operation.OwnerEpoch {
-		t.Fatalf("foreign owner changed lane without receipt = %+v", unchanged)
+	if !bytes.Equal(unchanged.Owner, operation.Owner) || unchanged.OwnerEpoch != operation.OwnerEpoch {
+		t.Fatalf("foreign owner changed lane without a claim = %+v", unchanged)
 	}
-	receipt, verifier := credentialRetirementReceipt(
-		t, operation.Owner, recovery.workers.owner.Generation,
-	)
-	recovery.workers.reaper = verifier
-	if err := recovery.recoverCredentialOperation(t.Context(), operation, receipt); err != nil {
-		t.Fatalf("immediate receipt recovery: %v", err)
+	if err := recovery.recoverCredentialOperation(t.Context(), operation); err != nil {
+		t.Fatalf("immediate claim recovery: %v", err)
 	}
 	terminal, err := st.CredentialOperationReceipt(operation.Token)
 	if err != nil {
@@ -607,11 +539,11 @@ func TestCredentialOperationRetirementReceiptTakesOverImmediately(t *testing.T) 
 	if terminal.TerminalStatus != store.CredentialTerminalQuarantined ||
 		terminal.Result != store.CredentialResultAmbiguous ||
 		terminal.OwnerEpoch != operation.OwnerEpoch+1 {
-		t.Fatalf("immediate receipt recovery = %+v", terminal)
+		t.Fatalf("immediate claim recovery = %+v", terminal)
 	}
 }
 
-func TestRetirementReceiptWaitsForCredentialAndAccountMutationLanes(t *testing.T) {
+func TestClaimForeignLanesAndMutationPageClearEveryForeignClass(t *testing.T) {
 	st := openTestStore(t)
 	credentialAccount := persistTestAccount(t, st, store.Account{
 		ID: 1, ConfigDir: t.TempDir(), KeychainService: "service-shared-receipt-credential", KeychainAccount: "account-shared-receipt-credential",
@@ -659,56 +591,53 @@ func TestRetirementReceiptWaitsForCredentialAndAccountMutationLanes(t *testing.T
 		LocatorDigest: mutationLocator, ExpectedCredentialDigest: mutationExpected,
 		IntentDigest: mutationIntent, ConfigDir: mutationAccount.ConfigDir,
 		KeychainService: mutationAccount.KeychainService, KeychainAccount: mutationAccount.KeychainAccount,
-		Owner: owner.workers.owner,
+		Owner: owner.owner,
 	})
 	if err != nil || mutationBegin.Active == nil {
 		t.Fatalf("begin account mutation = %+v err=%v", mutationBegin, err)
 	}
-	receipt, verifier := credentialRetirementReceipt(
-		t, owner.workers.owner, recovery.workers.owner.Generation,
-	)
-	recovery.workers.reaper = verifier
-	remaining, err := recovery.recoverCredentialOwnerPage(t.Context())
-	if err != nil {
+	if err := recovery.ClaimForeignLanes(t.Context()); err != nil {
 		t.Fatal(err)
-	}
-	if !remaining {
-		t.Fatal("retirement receipt was acknowledged while account mutation remained")
 	}
 	if _, err := st.CredentialOperationByToken(credentialOperation.Token); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("prepared credential lane after recovery = %v", err)
+		t.Fatalf("prepared credential lane after claim = %v", err)
 	}
-	page, err := verifier.ReapReceipts(
-		t.Context(), CredentialOwnerRecoveryID, proc.ReapReceiptCursor{}, 1,
-	)
-	if err != nil || len(page.Receipts) != 1 || page.Receipts[0].Digest != receipt.Digest {
-		t.Fatalf("retained shared receipt = %+v err=%v", page, err)
+	foreignMutations, _, err := st.AccountMutationsNotOwnedBy(recovery.owner, 0, 8)
+	if err != nil || len(foreignMutations) != 1 {
+		t.Fatalf("foreign mutations after credential claim = %+v err=%v", foreignMutations, err)
 	}
-	taken, _, err := recovery.TakeoverRetiredAccountMutationPage(t.Context())
-	if err != nil {
-		t.Fatal(err)
+	taken, more, err := recovery.TakeoverRetiredAccountMutationPage(t.Context())
+	if err != nil || more {
+		t.Fatalf("mutation takeover page more=%v err=%v", more, err)
 	}
 	if len(taken) != 1 || taken[0].OperationID != mutationID ||
-		taken[0].Owner != recovery.workers.owner ||
+		!bytes.Equal(taken[0].Owner, recovery.owner) ||
 		taken[0].OwnerEpoch != mutationBegin.Active.OwnerEpoch+1 {
 		t.Fatalf("taken account mutation = %+v", taken)
 	}
-	remaining, err = recovery.recoverCredentialOwnerPage(t.Context())
-	if err != nil {
-		t.Fatal(err)
+	redelivered, more, err := recovery.TakeoverRetiredAccountMutationPage(t.Context())
+	if err != nil || more || len(redelivered) != 0 {
+		t.Fatalf("claimed mutation re-delivered = %+v more=%v err=%v", redelivered, more, err)
 	}
-	if remaining {
-		t.Fatal("retirement recovery remained after both old-owner lane classes cleared")
-	}
-	page, err = verifier.ReapReceipts(
-		t.Context(), CredentialOwnerRecoveryID, proc.ReapReceiptCursor{}, 1,
-	)
-	if err != nil || len(page.Receipts) != 0 {
-		t.Fatalf("acknowledged receipt remained = %+v err=%v", page, err)
+	if remaining, _, err := st.CredentialOperationsNotOwnedBy(recovery.owner, 0, 8); err != nil ||
+		len(remaining) != 0 {
+		t.Fatalf("foreign credential lanes remained = %+v err=%v", remaining, err)
 	}
 }
 
-func TestCredentialOwnerReceiptsRecoverEveryLaneBeforeExactPrefixAck(t *testing.T) {
+// The golden is one literal v0.20.9 owner_record: a proc.Record encoded by
+// daemonkit@v0.20.9's Record.MarshalJSON from the module cache, Validate- and
+// round-trip-verified under that exact codec before capture.
+const poolUpgradeGoldenOwner = `{"recovery_id":"com.yasyf.cc-pool.credential-owner.v1","pid":4242,"start_time":"1722700000.123456","boot":"9f2a6c1e-5b4d-4e3a-8890-abcdef012345","comm":"cc-pool","executable":"/opt/homebrew/Cellar/cc-pool/0.20.9/bin/cc-pool","audit_token":[245,1,0,0,245,1,0,0,245,1,0,0,20,0,0,0,245,1,0,0,146,16,0,0,109,135,1,0,105,122,0,0],"generation":"5aa1b2c3d4e5f60718293a4b5c6d7e8f","process_group":false,"session_id":0,"role":"","operation_id":"","stop_session":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"preparation_nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"runtime_protocol":0,"target_process_generation":null,"stop_authority_state":"","expires_unix_milli":0}`
+
+// TestClaimForeignLanesAdoptsVZeroTwentyNineRows is §B's pool-level arm: rows
+// whose owner_record bytes are a literal v0.20.9 proc.Record are claimed by a
+// v2 successor exactly as any dead generation's rows, with the pending-add
+// retirement proof hook and account-mutation transfer intact.
+// TODO(dk-v021 integration): add the daemon-boot arm once Lane D's spec exists —
+// the cross-era gate (RemoveUnmarked + legacy lock) plus Serve → Start →
+// ClaimForeignLanes against a live v0.20.9 incumbent.
+func TestClaimForeignLanesAdoptsVZeroTwentyNineRows(t *testing.T) {
 	st := openTestStore(t)
 	credentialAccount := persistTestAccount(t, st, store.Account{
 		ID: 1, ConfigDir: t.TempDir(), KeychainService: "service-source-credential", KeychainAccount: "account-source-credential",
@@ -716,9 +645,10 @@ func TestCredentialOwnerReceiptsRecoverEveryLaneBeforeExactPrefixAck(t *testing.
 	mutationAccount := persistTestAccount(t, st, store.Account{
 		ID: 2, ConfigDir: t.TempDir(), KeychainService: "service-source-mutation", KeychainAccount: "account-source-mutation",
 	})
-	old := credentialRecoveryManager(t, st, credstest.NewFake(), "source-receipt-owner")
-	old.workers.owner = syntheticCredentialOwner(t, 1)
-	recovery := credentialRecoveryManager(t, st, old.Creds, "source-receipt-recovery")
+	golden := store.OwnerRecord(poolUpgradeGoldenOwner)
+	old := credentialRecoveryManager(t, st, credstest.NewFake(), "source-golden-owner")
+	old.owner = golden
+	recovery := credentialRecoveryManager(t, st, old.Creds, "source-golden-recovery")
 	installTestBackingRunner(recovery)
 
 	credentialBefore, err := old.credentialObservation(t.Context(), credentialAccount)
@@ -731,14 +661,17 @@ func TestCredentialOwnerReceiptsRecoverEveryLaneBeforeExactPrefixAck(t *testing.
 		credentialAccount,
 		store.CredentialOperationAdoptRotated,
 		store.CredentialTargetKeychain,
-		credentialIntentDigest(store.CredentialOperationAdoptRotated, "source-receipt"),
+		credentialIntentDigest(store.CredentialOperationAdoptRotated, "source-golden"),
 		credentialBefore,
 	)
 	credentialOperation, err = st.MarkCredentialOperationApplying(credentialOperation.Fence(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pending, err := st.ReserveAccountIndex(old.workers.owner)
+	if !bytes.Equal(credentialOperation.Owner, golden) {
+		t.Fatalf("seeded lane owner = %q, want golden v0.20.9 bytes", credentialOperation.Owner)
+	}
+	pending, err := st.ReserveAccountIndex(golden)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -788,7 +721,7 @@ func TestCredentialOwnerReceiptsRecoverEveryLaneBeforeExactPrefixAck(t *testing.
 	mutationLocator := store.CredentialKeychainLocatorDigest(
 		mutationAccount.KeychainService, mutationAccount.KeychainAccount,
 	)
-	mutationIntent := credentialIntentDigest(store.CredentialOperationAdoptRotated, "source-account-mutation")
+	mutationIntent := credentialIntentDigest(store.CredentialOperationAdoptRotated, "source-golden-mutation")
 	mutationID, err := store.NewAccountMutationID(
 		mutationAccount.ID, mutationAccount.InstanceID, mutationAccount.Generation,
 		store.AccountMutationRelogin, mutationLocator, mutationExpected, mutationIntent,
@@ -802,68 +735,45 @@ func TestCredentialOwnerReceiptsRecoverEveryLaneBeforeExactPrefixAck(t *testing.
 		LocatorDigest: mutationLocator, ExpectedCredentialDigest: mutationExpected,
 		IntentDigest: mutationIntent, ConfigDir: mutationAccount.ConfigDir,
 		KeychainService: mutationAccount.KeychainService, KeychainAccount: mutationAccount.KeychainAccount,
-		Owner: old.workers.owner,
+		Owner: golden,
 	})
 	if err != nil || mutationBegin.Active == nil {
 		t.Fatalf("begin account mutation = %+v err=%v", mutationBegin, err)
 	}
 
-	reaperGeneration := recovery.workers.owner.Generation
-	receiptPath := filepath.Join(t.TempDir(), "credential-owner-recovery.db")
-	receiptStore := &proc.FileStore{Path: receiptPath, MaxOutstanding: 2}
-	firstReceipt := commitCredentialRetirementReceipt(t, receiptStore, old.workers.owner, reaperGeneration)
-	settledOwner := syntheticCredentialOwner(t, 2)
-	secondReceipt := commitCredentialRetirementReceipt(t, receiptStore, settledOwner, reaperGeneration)
-	reopened := &proc.FileStore{Path: receiptPath, MaxOutstanding: 2}
-	recovery.workers.reaper = &proc.Reaper{Store: reopened, Generation: reaperGeneration}
-	blockedOwner := syntheticCredentialOwner(t, 3)
-	if err := reopened.Add(t.Context(), blockedOwner); !errors.Is(err, proc.ErrReceiptBacklog) {
-		t.Fatalf("unacknowledged credential-owner receipts did not retain admission backpressure: %v", err)
-	}
-
-	remaining, err := recovery.recoverCredentialOwnerPage(t.Context())
-	if err != nil {
+	if err := recovery.ClaimForeignLanes(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if !remaining {
-		t.Fatal("credential-owner receipt was acknowledged while its account mutation remained")
-	}
 	if _, err := st.CredentialOperationByToken(credentialOperation.Token); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("credential-owner lane after recovery = %v", err)
+		t.Fatalf("golden-owned lane after claim = %v", err)
 	}
 	credentialReceipt, err := st.CredentialOperationReceipt(credentialOperation.Token)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if credentialReceipt.TerminalStatus != store.CredentialTerminalQuarantined ||
-		credentialReceipt.Result != store.CredentialResultAmbiguous {
-		t.Fatalf("credential-owner receipt = %+v", credentialReceipt)
+		credentialReceipt.Result != store.CredentialResultAmbiguous ||
+		credentialReceipt.OwnerEpoch != credentialOperation.OwnerEpoch+1 ||
+		!bytes.Equal(credentialReceipt.Owner, recovery.owner) {
+		t.Fatalf("claimed golden lane receipt = %+v", credentialReceipt)
 	}
-	pendingRows, _, err := st.PendingAddReservationsOwnedBy(old.workers.owner, 0, 1)
+	pendingRows, _, err := st.PendingAddReservationsOwnedBy(golden, 0, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(pendingRows) != 0 {
-		t.Fatalf("credential-owner pending add survived recovery = %+v", pendingRows)
+		t.Fatalf("golden-owned pending add survived the claim = %+v", pendingRows)
 	}
 	// #nosec G304 -- pendingMarker is created beneath this test's private temporary root.
 	if got, err := os.ReadFile(pendingMarker); err != nil || string(got) != "public" {
-		t.Fatalf("pending public target after recovery = %q err=%v", got, err)
+		t.Fatalf("pending public target after claim = %q err=%v", got, err)
 	}
-	reused, err := st.ReserveAccountIndex(recovery.workers.owner)
+	reused, err := st.ReserveAccountIndex(recovery.owner)
 	if err != nil || reused.ID != pending.ID {
 		t.Fatalf("reservation after proven retirement = %+v err=%v", reused, err)
 	}
 	if err := st.ReleaseAccountIndex(reused); err != nil {
 		t.Fatal(err)
-	}
-	page, err := recovery.workers.reaper.ReapReceipts(
-		t.Context(), CredentialOwnerRecoveryID, proc.ReapReceiptCursor{}, 3,
-	)
-	if err != nil || len(page.Receipts) != 2 ||
-		page.Receipts[0].Digest != firstReceipt.Digest ||
-		page.Receipts[1].Digest != secondReceipt.Digest {
-		t.Fatalf("credential-owner receipt prefix after blocked recovery = %+v err=%v", page, err)
 	}
 
 	taken, _, err := recovery.TakeoverRetiredAccountMutationPage(t.Context())
@@ -871,44 +781,32 @@ func TestCredentialOwnerReceiptsRecoverEveryLaneBeforeExactPrefixAck(t *testing.
 		t.Fatal(err)
 	}
 	if len(taken) != 1 || taken[0].OperationID != mutationID ||
-		taken[0].Owner != recovery.workers.owner ||
+		!bytes.Equal(taken[0].Owner, recovery.owner) ||
 		taken[0].OwnerEpoch != mutationBegin.Active.OwnerEpoch+1 {
-		t.Fatalf("credential-owner account mutation takeover = %+v", taken)
+		t.Fatalf("golden account mutation takeover = %+v", taken)
 	}
-	remaining, err = recovery.recoverCredentialOwnerPage(t.Context())
-	if err != nil {
-		t.Fatal(err)
+	if remaining, _, err := st.CredentialOperationsNotOwnedBy(recovery.owner, 0, 8); err != nil ||
+		len(remaining) != 0 {
+		t.Fatalf("foreign credential lanes remained = %+v err=%v", remaining, err)
 	}
-	if remaining {
-		t.Fatal("credential-owner recovery remained after every old-owner liability cleared")
+	if remaining, _, err := st.AccountMutationsNotOwnedBy(recovery.owner, 0, 8); err != nil ||
+		len(remaining) != 0 {
+		t.Fatalf("foreign account mutations remained = %+v err=%v", remaining, err)
 	}
-	page, err = recovery.workers.reaper.ReapReceipts(
-		t.Context(), CredentialOwnerRecoveryID, proc.ReapReceiptCursor{}, 1,
-	)
-	if err != nil || len(page.Receipts) != 0 {
-		t.Fatalf("acknowledged credential-owner receipts remained = %+v err=%v", page, err)
-	}
-	floor, err := reopened.ReapReceiptFloor(t.Context(), CredentialOwnerRecoveryID)
-	if err != nil || floor.Sequence != secondReceipt.Sequence {
-		t.Fatalf("credential-owner receipt floor = %+v err=%v, want sequence %d", floor, err, secondReceipt.Sequence)
-	}
-	if err := reopened.Add(t.Context(), blockedOwner); err != nil {
-		t.Fatalf("credential-owner receipt acknowledgement did not reopen admission: %v", err)
+	if remaining, _, err := st.PendingAddReservationsNotOwnedBy(recovery.owner, 0, 8); err != nil ||
+		len(remaining) != 0 {
+		t.Fatalf("foreign pending adds remained = %+v err=%v", remaining, err)
 	}
 }
 
-func TestCredentialOwnerRecoveryRetainsPendingAddWhenRetirementIsAmbiguous(t *testing.T) {
+func TestClaimForeignLanesRetainsPendingAddWhenRetirementIsAmbiguous(t *testing.T) {
 	st := openTestStore(t)
 	old := credentialRecoveryManager(t, st, credstest.NewFake(), "pending-retirement-old")
 	recovery := credentialRecoveryManager(t, st, old.Creds, "pending-retirement-new")
-	reservation, err := st.ReserveAccountIndex(old.workers.owner)
+	reservation, err := st.ReserveAccountIndex(old.owner)
 	if err != nil {
 		t.Fatal(err)
 	}
-	receipt, verifier := credentialRetirementReceipt(
-		t, old.workers.owner, recovery.workers.owner.Generation,
-	)
-	recovery.workers.reaper = verifier
 	retirementErr := errors.New("tenant retirement unavailable")
 	recovery.RetirePendingAdd = func(
 		context.Context,
@@ -916,25 +814,20 @@ func TestCredentialOwnerRecoveryRetainsPendingAddWhenRetirementIsAmbiguous(t *te
 	) (PendingAddRetirementProof, error) {
 		return PendingAddRetirementProof{}, retirementErr
 	}
-	remaining, _, err := recovery.recoverCredentialOwnerClass(
-		t.Context(), []proc.ReapReceipt{receipt},
-	)
-	if err != nil || !remaining {
-		t.Fatalf("ambiguous recovery = remaining %v err=%v", remaining, err)
+	if err := recovery.ClaimForeignLanes(t.Context()); err != nil {
+		t.Fatalf("ambiguous retirement failed the claim pass: %v", err)
 	}
-	pending, _, err := st.PendingAddReservationsOwnedBy(old.workers.owner, 0, 1)
+	pending, _, err := st.PendingAddReservationsOwnedBy(old.owner, 0, 1)
 	if err != nil || len(pending) != 1 || pending[0].ID != reservation.ID {
 		t.Fatalf("retained reservation = %+v err=%v", pending, err)
 	}
-	next, err := st.ReserveAccountIndex(recovery.workers.owner)
+	next, err := st.ReserveAccountIndex(recovery.owner)
 	if err != nil || next.ID == reservation.ID {
 		t.Fatalf("reservation reused after ambiguous retirement = %+v err=%v", next, err)
 	}
-	page, err := verifier.ReapReceipts(
-		t.Context(), CredentialOwnerRecoveryID, proc.ReapReceiptCursor{}, 1,
-	)
-	if err != nil || len(page.Receipts) != 1 || page.Receipts[0].Digest != receipt.Digest {
-		t.Fatalf("retained retirement receipt = %+v err=%v", page, err)
+	represented, _, err := st.PendingAddReservationsNotOwnedBy(recovery.owner, 0, 8)
+	if err != nil || len(represented) != 1 || represented[0].ID != reservation.ID {
+		t.Fatalf("deferred reservation not re-presented = %+v err=%v", represented, err)
 	}
 }
 
@@ -1426,7 +1319,7 @@ func TestExpiredAddCompensationRecoversFromAccountMutationSubject(t *testing.T) 
 	st := openTestStore(t)
 	credentials := credstest.NewFake()
 	manager := credentialRecoveryManager(t, st, credentials, "pending-compensation-owner")
-	reservation, err := st.ReserveAccountIndex(manager.workers.owner)
+	reservation, err := st.ReserveAccountIndex(manager.owner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1470,7 +1363,7 @@ func TestExpiredAddCompensationRecoversFromAccountMutationSubject(t *testing.T) 
 	begin, err := st.BeginAccountMutation(t.Context(), store.BeginAccountMutationRequest{
 		OperationID: accountOperationID, AccountID: account.ID, Kind: store.AccountMutationAdd,
 		AccountInstanceID: account.InstanceID, AccountGeneration: account.Generation,
-		IntentDigest: accountIntent, Owner: manager.workers.owner,
+		IntentDigest: accountIntent, Owner: manager.owner,
 	})
 	if err != nil || begin.Active == nil {
 		t.Fatalf("begin pending Add = %+v err=%v", begin, err)
@@ -1753,8 +1646,7 @@ func credentialRecoveryManager(
 ) *Manager {
 	t.Helper()
 	manager := &Manager{Store: st, Creds: credentials}
-	owner := bindTestWorkerAuthority(t, manager, "credential-recovery-"+generation)
-	manager.workers = &workerRuntime{owner: owner}
+	bindTestWorkerAuthority(t, manager, "credential-recovery-"+generation)
 	return manager
 }
 
@@ -1810,7 +1702,7 @@ func beginCredentialOperation(
 		KeychainService:   account.KeychainService,
 		KeychainAccount:   account.KeychainAccount,
 		LocatorDigest:     locator,
-		Owner:             manager.workers.owner,
+		Owner:             manager.owner,
 		Kind:              kind,
 		Target:            target,
 		IntentDigest:      intent,
@@ -1831,63 +1723,7 @@ func recoverExpiredCredentialOperation(
 	recovery := credentialRecoveryManager(
 		t, owner.Store, owner.Creds, "retired-"+operation.Token[:8],
 	)
-	receipt, verifier := credentialRetirementReceipt(
-		t, operation.Owner, recovery.workers.owner.Generation,
-	)
-	recovery.workers.reaper = verifier
-	return recovery.recoverCredentialOperation(t.Context(), operation, receipt)
-}
-
-func credentialRetirementReceipt(
-	t *testing.T,
-	owner proc.Record,
-	reaperGeneration proc.OwnerGeneration,
-) (proc.ReapReceipt, *proc.Reaper) {
-	t.Helper()
-	receiptStore := &proc.FileStore{Path: filepath.Join(t.TempDir(), "recovery.db")}
-	receipt := commitCredentialRetirementReceipt(t, receiptStore, owner, reaperGeneration)
-	return receipt, &proc.Reaper{Store: receiptStore, Generation: reaperGeneration}
-}
-
-func commitCredentialRetirementReceipt(
-	t *testing.T,
-	receiptStore *proc.FileStore,
-	owner proc.Record,
-	reaperGeneration proc.OwnerGeneration,
-) proc.ReapReceipt {
-	t.Helper()
-	if err := receiptStore.Add(t.Context(), owner); err != nil {
-		t.Fatal(err)
-	}
-	if err := receiptStore.BeginReap(t.Context(), owner, reaperGeneration); err != nil {
-		t.Fatal(err)
-	}
-	receipt, err := receiptStore.CommitReap(
-		t.Context(), owner, reaperGeneration, proc.ReapAbsent,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return receipt
-}
-
-func syntheticCredentialOwner(t *testing.T, sequence int) proc.Record {
-	t.Helper()
-	pid := 41000 + sequence
-	owner := proc.Record{
-		RecoveryID:   CredentialOwnerRecoveryID,
-		PID:          pid,
-		StartTime:    fmt.Sprintf("credential-owner-%d", sequence),
-		Boot:         "credential-owner-test-boot",
-		Comm:         "credential-owner-test",
-		Generation:   poolTestGeneration(fmt.Sprintf("credential-owner-generation-%d", sequence)),
-		ProcessGroup: true,
-		SessionID:    pid,
-	}
-	if err := owner.Validate(); err != nil {
-		t.Fatal(err)
-	}
-	return owner
+	return recovery.recoverCredentialOperation(t.Context(), operation)
 }
 
 type countingRecoveryRefresher struct{ refreshes atomic.Int32 }

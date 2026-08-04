@@ -229,7 +229,7 @@ func TestBeginAccountRemovalOnlyAllowsSettledMatchingPendingAdd(t *testing.T) {
 		}
 		if _, err := s.db.Exec(
 			`UPDATE pending_adds SET owner_record=? WHERE id=?`,
-			mustEncodeCredentialOwner(credentialOperationTestOwner("foreign-owner")), reservation.ID,
+			[]byte(credentialOperationTestOwner("foreign-owner")), reservation.ID,
 		); err != nil {
 			t.Fatal(err)
 		}

@@ -197,12 +197,16 @@ func TestCredentialLockNeverDeletesUnmarkedAmbiguousTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 	worker := mintCredentialLockOwner(t)
+	workerRaw, err := credentialLockWorkerValue(worker)
+	if err != nil {
+		t.Fatal(err)
+	}
 	nonce, err := newCredentialLockNonce()
 	if err != nil {
 		t.Fatal(err)
 	}
 	journal := credentialLockJournal{
-		Schema: credentialLockJournalSchema, AccountID: 1, Nonce: nonce, Worker: worker,
+		Schema: credentialLockJournalSchema, AccountID: 1, Nonce: nonce, Worker: workerRaw,
 		Targets: []credentialLockTarget{
 			{
 				Path: paths[0], Stage: credentialLockStagePath(paths[0], nonce, 0),

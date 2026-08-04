@@ -1,14 +1,13 @@
 package store
 
 import (
+	"bytes"
 	"database/sql"
 	"errors"
 	"reflect"
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/yasyf/daemonkit/proc"
 )
 
 func TestAccountMutationIDDomainIsHardReset(t *testing.T) {
@@ -795,7 +794,7 @@ func TestQuarantinedAddSurvivesAckRestartAndResolvesExactly(t *testing.T) {
 	}
 }
 
-func TestAccountMutationTakeoverRequiresExactReapReceipt(t *testing.T) {
+func TestAccountMutationTakeoverFencesExactOwnerEpoch(t *testing.T) {
 	s := openTest(t)
 	now := time.Unix(1_900_000_000, 0)
 	s.now = func() time.Time { return now }
@@ -809,17 +808,17 @@ func TestAccountMutationTakeoverRequiresExactReapReceipt(t *testing.T) {
 		t.Fatal(err)
 	}
 	newOwner := credentialOperationTestOwner("registry-recovery")
+	wrongFence := begin.Active.Fence()
+	wrongFence.Owner = newOwner
 	if _, err := s.TakeoverAccountMutation(
-		t.Context(), begin.Active.Fence(), newOwner, procZeroReceipt(), nil,
+		t.Context(), wrongFence, newOwner,
 	); !errors.Is(err, ErrAccountMutationFence) {
-		t.Fatalf("takeover without proof = %v", err)
+		t.Fatalf("takeover without the row's exact owner bytes = %v", err)
 	}
-	receipt, verifier := credentialOperationTestRetirement(t, owner, newOwner)
-	taken, err := s.TakeoverAccountMutation(
-		t.Context(), begin.Active.Fence(), newOwner, receipt, verifier,
-	)
-	if err != nil || taken.OwnerEpoch != begin.Active.OwnerEpoch+1 {
-		t.Fatalf("immediate verified takeover = %+v err=%v", taken, err)
+	taken, err := s.TakeoverAccountMutation(t.Context(), begin.Active.Fence(), newOwner)
+	if err != nil || taken.OwnerEpoch != begin.Active.OwnerEpoch+1 ||
+		!bytes.Equal(taken.Owner, newOwner) {
+		t.Fatalf("immediate takeover = %+v err=%v", taken, err)
 	}
 	if _, err := s.MarkAccountMutationApplying(begin.Active.Fence()); !errors.Is(err, ErrAccountMutationFence) {
 		t.Fatalf("stale owner transition = %v", err)
@@ -839,12 +838,17 @@ func TestAccountMutationAgeAloneCannotTakeover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	stale := begin.Active.Fence()
+	if _, err := s.TakeoverAccountMutation(
+		t.Context(), stale, credentialOperationTestOwner("registry-new-owner"),
+	); err != nil {
+		t.Fatal(err)
+	}
 	now = now.Add(time.Minute)
 	if _, err := s.TakeoverAccountMutation(
-		t.Context(), begin.Active.Fence(), credentialOperationTestOwner("registry-new-owner"),
-		procZeroReceipt(), nil,
+		t.Context(), stale, credentialOperationTestOwner("registry-late-owner"),
 	); !errors.Is(err, ErrAccountMutationFence) {
-		t.Fatalf("expired lane takeover without proof = %v", err)
+		t.Fatalf("aged stale-fence takeover = %v", err)
 	}
 }
 
@@ -931,7 +935,7 @@ func existingAccountMutationTestRequest(
 	t *testing.T,
 	account Account,
 	kind AccountMutationKind,
-	owner proc.Record,
+	owner OwnerRecord,
 ) BeginAccountMutationRequest {
 	t.Helper()
 	request := BeginAccountMutationRequest{
@@ -954,5 +958,3 @@ func existingAccountMutationTestRequest(
 	request.OperationID = operationID
 	return request
 }
-
-func procZeroReceipt() proc.ReapReceipt { return proc.ReapReceipt{} }

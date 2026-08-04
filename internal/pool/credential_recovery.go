@@ -2,166 +2,89 @@ package pool
 
 import (
 	"context"
-	"errors"
 	"log"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/daemonkit/proc"
 )
 
 const (
-	credentialRecoveryReceiptPage = 16
-	credentialRecoveryLanePage    = 64
-	accountRecoveryReceiptPage    = 16
-	pendingAddRecoveryTimeout     = 30 * time.Second
+	credentialRecoveryLanePage = 64
+	pendingAddRecoveryTimeout  = 30 * time.Second
 )
 
-var credentialRecoveryIDs = [...]proc.RecoveryID{
-	CredentialOwnerRecoveryID,
-}
-
-// RecoverRetiredCredentialOwners performs one receipt-fenced bounded recovery
-// pass and drains only while each subsequent page makes durable progress.
-func (m *Manager) RecoverRetiredCredentialOwners(ctx context.Context) error {
-	recoveryCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	stopCallerCancellation := context.AfterFunc(ctx, cancel)
-	done := make(chan struct{})
-	priorDone := m.publishCredentialOwnerRecovery(cancel, done)
-	if priorDone != nil {
-		<-priorDone
-	}
-	if err := recoveryCtx.Err(); err != nil {
-		stopCallerCancellation()
-		cancel()
-		m.finishCredentialOwnerRecovery(done)
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return nil
-	}
-	if m.workers == nil {
-		stopCallerCancellation()
-		cancel()
-		m.finishCredentialOwnerRecovery(done)
-		return nil
-	}
-	remaining, progressed, err := m.recoverCredentialOwnerPass(recoveryCtx)
+// ClaimForeignLanes claims every credential lane and pending-add reservation a
+// prior daemon generation left behind — any era's owner bytes included. The
+// rows themselves are the durable work list: each claim is one per-row epoch
+// CAS echoing the row's stored owner bytes, so a crash mid-claim re-presents
+// the remainder at the next boot. Serve's flock guarantees every foreign owner
+// is dead or fully drained before this runs; it belongs in Start, before the
+// scheduler and before business admission opens. Foreign account mutations are
+// TakeoverRetiredAccountMutationPage's leg, since their state-machine re-entry
+// is daemon-owned.
+func (m *Manager) ClaimForeignLanes(ctx context.Context) error {
+	owner, err := m.MutationOwner()
 	if err != nil {
-		stopCallerCancellation()
-		cancel()
-		m.finishCredentialOwnerRecovery(done)
-		if recoveryCtx.Err() != nil && ctx.Err() == nil {
-			return nil
-		}
 		return err
 	}
-	if !remaining || !progressed {
-		stopCallerCancellation()
-		cancel()
-		m.finishCredentialOwnerRecovery(done)
-		return nil
+	if err := m.claimForeignCredentialOperations(ctx, owner); err != nil {
+		return err
 	}
-	stopCallerCancellation()
-	go m.drainCredentialOwnerRecovery(recoveryCtx, done)
-	return nil
+	return m.claimForeignPendingAdds(ctx, owner)
 }
 
-func (m *Manager) publishCredentialOwnerRecovery(
-	cancel context.CancelFunc,
-	done chan struct{},
-) <-chan struct{} {
-	m.recoveryMu.Lock()
-	defer m.recoveryMu.Unlock()
-	priorDone := m.recoveryDone
-	if m.recoveryCancel != nil {
-		m.recoveryCancel()
-	}
-	m.recoveryCancel = cancel
-	m.recoveryDone = done
-	return priorDone
-}
-
-func (m *Manager) finishCredentialOwnerRecovery(done chan struct{}) {
-	close(done)
-	m.recoveryMu.Lock()
-	defer m.recoveryMu.Unlock()
-	if m.recoveryDone != done {
-		return
-	}
-	m.recoveryCancel = nil
-	m.recoveryDone = nil
-}
-
-func (m *Manager) recoverCredentialOwnerPage(ctx context.Context) (bool, error) {
-	remaining, _, err := m.recoverCredentialOwnerPass(ctx)
-	return remaining, err
-}
-
-func (m *Manager) recoverCredentialOwnerPass(ctx context.Context) (bool, bool, error) {
-	remaining := false
-	progressed := false
-	for _, recoveryID := range credentialRecoveryIDs {
-		page, err := m.workers.reaper.ReapReceipts(
-			ctx,
-			recoveryID,
-			proc.ReapReceiptCursor{},
-			credentialRecoveryReceiptPage,
-		)
-		if err != nil {
-			return remaining, progressed, err
-		}
-		remaining = remaining || page.More
-		if len(page.Receipts) == 0 {
-			continue
-		}
-		classRemaining, classProgressed, err := m.recoverCredentialOwnerClass(
-			ctx, page.Receipts,
-		)
-		remaining = remaining || classRemaining
-		progressed = progressed || classProgressed
-		if err != nil {
-			return remaining, progressed, err
-		}
-	}
-	return remaining, progressed, nil
-}
-
-func (m *Manager) recoverCredentialOwnerClass(
+func (m *Manager) claimForeignCredentialOperations(
 	ctx context.Context,
-	receipts []proc.ReapReceipt,
-) (bool, bool, error) {
-	remaining := false
-	progressed := false
-	ackBlocked := false
-	for _, receipt := range receipts {
-		if err := m.workers.reaper.VerifyReapReceipt(ctx, receipt); err != nil {
-			return true, progressed, err
+	owner store.OwnerRecord,
+) error {
+	afterAccountID := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		operations, operationMore, err := m.Store.CredentialOperationsOwnedBy(
-			receipt.Record, 0, credentialRecoveryLanePage,
+		operations, more, err := m.Store.CredentialOperationsNotOwnedBy(
+			owner, afterAccountID, credentialRecoveryLanePage,
 		)
 		if err != nil {
-			return true, progressed, err
+			return err
 		}
-		remaining = remaining || operationMore
 		for _, operation := range operations {
-			if err := m.recoverCredentialOperation(ctx, operation, receipt); err != nil {
-				log.Printf("credential recovery deferred: account=%d token=%s: %v", operation.AccountID, operation.Token, err)
-				continue
+			if err := m.recoverCredentialOperation(ctx, operation); err != nil {
+				log.Printf(
+					"credential recovery deferred: account=%d token=%s: %v",
+					operation.AccountID, operation.Token, err,
+				)
 			}
-			progressed = true
+			afterAccountID = operation.AccountID
 		}
-		pending, pendingMore, err := m.Store.PendingAddReservationsOwnedBy(
-			receipt.Record, 0, credentialRecoveryLanePage,
+		if !more {
+			return nil
+		}
+	}
+}
+
+func (m *Manager) claimForeignPendingAdds(
+	ctx context.Context,
+	owner store.OwnerRecord,
+) error {
+	afterAccountID := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		pending, more, err := m.Store.PendingAddReservationsNotOwnedBy(
+			owner, afterAccountID, credentialRecoveryLanePage,
 		)
 		if err != nil {
-			return true, progressed, err
+			return err
 		}
-		remaining = remaining || pendingMore
 		for _, reservation := range pending {
+			afterAccountID = reservation.ID
 			if m.RetirePendingAdd == nil {
-				log.Printf("pending add recovery deferred: account=%d: retirement proof is unavailable", reservation.ID)
+				log.Printf(
+					"pending add recovery deferred: account=%d: retirement proof is unavailable",
+					reservation.ID,
+				)
 				continue
 			}
 			cleanupCtx, cancel := context.WithTimeout(
@@ -174,137 +97,38 @@ func (m *Manager) recoverCredentialOwnerClass(
 			cancel()
 			if err != nil {
 				log.Printf("pending add recovery deferred: account=%d: %v", reservation.ID, err)
-				continue
 			}
-			progressed = true
 		}
-		remainingOperations, _, err := m.Store.CredentialOperationsOwnedBy(receipt.Record, 0, 1)
-		if err != nil {
-			return true, progressed, err
+		if !more {
+			return nil
 		}
-		remainingMutations, _, err := m.Store.AccountMutationsOwnedBy(receipt.Record, 0, 1)
-		if err != nil {
-			return true, progressed, err
-		}
-		remainingPending, _, err := m.Store.PendingAddReservationsOwnedBy(receipt.Record, 0, 1)
-		if err != nil {
-			return true, progressed, err
-		}
-		unsettled := len(remainingOperations) != 0 || len(remainingMutations) != 0 || len(remainingPending) != 0
-		if unsettled || ackBlocked {
-			remaining = true
-			ackBlocked = true
-			continue
-		}
-		if _, err := m.workers.reaper.AcknowledgeReap(ctx, receipt); err != nil {
-			return true, progressed, err
-		}
-		progressed = true
 	}
-	return remaining, progressed, nil
 }
 
-// TakeoverRetiredAccountMutationPage transfers one bounded page only after an
-// exact daemonkit retirement receipt verifies the old owner. The caller owns
-// state-specific account recovery after takeover.
+// TakeoverRetiredAccountMutationPage claims one bounded page of foreign
+// account mutations for daemon-side recovery: each row's stored owner bytes
+// are echoed into the epoch CAS, so a delivered mutation is never re-delivered
+// and a crash mid-page re-presents the remainder as still foreign.
 func (m *Manager) TakeoverRetiredAccountMutationPage(
 	ctx context.Context,
 ) ([]store.AccountMutation, bool, error) {
-	if m.workers == nil || m.workers.reaper == nil {
-		return nil, false, errors.New("account mutation recovery requires daemon worker ownership")
+	owner, err := m.MutationOwner()
+	if err != nil {
+		return nil, false, err
 	}
-	var owner proc.Record
-	ownerReady := false
-	taken := make([]store.AccountMutation, 0, credentialRecoveryLanePage)
-	more := false
-	for _, recoveryID := range credentialRecoveryIDs {
-		page, err := m.workers.reaper.ReapReceipts(
-			ctx,
-			recoveryID,
-			proc.ReapReceiptCursor{},
-			accountRecoveryReceiptPage,
-		)
+	mutations, more, err := m.Store.AccountMutationsNotOwnedBy(
+		owner, 0, credentialRecoveryLanePage,
+	)
+	if err != nil {
+		return nil, more, err
+	}
+	taken := make([]store.AccountMutation, 0, len(mutations))
+	for _, mutation := range mutations {
+		recovered, err := m.Store.TakeoverAccountMutation(ctx, mutation.Fence(), owner)
 		if err != nil {
-			return taken, more, err
+			return taken, true, err
 		}
-		more = more || page.More
-		if len(page.Receipts) != 0 && !ownerReady {
-			owner, err = m.credentialOwnerRecord()
-			if err != nil {
-				return taken, true, err
-			}
-			ownerReady = true
-		}
-		for _, receipt := range page.Receipts {
-			if err := m.workers.reaper.VerifyReapReceipt(ctx, receipt); err != nil {
-				return taken, true, err
-			}
-			remaining := credentialRecoveryLanePage - len(taken)
-			if remaining == 0 {
-				return taken, true, nil
-			}
-			mutations, ownerMore, err := m.Store.AccountMutationsOwnedBy(
-				receipt.Record,
-				0,
-				remaining,
-			)
-			if err != nil {
-				return taken, true, err
-			}
-			more = more || ownerMore
-			for _, mutation := range mutations {
-				recovered, err := m.Store.TakeoverAccountMutation(
-					ctx,
-					mutation.Fence(),
-					owner,
-					receipt,
-					m.workers.reaper,
-				)
-				if err != nil {
-					return taken, true, err
-				}
-				taken = append(taken, recovered)
-			}
-		}
+		taken = append(taken, recovered)
 	}
 	return taken, more, nil
-}
-
-func (m *Manager) drainCredentialOwnerRecovery(ctx context.Context, done chan struct{}) {
-	defer m.finishCredentialOwnerRecovery(done)
-	for {
-		remaining, progressed, err := m.recoverCredentialOwnerPass(ctx)
-		if err == nil && !remaining {
-			return
-		}
-		if err != nil {
-			log.Printf("credential recovery page deferred: %v", err)
-			return
-		}
-		if !progressed {
-			return
-		}
-		if err := ctx.Err(); err != nil {
-			return
-		}
-	}
-}
-
-func (m *Manager) stopCredentialOwnerRecovery() {
-	m.recoveryMu.Lock()
-	cancel := m.recoveryCancel
-	done := m.recoveryDone
-	if cancel != nil {
-		cancel()
-	}
-	m.recoveryMu.Unlock()
-	if done != nil {
-		<-done
-	}
-	m.recoveryMu.Lock()
-	if m.recoveryDone == done {
-		m.recoveryCancel = nil
-		m.recoveryDone = nil
-	}
-	m.recoveryMu.Unlock()
 }

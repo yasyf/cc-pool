@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -13,7 +14,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/daemonkit/proc"
 )
 
 const (
@@ -123,11 +123,11 @@ func (boundary *credentialOperationBoundary) Cross(ctx context.Context) error {
 	if boundary.crossed {
 		return nil
 	}
-	owner, err := boundary.manager.credentialOwnerRecord()
+	owner, err := boundary.manager.MutationOwner()
 	if err != nil {
 		return err
 	}
-	if boundary.operation.Owner != owner {
+	if !bytes.Equal(boundary.operation.Owner, owner) {
 		return store.ErrCredentialOperationOwner
 	}
 	actual, err := boundary.observe(ctx, boundary.account)
@@ -340,7 +340,7 @@ func executeCredentialOperation[T any](
 	fn func(context.Context, *credentialOperationBoundary) (T, error),
 ) (T, error) {
 	var zero T
-	owner, err := manager.credentialOwnerRecord()
+	owner, err := manager.MutationOwner()
 	if err != nil {
 		return zero, err
 	}
@@ -1465,7 +1465,6 @@ func installCredentialOperationCodec(
 func (m *Manager) recoverCredentialOperation(
 	ctx context.Context,
 	operation store.CredentialOperation,
-	retirement proc.ReapReceipt,
 ) error {
 	account, err := m.credentialOperationAccount(operation)
 	if err != nil {
@@ -1482,17 +1481,11 @@ func (m *Manager) recoverCredentialOperation(
 		) != operation.LocatorDigest {
 		return store.ErrAccountGenerationChanged
 	}
-	owner, err := m.credentialOwnerRecord()
+	owner, err := m.MutationOwner()
 	if err != nil {
 		return err
 	}
-	operation, err = m.Store.TakeoverCredentialOperation(
-		ctx,
-		operation.Fence(),
-		owner,
-		retirement,
-		m.workers.reaper,
-	)
+	operation, err = m.Store.TakeoverCredentialOperation(operation.Fence(), owner)
 	if err != nil {
 		return err
 	}

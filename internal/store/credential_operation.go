@@ -2,24 +2,15 @@ package store
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
-
-	"github.com/yasyf/daemonkit/proc"
 )
-
-// ProcessRetirementVerifier proves a daemonkit reap receipt remains durably unacknowledged.
-type ProcessRetirementVerifier interface {
-	VerifyReapReceipt(context.Context, proc.ReapReceipt) error
-}
 
 // CredentialOperationState is one durable credential operation phase.
 type CredentialOperationState string
@@ -281,7 +272,7 @@ const CredentialOperationPageLimit = 256
 // CredentialOperationFence authorizes one exact owner epoch transition.
 type CredentialOperationFence struct {
 	Token string
-	Owner proc.Record
+	Owner OwnerRecord
 	Epoch uint64
 }
 
@@ -299,7 +290,7 @@ type CredentialOperation struct {
 	KeychainService    string
 	KeychainAccount    string
 	LocatorDigest      CredentialDigest
-	Owner              proc.Record
+	Owner              OwnerRecord
 	OwnerEpoch         uint64
 	State              CredentialOperationState
 	Expected           CredentialExternalState
@@ -335,7 +326,7 @@ type CredentialOperationReceipt struct {
 	KeychainAccount    string
 	LocatorDigest      CredentialDigest
 	Expected           CredentialExternalState
-	Owner              proc.Record
+	Owner              OwnerRecord
 	OwnerEpoch         uint64
 	TerminalStatus     CredentialTerminalStatus
 	Result             CredentialResultCategory
@@ -373,7 +364,7 @@ type BeginCredentialOperationRequest struct {
 	KeychainService   string
 	KeychainAccount   string
 	LocatorDigest     CredentialDigest
-	Owner             proc.Record
+	Owner             OwnerRecord
 	Kind              CredentialOperationKind
 	Target            CredentialTarget
 	IntentDigest      CredentialDigest
@@ -503,10 +494,6 @@ func (s *Store) BeginCredentialOperation(
 	if err != nil {
 		return BeginCredentialOperationResult{}, err
 	}
-	ownerRecord, err := encodeCredentialOwner(request.Owner)
-	if err != nil {
-		return BeginCredentialOperationResult{}, err
-	}
 	result, err := tx.Exec(
 		`INSERT INTO credential_operations(
 		 account_id,operation_id,token,kind,target,intent_digest,
@@ -519,7 +506,7 @@ func (s *Store) BeginCredentialOperation(
 		request.AccountID, request.OperationID[:], token, request.Kind, request.Target,
 		request.IntentDigest[:], request.AccountInstanceID, request.AccountGeneration,
 		request.ConfigDir, request.KeychainService, request.KeychainAccount,
-		request.LocatorDigest[:], ownerRecord,
+		request.LocatorDigest[:], []byte(request.Owner),
 		request.Expected.Keychain.State, credentialDigestValue(request.Expected.Keychain.Digest),
 		now.UnixNano(), now.UnixNano(),
 	)
@@ -732,7 +719,24 @@ func credentialOperationMatchesEvidence(
 
 // CredentialOperationsOwnedBy returns one bounded stable account-id page.
 func (s *Store) CredentialOperationsOwnedBy(
-	owner proc.Record,
+	owner OwnerRecord,
+	afterAccountID, limit int,
+) (operations []CredentialOperation, more bool, err error) {
+	return s.credentialOperationsPage(owner, true, afterAccountID, limit)
+}
+
+// CredentialOperationsNotOwnedBy returns one bounded stable account-id page of
+// lanes whose stored owner bytes differ from owner — the successor's claim scan.
+func (s *Store) CredentialOperationsNotOwnedBy(
+	owner OwnerRecord,
+	afterAccountID, limit int,
+) (operations []CredentialOperation, more bool, err error) {
+	return s.credentialOperationsPage(owner, false, afterAccountID, limit)
+}
+
+func (s *Store) credentialOperationsPage(
+	owner OwnerRecord,
+	owned bool,
 	afterAccountID, limit int,
 ) (operations []CredentialOperation, more bool, err error) {
 	if err := owner.Validate(); err != nil {
@@ -741,16 +745,12 @@ func (s *Store) CredentialOperationsOwnedBy(
 	if afterAccountID < 0 || limit <= 0 || limit > CredentialOperationPageLimit {
 		return nil, false, errors.New("credential operation page is invalid")
 	}
-	ownerRecord, err := encodeCredentialOwner(owner)
-	if err != nil {
-		return nil, false, err
-	}
 	rows, err := s.db.Query(
 		`SELECT `+operationSelectColumns+`
 		 FROM credential_operations
-		 WHERE owner_record=? AND account_id>?
+		 WHERE (owner_record=?)=? AND account_id>?
 		 ORDER BY account_id LIMIT ?`,
-		ownerRecord, afterAccountID, limit+1,
+		[]byte(owner), owned, afterAccountID, limit+1,
 	)
 	if err != nil {
 		return nil, false, err
@@ -831,7 +831,7 @@ func (s *Store) StageCredentialOperationPublication(
 		`UPDATE credential_operations SET publication_payload=?,updated_at=?
 		 WHERE token=? AND owner_record=? AND owner_epoch=? AND state='applying' AND publication_payload IS NULL`,
 		bytes.Clone(publicationPayload), now.UnixNano(), fence.Token,
-		mustEncodeCredentialOwner(fence.Owner), fence.Epoch,
+		[]byte(fence.Owner), fence.Epoch,
 	)
 	if err != nil {
 		return CredentialOperation{}, err
@@ -1052,7 +1052,7 @@ func (s *Store) settleCredentialOperation(
 	deleted, err := tx.Exec(
 		`DELETE FROM credential_operations
 		 WHERE token=? AND owner_record=? AND owner_epoch=?`,
-		request.Fence.Token, mustEncodeCredentialOwner(request.Fence.Owner), request.Fence.Epoch,
+		request.Fence.Token, []byte(request.Fence.Owner), request.Fence.Epoch,
 	)
 	if err != nil {
 		return CredentialOperationReceipt{}, err
@@ -1070,22 +1070,19 @@ func (s *Store) settleCredentialOperation(
 	return receipt, nil
 }
 
-// TakeoverCredentialOperation transfers a provably retired lane into a new owner epoch.
+// TakeoverCredentialOperation transfers a foreign lane into a new owner epoch.
+// The fence's owner is the row's stored bytes echoed into the CAS; exclusion
+// against a live owner is Serve's flock, so the epoch CAS alone fences the
+// impossible straggler.
 func (s *Store) TakeoverCredentialOperation(
-	ctx context.Context,
 	expected CredentialOperationFence,
-	newOwner proc.Record,
-	receipt proc.ReapReceipt,
-	verifier ProcessRetirementVerifier,
+	newOwner OwnerRecord,
 ) (CredentialOperation, error) {
 	now := s.now()
 	if err := validateCredentialFence(expected); err != nil {
 		return CredentialOperation{}, err
 	}
 	if err := newOwner.Validate(); err != nil {
-		return CredentialOperation{}, err
-	}
-	if err := verifyProcessRetirement(ctx, expected.Owner, newOwner, receipt, verifier); err != nil {
 		return CredentialOperation{}, err
 	}
 	tx, err := s.db.Begin()
@@ -1105,16 +1102,12 @@ func (s *Store) TakeoverCredentialOperation(
 	if err := requireCredentialFence(operation, expected); err != nil {
 		return CredentialOperation{}, err
 	}
-	ownerRecord, err := encodeCredentialOwner(newOwner)
-	if err != nil {
-		return CredentialOperation{}, err
-	}
 	result, err := tx.Exec(
 		`UPDATE credential_operations
 		 SET owner_record=?,owner_epoch=owner_epoch+1,updated_at=?
 		 WHERE token=? AND owner_record=? AND owner_epoch=?`,
-		ownerRecord, now.UnixNano(), expected.Token,
-		mustEncodeCredentialOwner(expected.Owner), expected.Epoch,
+		[]byte(newOwner), now.UnixNano(), expected.Token,
+		[]byte(expected.Owner), expected.Epoch,
 	)
 	if err != nil {
 		return CredentialOperation{}, err
@@ -1134,29 +1127,6 @@ func (s *Store) TakeoverCredentialOperation(
 		return CredentialOperation{}, err
 	}
 	return operation, nil
-}
-
-func verifyProcessRetirement(
-	ctx context.Context,
-	expectedOwner proc.Record,
-	newOwner proc.Record,
-	receipt proc.ReapReceipt,
-	verifier ProcessRetirementVerifier,
-) error {
-	if verifier == nil {
-		return ErrCredentialOperationOwner
-	}
-	if err := receipt.Validate(); err != nil {
-		return errors.Join(ErrCredentialOperationOwner, err)
-	}
-	if !sameCredentialOwner(receipt.Record, expectedOwner) ||
-		receipt.ReaperGeneration != newOwner.Generation {
-		return ErrCredentialOperationOwner
-	}
-	if err := verifier.VerifyReapReceipt(ctx, receipt); err != nil {
-		return errors.Join(ErrCredentialOperationOwner, err)
-	}
-	return nil
 }
 
 // AbandonPreparedCredentialOperation removes a proven no-I/O lane.
@@ -1197,7 +1167,7 @@ func (s *Store) AbandonPreparedCredentialOperation(fence CredentialOperationFenc
 	}
 	if _, err := tx.Exec(
 		`DELETE FROM credential_operations WHERE token=? AND owner_record=? AND owner_epoch=?`,
-		fence.Token, mustEncodeCredentialOwner(fence.Owner), fence.Epoch,
+		fence.Token, []byte(fence.Owner), fence.Epoch,
 	); err != nil {
 		return err
 	}
@@ -1744,7 +1714,7 @@ func (s *Store) advanceCredentialOperation(
 		 WHERE token=? AND owner_record=? AND owner_epoch=? AND state=?`,
 		to, outcomeKeychainState, outcomeKeychainDigest,
 		terminalStatus, resultCategory, failureClass, storedPublicationPayload, now.UnixNano(), fence.Token,
-		mustEncodeCredentialOwner(fence.Owner), fence.Epoch, from,
+		[]byte(fence.Owner), fence.Epoch, from,
 	)
 	if err != nil {
 		return CredentialOperation{}, err
@@ -1843,9 +1813,7 @@ func scanCredentialOperation(row credentialOperationScanner) (CredentialOperatio
 	if err := scanCredentialDigest(locatorDigest, &operation.LocatorDigest); err != nil {
 		return CredentialOperation{}, err
 	}
-	if err := decodeCredentialOwner(ownerRaw, &operation.Owner); err != nil {
-		return CredentialOperation{}, err
-	}
+	operation.Owner = OwnerRecord(ownerRaw)
 	var err error
 	operation.Expected.Keychain.Digest, err = scanOptionalCredentialDigest(expectedKeychainDigest)
 	if err != nil {
@@ -1945,9 +1913,7 @@ func scanCredentialOperationReceipt(
 	if err := scanCredentialDigest(locatorDigest, &receipt.LocatorDigest); err != nil {
 		return CredentialOperationReceipt{}, err
 	}
-	if err := decodeCredentialOwner(ownerRaw, &receipt.Owner); err != nil {
-		return CredentialOperationReceipt{}, err
-	}
+	receipt.Owner = OwnerRecord(ownerRaw)
 	var err error
 	receipt.Expected.Keychain.Digest, err = scanOptionalCredentialDigest(expectedKeychainDigest)
 	if err != nil {
@@ -1993,7 +1959,7 @@ func insertCredentialOperationReceipt(
 		receipt.AccountGeneration, receipt.ConfigDir, receipt.KeychainService,
 		receipt.KeychainAccount, receipt.LocatorDigest[:], receipt.Kind, receipt.Target,
 		receipt.IntentDigest[:], receipt.Expected.Keychain.State,
-		credentialDigestValue(receipt.Expected.Keychain.Digest), mustEncodeCredentialOwner(receipt.Owner),
+		credentialDigestValue(receipt.Expected.Keychain.Digest), []byte(receipt.Owner),
 		receipt.OwnerEpoch, receipt.TerminalStatus, receipt.Result,
 		credentialFailureClassValue(receipt.FailureClass), receipt.Outcome.Keychain.State,
 		credentialDigestValue(receipt.Outcome.Keychain.Digest), credentialPublicationPayloadValue(receipt.PublicationPayload),
@@ -2126,7 +2092,7 @@ func validateCredentialOperationRequest(request BeginCredentialOperationRequest)
 		return err
 	}
 	if err := request.Owner.Validate(); err != nil {
-		return errors.New("credential operation owner process is invalid")
+		return err
 	}
 	if err := request.Expected.validate(); err != nil {
 		return err
@@ -2429,10 +2395,7 @@ func validateCredentialFence(fence CredentialOperationFence) error {
 	if fence.Epoch == 0 {
 		return errors.New("credential operation owner epoch is required")
 	}
-	if err := fence.Owner.Validate(); err != nil {
-		return errors.New("credential operation owner process is invalid")
-	}
-	return nil
+	return fence.Owner.Validate()
 }
 
 func requireCredentialFence(
@@ -2440,7 +2403,7 @@ func requireCredentialFence(
 	fence CredentialOperationFence,
 ) error {
 	if operation.Token != fence.Token || operation.OwnerEpoch != fence.Epoch ||
-		!sameCredentialOwner(operation.Owner, fence.Owner) {
+		!bytes.Equal(operation.Owner, fence.Owner) {
 		return ErrCredentialOperationOwner
 	}
 	return nil
@@ -2451,7 +2414,7 @@ func receiptFenceMatches(
 	fence CredentialOperationFence,
 ) bool {
 	return receipt.Token == fence.Token && receipt.OwnerEpoch == fence.Epoch &&
-		sameCredentialOwner(receipt.Owner, fence.Owner)
+		bytes.Equal(receipt.Owner, fence.Owner)
 }
 
 func operationIdentityMatchesRequest(
@@ -2619,7 +2582,7 @@ func credentialPendingAddCompensationMatches(
 		return err
 	}
 	if pendingInstance != instanceID || pendingGeneration != generation ||
-		!bytes.Equal(pendingOwner, mustEncodeCredentialOwner(mutation.Owner)) ||
+		!bytes.Equal(pendingOwner, mutation.Owner) ||
 		mutation.Kind != AccountMutationAdd || mutation.State != AccountMutationCompensating ||
 		mutation.AccountInstanceID != instanceID || mutation.AccountGeneration != generation ||
 		mutation.ConfigDir != configDir || mutation.KeychainService != keychainService ||
@@ -2702,41 +2665,6 @@ func validateAccountInstanceID(instanceID string) error {
 		return errors.New("credential operation account instance id is invalid")
 	}
 	return nil
-}
-
-func encodeCredentialOwner(owner proc.Record) ([]byte, error) {
-	if err := owner.Validate(); err != nil {
-		return nil, err
-	}
-	encoded, err := json.Marshal(owner)
-	if err != nil {
-		return nil, fmt.Errorf("encode credential operation owner: %w", err)
-	}
-	return encoded, nil
-}
-
-func mustEncodeCredentialOwner(owner proc.Record) []byte {
-	encoded, err := encodeCredentialOwner(owner)
-	if err != nil {
-		panic(err)
-	}
-	return encoded
-}
-
-func decodeCredentialOwner(encoded []byte, owner *proc.Record) error {
-	if err := json.Unmarshal(encoded, owner); err != nil {
-		return errors.Join(errors.New("credential operation owner is corrupt"), err)
-	}
-	if err := owner.Validate(); err != nil {
-		return errors.Join(errors.New("credential operation owner is corrupt"), err)
-	}
-	return nil
-}
-
-func sameCredentialOwner(left, right proc.Record) bool {
-	leftEncoded, leftErr := encodeCredentialOwner(left)
-	rightEncoded, rightErr := encodeCredentialOwner(right)
-	return leftErr == nil && rightErr == nil && bytes.Equal(leftEncoded, rightEncoded)
 }
 
 func newCredentialOperationToken() (string, error) {

@@ -160,7 +160,7 @@ type Server struct {
 
 	accountMutationTerminal accountMutationTerminalRunner
 	accountMutationLifetime context.Context
-	accountMutationOwner    func() (proc.Record, error)
+	accountMutationOwner    func() (store.OwnerRecord, error)
 	accountMutationMu       sync.Mutex
 	accountMutationRuns     map[store.AccountMutationID]*accountMutationRun
 }
