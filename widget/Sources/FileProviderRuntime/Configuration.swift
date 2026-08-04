@@ -3,16 +3,11 @@ import Foundation
 import FuseKit
 
 enum CCPoolFileProviderConfiguration {
-  enum ConfigurationError: Error, Equatable, Sendable {
-    case missingFuseKitBuildID
-  }
-
   static let appGroupIdentifier = "SXKCTF23Q2.ccp"
   static let appGroupEndpoint = try! CatalogAppGroupEndpoint(
     identifier: appGroupIdentifier,
     socketLeaf: "fusekit.sock"
   )
-  static let brokerNoProgressTimeout: TimeInterval = 75
 
   static var realHome: String {
     if let pw = getpwuid(getuid()), let dir = pw.pointee.pw_dir {
@@ -28,22 +23,9 @@ enum CCPoolFileProviderConfiguration {
   }
 
   static var brokerConfiguration: CatalogBroker.Configuration {
-    get throws {
-      try makeBrokerConfiguration(environment: ProcessInfo.processInfo.environment)
-    }
-  }
-
-  static func makeBrokerConfiguration(
-    environment: [String: String]
-  ) throws -> CatalogBroker.Configuration {
-    guard let buildID = environment["FUSEKIT_BUILD_ID"], !buildID.isEmpty else {
-      throw ConfigurationError.missingFuseKitBuildID
-    }
-    return .init(
+    .init(
       appGroupEndpoint: appGroupEndpoint,
-      daemonSocketPath: holderSocketPath,
-      expectedRuntimeBuild: buildID,
-      noProgressTimeout: brokerNoProgressTimeout
+      daemonSocketPath: holderSocketPath
     )
   }
 

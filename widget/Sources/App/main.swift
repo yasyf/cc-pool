@@ -8,7 +8,7 @@ if childStatus >= 0 {
 
 do {
   if try await CatalogBroker.runChildIfRequested(
-    configuration: try CCPoolFileProviderConfiguration.brokerConfiguration
+    configuration: CCPoolFileProviderConfiguration.brokerConfiguration
   ) {
     exit(0)
   }

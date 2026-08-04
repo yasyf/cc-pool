@@ -12,27 +12,9 @@ final class FileProviderRuntimeConfigurationTests: XCTestCase {
     )
   }
 
-  func testBrokerConfigurationPinsExactBuildAndTimeout() throws {
-    let buildID = "  exact-build-id  "
-    let broker = try CCPoolFileProviderConfiguration.makeBrokerConfiguration(
-      environment: ["FUSEKIT_BUILD_ID": buildID]
-    )
+  func testBrokerConfigurationBindsTheSignedTopology() {
+    let broker = CCPoolFileProviderConfiguration.brokerConfiguration
     XCTAssertEqual(broker.appGroupEndpoint, CCPoolFileProviderConfiguration.appGroupEndpoint)
     XCTAssertEqual(broker.daemonSocketPath, CCPoolFileProviderConfiguration.holderSocketPath)
-    XCTAssertEqual(broker.expectedRuntimeBuild, buildID)
-    XCTAssertEqual(broker.noProgressTimeout, 75)
-  }
-
-  func testBrokerConfigurationRejectsMissingOrEmptyBuild() {
-    for environment in [[:], ["FUSEKIT_BUILD_ID": ""]] {
-      XCTAssertThrowsError(
-        try CCPoolFileProviderConfiguration.makeBrokerConfiguration(environment: environment)
-      ) { error in
-        XCTAssertEqual(
-          error as? CCPoolFileProviderConfiguration.ConfigurationError,
-          .missingFuseKitBuildID
-        )
-      }
-    }
   }
 }
