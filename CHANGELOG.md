@@ -31,6 +31,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scope opens, before any work is admitted; recovery no longer runs as a
   separate admission gate inside the terminal manager.
 - Daemon and worker lifecycle now runs on daemonkit `v0.21.4`.
+- The daemon's control surface is a unary request and reply protocol whose
+  account-mutation output is polled rather than streamed, and its wire schema
+  revs to match. A CLI and a daemon built from different revisions now refuse
+  each other by exact build identity instead of attempting to interoperate.
+- The first launch after upgrading from `0.64.x` retires the previous service
+  registration and takes over the legacy socket lock before claiming any work,
+  so it replaces a running legacy daemon rather than racing it. This happens
+  once per machine.
+- The sync helper runs as a resident service on its own socket, addressed by
+  the service it registers rather than by a path the pool computes.
+
+### Fixed
+- Confirming that the helper service is active now also confirms the process
+  answering is the installed application's own binary, by correlating the
+  serving process against the installed bundle. Previously any process running
+  as the same user satisfied the check by listening on the socket.
 
 ## [0.64.9] - 2026-07-27
 
