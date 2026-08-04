@@ -14,8 +14,8 @@ import (
 	"syscall"
 	"time"
 
-	daemonstate "github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/daemonkit/durable"
 )
 
 const (
@@ -58,7 +58,7 @@ type credentialLockJournal struct {
 	Schema    int                    `json:"schema"`
 	AccountID int                    `json:"account_id"`
 	Nonce     string                 `json:"nonce"`
-	Worker    proc.Record            `json:"worker"`
+	Worker    store.OwnerRecord      `json:"worker"`
 	Targets   []credentialLockTarget `json:"targets"`
 }
 
@@ -66,7 +66,7 @@ type credentialLockMarker struct {
 	Schema      int                       `json:"schema"`
 	AccountID   int                       `json:"account_id"`
 	Nonce       string                    `json:"nonce"`
-	Worker      proc.Record               `json:"worker"`
+	Worker      store.OwnerRecord         `json:"worker"`
 	Target      string                    `json:"target"`
 	Fingerprint credentialLockFingerprint `json:"fingerprint"`
 }
@@ -74,7 +74,7 @@ type credentialLockMarker struct {
 type credentialLockLease struct {
 	journalPath  string
 	journal      credentialLockJournal
-	guard        *proc.FileLockHandle
+	guard        *durable.Lock
 	journalOwned bool
 	released     bool
 }
@@ -101,6 +101,7 @@ func credentialRefreshLockPaths(configDir string) ([]string, error) {
 
 func acquireCredentialRefreshLocks(
 	ctx context.Context,
+	owner store.OwnerRecord,
 	accountID int,
 	configDir string,
 ) (*credentialLockLease, error) {
@@ -109,10 +110,9 @@ func acquireCredentialRefreshLocks(
 		return nil, err
 	}
 	journalPath := credentialLockJournalPath(accountID)
-	guard, err := (proc.FileLockSpec{
-		Path: journalPath + ".guard", Mode: proc.FileLockExclusive,
-		Deadline: credentialCASWorkerTimeout,
-	}).Acquire(ctx)
+	guardCtx, cancelGuard := context.WithTimeout(ctx, credentialCASWorkerTimeout)
+	defer cancelGuard()
+	guard, err := durable.AcquireLock(guardCtx, journalPath+".guard")
 	if err != nil {
 		return nil, fmt.Errorf("acquire credential lock journal: %w", err)
 	}
@@ -130,17 +130,13 @@ func acquireCredentialRefreshLocks(
 	if err := recoverCredentialLockJournal(ctx, journalPath, accountID, paths); err != nil {
 		return fail(err)
 	}
-	worker, err := currentCredentialLockWorker()
-	if err != nil {
-		return fail(err)
-	}
 	nonce, err := newCredentialLockNonce()
 	if err != nil {
 		return fail(err)
 	}
 	lease.journal = credentialLockJournal{
 		Schema: credentialLockJournalSchema, AccountID: accountID,
-		Nonce: nonce, Worker: worker, Targets: make([]credentialLockTarget, len(paths)),
+		Nonce: nonce, Worker: owner, Targets: make([]credentialLockTarget, len(paths)),
 	}
 	for index, path := range paths {
 		lease.journal.Targets[index] = credentialLockTarget{
@@ -193,7 +189,7 @@ func (lease *credentialLockLease) acquireTarget(ctx context.Context, index int) 
 	for {
 		err := publishCredentialLockDirectory(target.Stage, target.Path)
 		if err == nil {
-			if err := daemonstate.SyncDir(filepath.Dir(target.Path)); err != nil {
+			if err := durable.SyncDir(filepath.Dir(target.Path)); err != nil {
 				return err
 			}
 			credentialLockCheckpoint(fmt.Sprintf("target-published-%d", index))
@@ -344,7 +340,7 @@ func releaseCredentialLockTarget(
 		if err := os.Remove(markerPath); err != nil {
 			return err
 		}
-		if err := daemonstate.SyncDir(target.Path); err != nil {
+		if err := durable.SyncDir(target.Path); err != nil {
 			return err
 		}
 		credentialLockCheckpoint(fmt.Sprintf(
@@ -356,7 +352,7 @@ func releaseCredentialLockTarget(
 	if err := os.Remove(target.Path); err != nil {
 		return fmt.Errorf("remove exact credential lock target: %w", err)
 	}
-	if err := daemonstate.SyncDir(filepath.Dir(target.Path)); err != nil {
+	if err := durable.SyncDir(filepath.Dir(target.Path)); err != nil {
 		return err
 	}
 	credentialLockCheckpoint(fmt.Sprintf(
@@ -406,7 +402,7 @@ func cleanupCredentialLockStage(
 	if err := os.Remove(target.Stage); err != nil {
 		return true, err
 	}
-	return true, daemonstate.SyncDir(filepath.Dir(target.Stage))
+	return true, durable.SyncDir(filepath.Dir(target.Stage))
 }
 
 func recoverCredentialLockJournal(
@@ -480,27 +476,6 @@ func recoverCredentialLockJournal(
 	return nil
 }
 
-func currentCredentialLockWorker() (proc.Record, error) {
-	identity, err := proc.CurrentIdentity()
-	if err != nil {
-		return proc.Record{}, err
-	}
-	generation, err := proc.ProcessGeneration()
-	if err != nil {
-		return proc.Record{}, err
-	}
-	record := proc.Record{
-		RecoveryID: CredentialOwnerRecoveryID,
-		PID:        identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
-		Comm: identity.Comm, Executable: identity.Executable, AuditToken: identity.AuditToken,
-		Generation: generation,
-	}
-	if err := record.Validate(); err != nil {
-		return proc.Record{}, err
-	}
-	return record, nil
-}
-
 func newCredentialLockNonce() (string, error) {
 	var raw [16]byte
 	if _, err := rand.Read(raw[:]); err != nil {
@@ -521,7 +496,7 @@ func (lease *credentialLockLease) writeJournal() error {
 	if err != nil {
 		return err
 	}
-	return daemonstate.WriteFileDurable(lease.journalPath, payload, 0o600)
+	return durable.WriteFile(lease.journalPath, payload, 0o600)
 }
 
 func readCredentialLockJournal(path string) (credentialLockJournal, error) {
@@ -540,7 +515,7 @@ func removeCredentialLockJournal(path string) error {
 	if err != nil {
 		return err
 	}
-	return daemonstate.SyncDir(filepath.Dir(path))
+	return durable.SyncDir(filepath.Dir(path))
 }
 
 func writeCredentialLockMarker(directory string, marker credentialLockMarker) error {
@@ -548,7 +523,7 @@ func writeCredentialLockMarker(directory string, marker credentialLockMarker) er
 	if err != nil {
 		return err
 	}
-	return daemonstate.WriteFileDurable(
+	return durable.WriteFile(
 		filepath.Join(directory, lockMarkerName), payload, 0o600,
 	)
 }
@@ -606,9 +581,6 @@ func validateCredentialLockJournal(
 	if err := journal.Worker.Validate(); err != nil {
 		return err
 	}
-	if journal.Worker.RecoveryID != CredentialOwnerRecoveryID || journal.Worker.ProcessGroup {
-		return errors.New("credential lock journal worker kind is invalid")
-	}
 	for index, target := range journal.Targets {
 		if target.Path != paths[index] ||
 			target.Stage != credentialLockStagePath(target.Path, journal.Nonce, index) {
@@ -637,7 +609,7 @@ func validateCredentialLockMarker(
 	marker credentialLockMarker,
 ) error {
 	if marker.Schema != credentialLockJournalSchema || marker.AccountID != journal.AccountID ||
-		marker.Nonce != journal.Nonce || marker.Worker != journal.Worker ||
+		marker.Nonce != journal.Nonce || !bytes.Equal(marker.Worker, journal.Worker) ||
 		marker.Target != target.Path || marker.Fingerprint != target.Fingerprint {
 		return errors.New("credential lock owner marker does not match its journal")
 	}

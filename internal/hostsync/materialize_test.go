@@ -23,7 +23,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/testhome"
 	"github.com/yasyf/cc-pool/internal/workerexec"
-	"github.com/yasyf/daemonkit/proc"
 )
 
 const materializeManifest = "/cfg/synckit/manifests/cc-pool.json"
@@ -232,23 +231,18 @@ func newMaterializeService(t *testing.T) (*Service, *pool.Manager, *credstest.Fa
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity, err := proc.CurrentIdentity()
+	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	ownerGenerationDigest := sha256.Sum256([]byte(t.Name()))
-	var ownerGeneration proc.OwnerGeneration
-	copy(ownerGeneration[:], ownerGenerationDigest[:len(ownerGeneration)])
-	owner := proc.Record{
-		RecoveryID: pool.CredentialOwnerRecoveryID,
-		PID:        identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
-		Comm: identity.Comm, Executable: identity.Executable,
-		AuditToken: identity.AuditToken, Generation: ownerGeneration,
+	owner, err := store.MintOwnerRecord(time.Now())
+	if err != nil {
+		t.Fatal(err)
 	}
 	fk := credstest.NewFake()
 	credentials := backingCredentials{fk}
 	authority, err := pool.NewWorkerAuthority(
-		inlineMaterializeTaskRunner{credentials: credentials}, identity.Executable, owner,
+		inlineMaterializeTaskRunner{credentials: credentials}, executable, owner,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -304,7 +298,7 @@ func newMaterializeService(t *testing.T) (*Service, *pool.Manager, *credstest.Fa
 	return s, m, fk, rec
 }
 
-func mustMutationOwner(t *testing.T, manager *pool.Manager) proc.Record {
+func mustMutationOwner(t *testing.T, manager *pool.Manager) store.OwnerRecord {
 	t.Helper()
 	owner, err := manager.MutationOwner()
 	if err != nil {

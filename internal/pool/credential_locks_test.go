@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/testhome"
 )
 
@@ -43,7 +44,9 @@ func TestCredentialLockCrashHelper(t *testing.T) {
 		}
 		os.Exit(77)
 	}
-	lease, err := acquireCredentialRefreshLocks(t.Context(), 1, configDir)
+	lease, err := acquireCredentialRefreshLocks(
+		t.Context(), mintCredentialLockOwner(t), 1, configDir,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +116,9 @@ func TestCredentialLockRecoversEveryCrashTransition(t *testing.T) {
 			configDir := prepareTestAccountConfigDir(t, 1)
 			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 			defer cancel()
-			lease, err := acquireCredentialRefreshLocks(ctx, 1, configDir)
+			lease, err := acquireCredentialRefreshLocks(
+				ctx, mintCredentialLockOwner(t), 1, configDir,
+			)
 			if err != nil {
 				t.Fatalf("recover after %s: %v", checkpoint.name, err)
 			}
@@ -128,7 +133,8 @@ func TestCredentialLockRecoversEveryCrashTransition(t *testing.T) {
 func TestCredentialLockRecoversAbandonedSameWorkerJournal(t *testing.T) {
 	testhome.Sandbox(t, t.TempDir())
 	configDir := prepareTestAccountConfigDir(t, 1)
-	lease, err := acquireCredentialRefreshLocks(t.Context(), 1, configDir)
+	owner := mintCredentialLockOwner(t)
+	lease, err := acquireCredentialRefreshLocks(t.Context(), owner, 1, configDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +155,7 @@ func TestCredentialLockRecoversAbandonedSameWorkerJournal(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	recovered, err := acquireCredentialRefreshLocks(ctx, 1, configDir)
+	recovered, err := acquireCredentialRefreshLocks(ctx, owner, 1, configDir)
 	if err != nil {
 		t.Fatalf("recover same-worker abandoned journal: %v", err)
 	}
@@ -162,7 +168,9 @@ func TestCredentialLockRecoversAbandonedSameWorkerJournal(t *testing.T) {
 func TestCredentialLockReleaseOutlivesCallerCancellation(t *testing.T) {
 	testhome.Sandbox(t, t.TempDir())
 	configDir := prepareTestAccountConfigDir(t, 1)
-	lease, err := acquireCredentialRefreshLocks(t.Context(), 1, configDir)
+	lease, err := acquireCredentialRefreshLocks(
+		t.Context(), mintCredentialLockOwner(t), 1, configDir,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,10 +196,7 @@ func TestCredentialLockNeverDeletesUnmarkedAmbiguousTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worker, err := currentCredentialLockWorker()
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := mintCredentialLockOwner(t)
 	nonce, err := newCredentialLockNonce()
 	if err != nil {
 		t.Fatal(err)
@@ -222,13 +227,22 @@ func TestCredentialLockNeverDeletesUnmarkedAmbiguousTarget(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
-	if _, err := acquireCredentialRefreshLocks(ctx, 1, configDir); err == nil ||
+	if _, err := acquireCredentialRefreshLocks(ctx, worker, 1, configDir); err == nil ||
 		!strings.Contains(err.Error(), "owner marker") {
 		t.Fatalf("ambiguous recovery error = %v", err)
 	}
 	if info, err := os.Lstat(paths[0]); err != nil || !info.IsDir() {
 		t.Fatalf("ambiguous Claude lock was deleted: %+v, %v", info, err)
 	}
+}
+
+func mintCredentialLockOwner(t *testing.T) store.OwnerRecord {
+	t.Helper()
+	owner, err := store.MintOwnerRecord(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return owner
 }
 
 func waitForCredentialLockHelper(t *testing.T, readyPath string) {

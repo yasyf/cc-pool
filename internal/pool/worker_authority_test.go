@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"errors"
+	"os"
 	"reflect"
 	"sync"
 	"testing"
@@ -11,7 +12,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/workerexec"
-	"github.com/yasyf/daemonkit/proc"
 )
 
 type rejectingTestTaskRunner struct{}
@@ -20,27 +20,19 @@ func (rejectingTestTaskRunner) Run(context.Context, workerexec.CommandRequest) (
 	return workerexec.CommandResult{}, errors.New("unexpected test worker task")
 }
 
-func bindTestWorkerAuthority(t *testing.T, manager *Manager, generation string) proc.Record {
+func bindTestWorkerAuthority(t *testing.T, manager *Manager, _ string) store.OwnerRecord {
 	t.Helper()
-	identity, err := proc.CurrentIdentity()
+	owner, err := store.MintOwnerRecord(time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	owner := proc.Record{
-		RecoveryID: CredentialOwnerRecoveryID,
-		PID:        identity.PID,
-		StartTime:  identity.StartTime,
-		Boot:       identity.Boot,
-		Comm:       identity.Comm,
-		Executable: identity.Executable,
-		AuditToken: identity.AuditToken,
-		Generation: poolTestGeneration("test-worker-authority-" + generation),
-	}
-	if err := owner.Validate(); err != nil {
+	executable, err := os.Executable()
+	if err != nil {
 		t.Fatal(err)
 	}
+	manager.owner = owner
 	manager.workerAuthority = &WorkerAuthority{
-		runner: rejectingTestTaskRunner{}, executable: identity.Executable, owner: owner,
+		runner: rejectingTestTaskRunner{}, executable: executable, owner: owner,
 	}
 	var credentialClaim sync.Mutex
 	manager.ClaimCredentialMutation = func(int) (func(), error) {

@@ -34,7 +34,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/workerexec"
-	"github.com/yasyf/daemonkit/proc"
 )
 
 type directTaskRunner struct{}
@@ -244,23 +243,13 @@ func cmdAccount(args []string) error {
 	return nil
 }
 
-func simCredentialOwner() (proc.Record, error) {
-	identity, err := proc.CurrentIdentity()
+func simCredentialOwner() (store.OwnerRecord, error) {
+	owner, err := store.MintOwnerRecord(time.Now())
 	if err != nil {
-		return proc.Record{}, err
-	}
-	generation, err := proc.ProcessGeneration()
-	if err != nil {
-		return proc.Record{}, err
-	}
-	owner := proc.Record{
-		RecoveryID: pool.CredentialOwnerRecoveryID,
-		PID:        identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
-		Comm: identity.Comm, Executable: identity.Executable, AuditToken: identity.AuditToken,
-		Generation: generation,
+		return nil, err
 	}
 	if err := owner.Validate(); err != nil {
-		return proc.Record{}, err
+		return nil, err
 	}
 	return owner, nil
 }
