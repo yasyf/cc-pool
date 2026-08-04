@@ -26,6 +26,13 @@ const concurrency = 3 + 5
 
 // Daemon is the tenant lane's whole identity, read by the signed app that
 // serves it and the cc-pool daemon that calls it.
+//
+// Trust.Control is nil, the same-user floor, for the reason Spec states for the
+// daemon's own control lane: the only caller is statusapp's readiness
+// observation, which rides Control through WaitReady from the unsigned Homebrew
+// CLI and daemon, so a stated requirement would lock out the lane it protects.
+// The floor still excludes other users; what it admits is a same-user process
+// issuing Drain, which is availability, not disclosure.
 func Daemon() daemonkit.Daemon {
 	return daemonkit.Daemon{
 		Label:       Label,

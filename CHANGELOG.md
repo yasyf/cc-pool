@@ -55,6 +55,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process is additionally pinned to one live instance of the installed bundle
   across the observation. Previously any process running as the same user
   satisfied the check by listening on the socket.
+- `ccp service install` succeeds again. It compared the daemon's reported build
+  against this CLI's version, but those name different things — the former is
+  daemonkit's own digest of the running executable, the latter cc-pool's
+  release version — so the check could never hold. Every successful install
+  reported a build mismatch and rolled its own holder installation back.
+- Shutting the daemon down no longer releases the credential store while an
+  account mutation is still settling. A drain whose budget ran out left its
+  worker join behind and closed the store anyway, and the settling mutation
+  then read through the freed handle. Teardown now waits for that join, and on
+  a spent budget it keeps everything held rather than releasing it early.
+- `ccp select` no longer accepts a daemon that has begun draining. Readiness
+  came from a status the daemon last published while serving, which stayed
+  behind once shutdown started; it now follows the daemon's live phase, so a
+  draining daemon is refused instead of failing the next call.
+- Removing an account no longer gives up after 30 seconds. The tenant call it
+  makes imposed its own half-minute limit on top of the caller's, so the
+  four-minute budget the command asks for was cut short with time to spare.
+  A caller that states its own deadline now keeps it.
+- Host sync no longer fails on a large but legitimate worker response. Replies
+  were capped at 4 MiB — a default that applied because no limit was stated —
+  while the protocol admits 12 MiB, so a valid larger reply was truncated and
+  reported as an error.
+- Starting the daemon no longer retires a reservation its own sync helper is
+  still holding. Startup claimed abandoned work from earlier runs while the
+  helper was already live, and every helper records a distinct owner, so its
+  in-flight reservation was indistinguishable from one left behind by a dead
+  predecessor. The claim now completes before the helper starts.
+- The bundled runtime reports itself installed only once its tenant lane
+  answers, rather than as soon as the primary holder starts — activation could
+  previously succeed and then unwind when a later startup step failed. If
+  either embedded lane stops, the application now stops with it instead of
+  running on with one lane missing.
+- The command the daemon prints for clearing a pre-upgrade login ledger now
+  quotes the path, so it still runs when the home directory contains an
+  apostrophe. It was the only documented way past that refusal.
 
 ## [0.64.9] - 2026-07-27
 
