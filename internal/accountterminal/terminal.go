@@ -791,7 +791,11 @@ func (a *TerminalAttachment) Close() error {
 	return nil
 }
 
-// Cancel terminates, reaps, and durably untracks the terminal task.
+// Cancel terminates, reaps, and durably untracks the terminal task. It returns
+// only once the terminal has settled: an expired ctx annotates the returned
+// error and never abandons the wait, since returning early would leak an
+// unreaped child rather than a parked goroutine. A caller's budget therefore
+// tags the error, and the drain ladder bounds the settlement.
 func (t *Terminal) Cancel(ctx context.Context) error {
 	t.cancel()
 	done := ctx.Done()
