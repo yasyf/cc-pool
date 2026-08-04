@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.65.0] - 2026-08-04
+
+cc-pool moves to daemonkit v0.21. Credential ownership is fenced on an opaque
+per-generation owner record, the store accepts exactly one schema fingerprint,
+and the daemon's control surface revs its wire schema. Downgrading after the
+first post-upgrade boot is unsupported: a `0.64.x` daemon fails loudly on the
+new owner records and stays broken until upgraded again.
+
 ### Changed
 - Credential ownership fencing now keys on an opaque per-generation owner
   record across all five owner-carrying store tables (active credential
@@ -717,7 +725,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   picked automatically when fuse-t is present); CI and release workflows.
 - License: PolyForm Noncommercial 1.0.0.
 
-[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.64.9...HEAD
+[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.65.0...HEAD
+[0.65.0]: https://github.com/yasyf/cc-pool/compare/v0.64.9...v0.65.0
 [0.64.9]: https://github.com/yasyf/cc-pool/compare/v0.64.8...v0.64.9
 [0.64.8]: https://github.com/yasyf/cc-pool/compare/v0.64.6...v0.64.8
 [0.64.6]: https://github.com/yasyf/cc-pool/compare/v0.64.5...v0.64.6
