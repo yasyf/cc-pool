@@ -148,7 +148,7 @@ func resolveSelectionTxn(ctx context.Context, cmd *cobra.Command, m *pool.Manage
 
 	cl := daemon.NewClient()
 	keepClient := false
-	defer func() {
+	defer func() { //nolint:contextcheck // Close states its own budget: this teardown must run even when ctx is already cancelled.
 		if !keepClient {
 			_ = cl.Close()
 		}
@@ -200,7 +200,7 @@ func resolveSelectionTxn(ctx context.Context, cmd *cobra.Command, m *pool.Manage
 			keepClient = true
 			return &selectionTxn{
 				acct: a, dir: resp.Dir, line: daemonSelectionLine(m, resp), commit: commit, abort: abort,
-				close: func() { _ = cl.Close() },
+				close: func() { _ = cl.Close() }, //nolint:contextcheck // Close states its own budget: this teardown must run even when ctx is already cancelled.
 			}, nil
 		case outcomeError:
 			abortDaemonSelection(ctx, cl, resp.ReservationToken)

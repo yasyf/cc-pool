@@ -336,7 +336,7 @@ func daemonAt(wantVersion string) bool {
 
 func daemonHealth(ctx context.Context, wantVersion string) error {
 	cl := daemon.NewClient()
-	defer func() { _ = cl.Close() }()
+	defer func() { _ = cl.Close() }() //nolint:contextcheck // Close states its own budget: this teardown must run even when ctx is already cancelled.
 	resp, err := daemonHealthContext(ctx, cl)
 	if err != nil {
 		return err

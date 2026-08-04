@@ -63,7 +63,10 @@ func NewClient() *Client {
 	}
 }
 
-// Close permanently releases the business lane.
+// Close permanently releases the business lane. It takes no context and states
+// its own budget deliberately: callers release the lane from a deferred call on
+// paths where their own context is already cancelled, and daemonkit refuses a
+// verb whose context carries no deadline.
 func (c *Client) Close() error {
 	c.mu.Lock()
 	if c.closed {

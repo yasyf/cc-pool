@@ -119,7 +119,7 @@ func gatherStatus(ctx context.Context) ([]pool.Snapshot, []daemon.LedgerState, e
 func loadStatusSnapshot(ctx context.Context) (daemon.StatusSnapshot, error) {
 	cl := daemon.NewClient()
 	resp, daemonErr := cl.StatusContext(ctx)
-	_ = cl.Close()
+	_ = cl.Close() //nolint:contextcheck // Close states its own budget: this teardown must run even when ctx is already cancelled.
 	if daemonStatusUsable(resp, daemonErr) {
 		snapshot := daemon.NewStatusSnapshot(resp.Accounts, time.Now())
 		snapshot.Ledgers = resp.Ledgers
