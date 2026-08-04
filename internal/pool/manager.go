@@ -177,16 +177,13 @@ func (m *Manager) scanSessions(ctx context.Context) ([]procscan.Session, error) 
 	return m.ScanSessions(ctx)
 }
 
-// Close releases resources within a cleanup context derived from ctx.
-func (m *Manager) Close(ctx context.Context) error {
-	var result error
-	if m.workers != nil {
-		result = m.workers.close(ctx)
+// Close releases the store. Disposable workers run in the process scope Serve
+// owns, so their settlement is the daemon's drain, not the manager's.
+func (m *Manager) Close() error {
+	if m.Store == nil {
+		return nil
 	}
-	if m.Store != nil {
-		result = errors.Join(result, m.Store.Close())
-	}
-	return result
+	return m.Store.Close()
 }
 
 // Meta keys recording pool-level state in the store's meta table.

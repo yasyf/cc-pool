@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
@@ -11,7 +12,6 @@ import (
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/mountservice"
 	"github.com/yasyf/fusekit/tenant"
-	"github.com/yasyf/fusekit/transportproto"
 )
 
 var errUnauthorized = errors.New("tenantfs: unauthorized FuseKit peer")
@@ -21,15 +21,6 @@ type MountAuthorizer struct{}
 
 // NewMountAuthorizer returns the deny-all external mount-control authorizer.
 func NewMountAuthorizer() MountAuthorizer { return MountAuthorizer{} }
-
-// AuthorizeObservation rejects external runtime observation.
-func (a MountAuthorizer) AuthorizeObservation(
-	_ context.Context,
-	_ mountservice.ObservationIdentity,
-	_ mountproto.Operation,
-) error {
-	return errUnauthorized
-}
 
 // Authorize rejects external tenant lifecycle control.
 func (a MountAuthorizer) Authorize(
@@ -66,29 +57,48 @@ func (a CatalogAuthorizer) Authorize(
 	return catalogAuthorization(operation, route)
 }
 
+// catalogAuthorization admits the File Provider role and nothing else. The
+// broker's forward wrapper died with v0.20, so a tenant request's domain
+// binding is asserted here: cc-pool's domain is a pure function of the tenant,
+// which leaves no session binding to track.
 func catalogAuthorization(
 	operation catalogproto.Operation,
 	route catalogservice.Route,
 ) (catalogservice.Authorization, error) {
-	authorization := catalogservice.Authorization{Route: route}
-	switch {
-	case operation == catalogproto.OperationBrokerOpen && route == (catalogservice.Route{}):
-		authorization.Principal = "cc-pool-fileprovider"
-		authorization.Role = catalogservice.RoleFileProvider
-		authorization.Presentation = catalog.PresentationFileProvider
-	case route.Forwarded && route.Tenant != "" && route.Domain != "":
-		authorization.Principal = "cc-pool-fileprovider"
-		authorization.Role = catalogservice.RoleFileProvider
-		authorization.Presentation = catalog.PresentationFileProvider
-	default:
+	authorization := catalogservice.Authorization{
+		Principal:    "cc-pool-fileprovider",
+		Role:         catalogservice.RoleFileProvider,
+		Presentation: catalog.PresentationFileProvider,
+		Route:        route,
+	}
+	if operation == catalogproto.OperationBrokerPoll || operation == catalogproto.OperationBrokerResult {
+		if route != (catalogservice.Route{}) {
+			return catalogservice.Authorization{}, errUnauthorized
+		}
+		return authorization, nil
+	}
+	if route.Tenant == "" || route.Generation == 0 {
 		return catalogservice.Authorization{}, errUnauthorized
 	}
+	domain, err := boundDomain(route.Tenant)
+	if err != nil {
+		return catalogservice.Authorization{}, err
+	}
+	authorization.Route.Domain = domain
+	authorization.Route.Forwarded = true
 	return authorization, nil
 }
 
+func boundDomain(id catalog.TenantID) (catalogproto.DomainID, error) {
+	instance, found := strings.CutPrefix(string(id), accountTenantPrefix)
+	if !found || !validAccountInstanceID(instance) {
+		return "", errUnauthorized
+	}
+	return catalogproto.DeriveDomainID(OwnerID, catalogproto.PresentationInstanceID(instance))
+}
+
 func validCatalogIdentity(uid int, identity catalogservice.Identity) bool {
-	return identity.WireBuild == transportproto.WireBuild && identity.Session != nil &&
-		identity.Peer.PID > 1 && identity.Peer.UID == uid
+	return identity.Caller.PID > 1 && identity.Caller.UID == uint32(uid)
 }
 
 var (

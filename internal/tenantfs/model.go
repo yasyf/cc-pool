@@ -16,6 +16,8 @@ const (
 	OwnerID catalogproto.OwnerID = "com.yasyf.cc-pool"
 )
 
+const accountTenantPrefix = "account-"
+
 // Account identifies one immutable account tenant generation.
 type Account struct {
 	InstanceID              string
@@ -29,7 +31,7 @@ func (a Account) TenantID() (catalog.TenantID, error) {
 	if !validAccountInstanceID(a.InstanceID) {
 		return "", errors.New("tenantfs: account instance id is not 32 lowercase hexadecimal characters")
 	}
-	return catalog.NewTenantID("account-" + a.InstanceID)
+	return catalog.NewTenantID(accountTenantPrefix + a.InstanceID)
 }
 
 // Spec returns the exact durable File Provider-only FuseKit tenant.

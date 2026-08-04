@@ -132,17 +132,16 @@ func testCredentialCAS(manager *Manager) credentialCASFunc {
 }
 
 func TestCredentialOwnerRecordFailsClosedWithoutWorkerAuthority(t *testing.T) {
-	if _, err := (&Manager{}).credentialOwnerRecord(); err == nil {
-		t.Fatal("credential owner synthesized without exact worker authority")
+	if err := (&Manager{}).owner.Validate(); err == nil {
+		t.Fatal("a manager without worker authority carries a valid owner")
 	}
 
 	manager := &Manager{}
 	want := bindTestWorkerAuthority(t, manager, "exact-owner")
-	got, err := manager.credentialOwnerRecord()
-	if err != nil {
+	if err := manager.owner.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("credential owner = %+v, want %+v", got, want)
+	if !reflect.DeepEqual(manager.owner, want) {
+		t.Fatalf("credential owner = %+v, want %+v", manager.owner, want)
 	}
 }

@@ -4,26 +4,16 @@ import (
 	"context"
 	"testing"
 
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/catalogservice"
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/mountservice"
-	"github.com/yasyf/fusekit/transportproto"
 )
 
 func TestExternalMountControlIsExhaustivelyRejected(t *testing.T) {
 	authorizer := MountAuthorizer{}
-	identity := mountservice.ObservationIdentity{
-		Peer: wire.Peer{PID: 7, UID: 42}, WireBuild: transportproto.WireBuild,
-	}
-	if err := authorizer.AuthorizeObservation(t.Context(), identity, mountproto.OperationRuntimeHealth); err == nil {
-		t.Fatal("runtime-health observation was externally authorized")
-	}
-	lifecycle := mountservice.Identity{
-		Peer: wire.Peer{PID: 7, UID: 42}, WireBuild: transportproto.WireBuild,
-		Session: &wire.AcceptedSession{},
-	}
+	lifecycle := mountservice.Identity{Caller: daemonkit.Caller{PID: 7, UID: 42}}
 	if _, err := authorizer.Authorize(
 		context.Background(), lifecycle, mountproto.OperationTenantState, "tenant", 1,
 	); err == nil {
@@ -33,10 +23,7 @@ func TestExternalMountControlIsExhaustivelyRejected(t *testing.T) {
 
 func TestNativeOperationsAreExhaustivelyRejected(t *testing.T) {
 	authorizer := MountAuthorizer{}
-	identity := mountservice.Identity{
-		Peer: wire.Peer{PID: 7, UID: 42}, WireBuild: transportproto.WireBuild,
-		Session: &wire.AcceptedSession{},
-	}
+	identity := mountservice.Identity{Caller: daemonkit.Caller{PID: 7, UID: 42}}
 	operations := []mountproto.Operation{
 		mountproto.OperationNativeBind,
 		mountproto.OperationNativeMounted,

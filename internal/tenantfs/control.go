@@ -7,28 +7,34 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
-	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/holder"
 	"github.com/yasyf/fusekit/tenant"
-	"github.com/yasyf/fusekit/transportproto"
 )
 
 const controlProtocol uint16 = 1
 
+// controlOperationTimeout is the tenant lane's per-call budget. A caller's own
+// stricter deadline always wins; a caller carrying none still cannot reach
+// daemonkit, which refuses a deadline-less Call outright.
+const controlOperationTimeout = 30 * time.Second
+
+const holderLivenessPoll = time.Second
+
 const (
-	operationRuntimeReadiness wire.Op = "product.cc-pool.runtime-readiness.v1"
-	operationTenantState      wire.Op = "product.cc-pool.tenant-state.v1"
-	operationTenantProvision  wire.Op = "product.cc-pool.tenant-provision.v1"
-	operationTenantReplace    wire.Op = "product.cc-pool.tenant-replace.v1"
-	operationTenantRetire     wire.Op = "product.cc-pool.tenant-retire.v1"
-	operationTenantPrepare    wire.Op = "product.cc-pool.tenant-prepare.v1"
-	operationLeaseCommit      wire.Op = "product.cc-pool.file-provider-lease-commit.v1"
-	operationLeaseRenew       wire.Op = "product.cc-pool.file-provider-lease-renew.v1"
-	operationLeaseRelease     wire.Op = "product.cc-pool.file-provider-lease-release.v1"
+	operationRuntimeReadiness = "product.cc-pool.runtime-readiness.v1"
+	operationTenantState      = "product.cc-pool.tenant-state.v1"
+	operationTenantProvision  = "product.cc-pool.tenant-provision.v1"
+	operationTenantReplace    = "product.cc-pool.tenant-replace.v1"
+	operationTenantRetire     = "product.cc-pool.tenant-retire.v1"
+	operationTenantPrepare    = "product.cc-pool.tenant-prepare.v1"
+	operationLeaseCommit      = "product.cc-pool.file-provider-lease-commit.v1"
+	operationLeaseRenew       = "product.cc-pool.file-provider-lease-renew.v1"
+	operationLeaseRelease     = "product.cc-pool.file-provider-lease-release.v1"
 )
 
 // ControlErrorCode classifies an exact cc-pool holder operation failure.
@@ -60,11 +66,12 @@ func (e *ControlRemoteError) Error() string {
 }
 
 // ControlTransportError reports a daemonkit session outcome without replaying
-// a possibly dispatched mutation.
+// a possibly dispatched mutation. Undispatched is true only when the transport
+// proved the request never reached the holder.
 type ControlTransportError struct {
-	Outcome wire.Outcome
-	Message string
-	cause   error
+	Undispatched bool
+	Message      string
+	cause        error
 }
 
 func (e *ControlTransportError) Error() string { return e.Message }
@@ -153,31 +160,55 @@ type leaseResponse struct {
 	Receipt catalogproto.FileProviderLeaseReceipt `json:"receipt"`
 }
 
-// ControlClient owns one persistent exact-build cc-pool holder session.
+// ControlClient owns one exact-build cc-pool tenant lane.
 type ControlClient struct {
-	wire *wire.Client
-	done <-chan struct{}
+	client   *daemonkit.Client
+	business *daemonkit.Business
+	done     chan struct{}
+	stop     context.CancelFunc
 }
 
-// NewControlClient opens the holder's cc-pool-specific business protocol.
-func NewControlClient(ctx context.Context, socket string) (*ControlClient, error) {
-	if socket == "" {
-		return nil, errors.New("tenantfs: FuseKit socket is empty")
-	}
-	session, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(socket), WireBuild: transportproto.WireBuild, Role: trust.UnprotectedRole,
-	})
+// NewControlClient opens cc-pool's tenant lane on the signed app. ctx bounds
+// the liveness monitor behind Done, not the calls made on the lane.
+func NewControlClient(ctx context.Context) (*ControlClient, error) {
+	client, err := daemonkit.Open(Daemon())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("tenantfs: open the cc-pool tenant lane: %w", err)
 	}
-	return &ControlClient{wire: session, done: controlSessionDone(session.Events())}, nil
+	monitorCtx, stop := context.WithCancel(ctx)
+	control := &ControlClient{
+		client: client, business: client.Business(),
+		done: make(chan struct{}), stop: stop,
+	}
+	go control.monitor(monitorCtx)
+	return control, nil
 }
 
-// Close settles and closes the persistent holder session.
-func (c *ControlClient) Close() error { return c.wire.Close() }
+// Close settles and closes the tenant lane.
+func (c *ControlClient) Close(ctx context.Context) error {
+	c.stop()
+	return c.business.Close(ctx)
+}
 
-// Done closes when the persistent holder session terminates.
+// Done closes when the tenant lane is proven absent.
 func (c *ControlClient) Done() <-chan struct{} { return c.done }
+
+// monitor closes Done at the first proof the lane stopped listening. Business
+// re-attaches on its own across a holder restart, so proven absence is the
+// only observation that outlives one session.
+func (c *ControlClient) monitor(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(holderLivenessPoll):
+		}
+		if _, err := c.Readiness(ctx); errors.Is(err, daemonkit.ErrAbsent) {
+			close(c.done)
+			return
+		}
+	}
+}
 
 // Readiness identifies the exact admitted holder publication.
 func (c *ControlClient) Readiness(ctx context.Context) (holder.LocalRuntimeReadiness, error) {
@@ -288,29 +319,23 @@ func (c *ControlClient) ReleaseFileProviderLease(
 	return response.Receipt, nil
 }
 
-func (c *ControlClient) call(ctx context.Context, operation wire.Op, request, response any) error {
+func (c *ControlClient) call(ctx context.Context, operation string, request, response any) error {
 	payload, err := json.Marshal(request)
 	if err != nil {
 		return err
 	}
-	result, err := c.wire.Call(ctx, operation, "", payload)
+	callCtx, cancel := context.WithTimeout(ctx, controlOperationTimeout)
+	defer cancel()
+	reply, err := c.business.Call(callCtx, operation, payload)
 	if err != nil {
-		return err
-	}
-	if result.Outcome != wire.Delivered || result.Response.Rejected {
-		message := result.Response.Reason
-		if message == "" {
-			message = "tenantfs: cc-pool holder request was not delivered"
+		return &ControlTransportError{
+			Undispatched: daemonkit.Undispatched(err), Message: err.Error(), cause: err,
 		}
-		return &ControlTransportError{Outcome: result.Outcome, Message: message, cause: result.Rejection()}
 	}
-	if result.Response.Err != "" {
-		return &ControlTransportError{Outcome: result.Outcome, Message: result.Response.Err}
+	if len(reply.Body) == 0 {
+		return &ControlTransportError{Message: "tenantfs: cc-pool holder response has no payload"}
 	}
-	if len(result.Response.Payload) == 0 {
-		return &ControlTransportError{Outcome: result.Outcome, Message: "tenantfs: cc-pool holder response has no payload"}
-	}
-	if err := decodeControl(result.Response.Payload, response); err != nil {
+	if err := decodeControl(reply.Body, response); err != nil {
 		return err
 	}
 	header, err := controlResponseHeader(response)
@@ -332,117 +357,93 @@ func (c *ControlClient) call(ctx context.Context, operation wire.Op, request, re
 	return &ControlRemoteError{Code: header.Code, Message: header.Message}
 }
 
-// BusinessHandlers returns the complete cc-pool control surface registered on
-// the holder's existing daemonkit server.
-func BusinessHandlers() []holder.BusinessHandlerSpec {
-	return []holder.BusinessHandlerSpec{
-		controlHandler(operationRuntimeReadiness, false, handleReadiness),
-		controlHandler(operationTenantState, true, handleState),
-		controlHandler(operationTenantProvision, true, handleProvision),
-		controlHandler(operationTenantReplace, true, handleReplace),
-		controlHandler(operationTenantRetire, true, handleRetire),
-		controlHandler(operationTenantPrepare, true, handlePrepare),
-		controlHandler(operationLeaseCommit, true, handleLeaseCommit),
-		controlHandler(operationLeaseRenew, true, handleLeaseRenew),
-		controlHandler(operationLeaseRelease, true, handleLeaseRelease),
-	}
+var controlHandlers = map[string]func(context.Context, daemonkit.Request, *holder.LocalTenantController) any{
+	operationRuntimeReadiness: handleReadiness,
+	operationTenantState:      handleState,
+	operationTenantProvision:  handleProvision,
+	operationTenantReplace:    handleReplace,
+	operationTenantRetire:     handleRetire,
+	operationTenantPrepare:    handlePrepare,
+	operationLeaseCommit:      handleLeaseCommit,
+	operationLeaseRenew:       handleLeaseRenew,
+	operationLeaseRelease:     handleLeaseRelease,
 }
 
-func controlHandler(
-	op wire.Op,
-	concurrent bool,
-	handler func(context.Context, wire.Request, *holder.LocalTenantController) any,
-) holder.BusinessHandlerSpec {
-	return holder.BusinessHandlerSpec{
-		Op: op, Concurrent: concurrent,
-		Handler: func(ctx context.Context, request wire.Request, controller *holder.LocalTenantController) (any, error) {
-			if request.Session == nil || request.Session.Protected() ||
-				request.WireBuild != transportproto.WireBuild || request.Session.WireBuild() != transportproto.WireBuild {
-				return controlFailure(ControlErrorInvalid, "cc-pool holder request has an invalid session"), nil
-			}
-			if request.Tenant != "" {
-				return controlFailure(ControlErrorInvalid, "cc-pool holder request has an invalid route"), nil
-			}
-			return handler(ctx, request, controller), nil
-		},
-	}
-}
-
-func handleReadiness(ctx context.Context, request wire.Request, controller *holder.LocalTenantController) any {
+func handleReadiness(ctx context.Context, request daemonkit.Request, controller *holder.LocalTenantController) any {
 	var input readinessRequest
-	if err := decodeControlRequest(request.Payload, &input); err != nil {
+	if err := decodeControlRequest(request.Body, &input); err != nil {
 		return readinessResponse{controlHeader: controlErrorHeader(err)}
 	}
 	value, err := controller.Readiness(ctx)
 	return readinessResponse{controlHeader: controlErrorHeader(err), Readiness: value}
 }
 
-func handleState(ctx context.Context, request wire.Request, controller *holder.LocalTenantController) any {
+func handleState(ctx context.Context, request daemonkit.Request, controller *holder.LocalTenantController) any {
 	var input stateRequest
-	if err := decodeControlRequest(request.Payload, &input); err != nil {
+	if err := decodeControlRequest(request.Body, &input); err != nil {
 		return stateResponse{controlHeader: controlErrorHeader(err)}
 	}
 	value, err := controller.State(ctx, input.Tenant)
 	return stateResponse{controlHeader: controlErrorHeader(err), State: value}
 }
 
-func handleProvision(ctx context.Context, request wire.Request, controller *holder.LocalTenantController) any {
+func handleProvision(ctx context.Context, request daemonkit.Request, controller *holder.LocalTenantController) any {
 	var input provisionRequest
-	if err := decodeControlRequest(request.Payload, &input); err != nil {
+	if err := decodeControlRequest(request.Body, &input); err != nil {
 		return acknowledgementResponse{controlHeader: controlErrorHeader(err)}
 	}
 	value, err := controller.Provision(ctx, input.Spec)
 	return acknowledgementResponse{controlHeader: controlErrorHeader(err), Acknowledgement: value}
 }
 
-func handleReplace(ctx context.Context, request wire.Request, controller *holder.LocalTenantController) any {
+func handleReplace(ctx context.Context, request daemonkit.Request, controller *holder.LocalTenantController) any {
 	var input replaceRequest
-	if err := decodeControlRequest(request.Payload, &input); err != nil {
+	if err := decodeControlRequest(request.Body, &input); err != nil {
 		return acknowledgementResponse{controlHeader: controlErrorHeader(err)}
 	}
 	value, err := controller.Replace(ctx, input.Expected, input.Next)
 	return acknowledgementResponse{controlHeader: controlErrorHeader(err), Acknowledgement: value}
 }
 
-func handleRetire(ctx context.Context, request wire.Request, controller *holder.LocalTenantController) any {
+func handleRetire(ctx context.Context, request daemonkit.Request, controller *holder.LocalTenantController) any {
 	var input retireRequest
-	if err := decodeControlRequest(request.Payload, &input); err != nil {
+	if err := decodeControlRequest(request.Body, &input); err != nil {
 		return retireResponse{controlHeader: controlErrorHeader(err)}
 	}
 	value, err := controller.Retire(ctx, input.Tenant, input.Expected)
 	return retireResponse{controlHeader: controlErrorHeader(err), Proof: value}
 }
 
-func handlePrepare(ctx context.Context, request wire.Request, controller *holder.LocalTenantController) any {
+func handlePrepare(ctx context.Context, request daemonkit.Request, controller *holder.LocalTenantController) any {
 	var input prepareRequest
-	if err := decodeControlRequest(request.Payload, &input); err != nil {
+	if err := decodeControlRequest(request.Body, &input); err != nil {
 		return prepareResponse{controlHeader: controlErrorHeader(err)}
 	}
 	value, err := controller.Prepare(ctx, input.Tenant, input.Preparation)
 	return prepareResponse{controlHeader: controlErrorHeader(err), Proof: value}
 }
 
-func handleLeaseCommit(ctx context.Context, request wire.Request, controller *holder.LocalTenantController) any {
+func handleLeaseCommit(ctx context.Context, request daemonkit.Request, controller *holder.LocalTenantController) any {
 	var input leaseCommitRequest
-	if err := decodeControlRequest(request.Payload, &input); err != nil {
+	if err := decodeControlRequest(request.Body, &input); err != nil {
 		return leaseResponse{controlHeader: controlErrorHeader(err)}
 	}
 	value, err := controller.CommitFileProviderLease(ctx, input.Commit)
 	return leaseResponse{controlHeader: controlErrorHeader(err), Receipt: value}
 }
 
-func handleLeaseRenew(ctx context.Context, request wire.Request, controller *holder.LocalTenantController) any {
+func handleLeaseRenew(ctx context.Context, request daemonkit.Request, controller *holder.LocalTenantController) any {
 	var input leaseRenewRequest
-	if err := decodeControlRequest(request.Payload, &input); err != nil {
+	if err := decodeControlRequest(request.Body, &input); err != nil {
 		return leaseResponse{controlHeader: controlErrorHeader(err)}
 	}
 	value, err := controller.RenewFileProviderLease(ctx, input.Renew)
 	return leaseResponse{controlHeader: controlErrorHeader(err), Receipt: value}
 }
 
-func handleLeaseRelease(ctx context.Context, request wire.Request, controller *holder.LocalTenantController) any {
+func handleLeaseRelease(ctx context.Context, request daemonkit.Request, controller *holder.LocalTenantController) any {
 	var input leaseReleaseRequest
-	if err := decodeControlRequest(request.Payload, &input); err != nil {
+	if err := decodeControlRequest(request.Body, &input); err != nil {
 		return leaseResponse{controlHeader: controlErrorHeader(err)}
 	}
 	value, err := controller.ReleaseFileProviderLease(ctx, input.Receipt)
@@ -550,15 +551,4 @@ func classifyControlError(err error) ControlErrorCode {
 	default:
 		return ControlErrorFailed
 	}
-}
-
-func controlSessionDone(events <-chan wire.Event) <-chan struct{} {
-	done := make(chan struct{})
-	go func() {
-		for event := range events {
-			_ = event
-		}
-		close(done)
-	}()
-	return done
 }

@@ -2,20 +2,11 @@ package pool
 
 import (
 	"context"
-	"crypto/sha256"
 	"testing"
 	"time"
 
 	"github.com/yasyf/daemonkit"
-	"github.com/yasyf/daemonkit/proc"
 )
-
-func poolTestGeneration(label string) proc.OwnerGeneration {
-	digest := sha256.Sum256([]byte(label))
-	var generation proc.OwnerGeneration
-	copy(generation[:], digest[:len(generation)])
-	return generation
-}
 
 func poolTestRunner(t *testing.T, recordPath string) *workerRuntime {
 	t.Helper()

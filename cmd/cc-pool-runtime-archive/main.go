@@ -31,6 +31,7 @@ const (
 
 var (
 	embeddedHolder         holderbridge.Process
+	embeddedTenants        tenantfs.Lane
 	embeddedHolderStopping atomic.Bool
 )
 
@@ -77,6 +78,9 @@ func startHolder(ctx context.Context, requiredAppGroup string) error {
 		ctx, runtime.LocalTenantController(), claudeAuthorityPolicy(),
 	)
 	if err == nil {
+		err = embeddedTenants.Start(ctx, runtime.LocalTenantController())
+	}
+	if err == nil {
 		return nil
 	}
 	cleanupCtx, cancel := context.WithTimeout(
@@ -114,7 +118,9 @@ func CCPoolFuseKitStop() C.int32_t {
 		context.Background(), holderbridge.RuntimeShutdownTimeout,
 	)
 	defer cancel()
-	return operationStatus("runtime shutdown", embeddedHolder.Close(ctx))
+	return operationStatus("runtime shutdown", errors.Join(
+		embeddedTenants.Close(ctx), embeddedHolder.Close(ctx),
+	))
 }
 
 func newHolderRuntime(ctx context.Context, requiredAppGroup string) (*holder.Runtime, error) {
@@ -134,7 +140,6 @@ func newHolderRuntime(ctx context.Context, requiredAppGroup string) (*holder.Run
 		Owner: tenantfs.SourceAuthorityFleetOwner, Drivers: drivers,
 		CatalogAuthorizer: tenantfs.NewCatalogAuthorizer(),
 		Authorizer:        tenantfs.NewMountAuthorizer(),
-		BusinessHandlers:  tenantfs.BusinessHandlers(),
 	})
 }
 

@@ -21,7 +21,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/testhome"
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/cc-pool/internal/workerexec"
 )
 
 type credentialCASTestTaskRunner struct{}
@@ -31,20 +31,20 @@ type credentialCASTestResult struct {
 	err      error
 }
 
-func (credentialCASTestTaskRunner) Run(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
+func (credentialCASTestTaskRunner) Run(ctx context.Context, task workerexec.CommandRequest) (workerexec.CommandResult, error) {
 	if len(task.Args) != 1 || task.Args[0] != casWorkerArgument {
-		return worker.CommandResult{}, errors.New("unexpected credential CAS test task")
+		return workerexec.CommandResult{}, errors.New("unexpected credential CAS test task")
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return worker.CommandResult{}, err
+		return workerexec.CommandResult{}, err
 	}
 	if len(task.Env) != 1 || task.Env[0] != "HOME="+home {
-		return worker.CommandResult{}, fmt.Errorf("credential CAS worker environment is not exact: %v", task.Env)
+		return workerexec.CommandResult{}, fmt.Errorf("credential CAS worker environment is not exact: %v", task.Env)
 	}
 	var output bytes.Buffer
 	err = RunCredentialCASWorker(ctx, bytes.NewReader(task.Stdin), &output)
-	return worker.CommandResult{Stdout: output.Bytes()}, err
+	return workerexec.CommandResult{Stdout: output.Bytes()}, err
 }
 
 func TestCredentialCASKeychainWrite(t *testing.T) {

@@ -7,37 +7,43 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/oauth"
+	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/workerexec"
+	"github.com/yasyf/daemonkit"
 )
 
 const hostSyncCommandTimeout = 10 * time.Minute
 
-// OpenHostSyncWorker opens child-local state with its own claimed disposable workers.
-func OpenHostSyncWorker(ctx context.Context) (*Manager, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	workers, scanner, err := newWorkerRuntimeAt(
-		ctx, HostSyncWorkerStorePath(), HostSyncChildStorePath(), true,
-	)
-	if err != nil {
-		return nil, err
-	}
+// OpenHostSyncWorker opens child-local state with its own disposable workers,
+// bound to the process scope synckit's helper runtime handed Prepare.
+func OpenHostSyncWorker(scope daemonkit.Ctx) (*Manager, error) {
 	db, err := store.Open(DBPath())
 	if err != nil {
-		_ = workers.close(ctx)
 		return nil, err
 	}
-	authority, err := NewWorkerAuthority(workers.pool, workers.executable, workers.owner)
+	workers, err := newWorkerRuntime(scope)
 	if err != nil {
-		_ = workers.close(ctx)
+		_ = db.Close()
+		return nil, err
+	}
+	scanner, err := procscan.NewWorkerScanner(workers, workers.executable)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	owner, err := store.MintOwnerRecord(time.Now())
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	authority, err := NewWorkerAuthority(workers, workers.executable, owner)
+	if err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	manager, err := NewManager(db, oauth.New(), scanner.Scan, authority)
 	if err != nil {
-		_ = workers.close(ctx)
 		_ = db.Close()
 		return nil, err
 	}

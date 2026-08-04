@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/version"
-	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/holder"
@@ -254,7 +253,7 @@ func testPreparationLease() PreparationLease {
 
 func exactRuntimeReadiness() holder.LocalRuntimeReadiness {
 	return holder.LocalRuntimeReadiness{
-		RuntimeBuild: version.String(), ProcessGeneration: proc.OwnerGeneration{1},
+		RuntimeBuild: version.String(), ProcessGeneration: catalog.ProcessGeneration{1},
 		ActivationGeneration: "activation-7",
 	}
 }
