@@ -8,6 +8,7 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/holderbridge"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/daemonkit/deploy"
@@ -80,14 +81,21 @@ func ApplyPackagedApp(ctx context.Context, candidateSourcePath string) (ServiceI
 	return ServiceInstallReceipt{Generation: generation, Activation: activation}, nil
 }
 
-// RequireActiveService converges the exact installed application and proves its live FuseKit runtime ready.
+// RequireActiveService proves the installed application's FuseKit runtime is
+// serving. It only observes: landing a generation is ApplyPackagedApp's to
+// perform and launchd's to sustain, so requiring the service never activates
+// one.
 func RequireActiveService(ctx context.Context) error {
-	controller, err := openInstalledDeployment(installedAppPath())
+	client, err := daemonkit.Open(tenantfs.Daemon())
 	if err != nil {
-		return err
+		return fmt.Errorf("CCPoolStatus: open the cc-pool tenant lane: %w", err)
 	}
-	_, err = activate(ctx, controller)
-	return err
+	readyCtx, cancel := context.WithTimeout(ctx, holderbridge.ReadinessContract().ObservationTimeout())
+	defer cancel()
+	if _, err := client.WaitReady(readyCtx); err != nil {
+		return fmt.Errorf("CCPoolStatus: require the live FuseKit runtime: %w", err)
+	}
+	return nil
 }
 
 // UninstallPackagedApp quiesces and removes the exact deploy-sealed installed application.

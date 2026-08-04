@@ -2,4 +2,6 @@
 
 package daemon
 
-const WireBuild = "com.yasyf.cc-pool.control/986fb1a10bd56a40369530da493bbb469178dffe045250558f3d7f16d2f18390/v1"
+import "github.com/yasyf/daemonkit"
+
+const RuntimeSchema daemonkit.Schema = "com.yasyf.cc-pool.control/986fb1a10bd56a40369530da493bbb469178dffe045250558f3d7f16d2f18390/v2"
