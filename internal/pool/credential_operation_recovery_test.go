@@ -1805,7 +1805,7 @@ func TestStrandedCredentialRecoveryFencesAdmissionAndRetries(t *testing.T) {
 		claimed.OwnerEpoch != operation.OwnerEpoch+1 {
 		t.Fatalf("stranded lane after claim = %+v err=%v", claimed, err)
 	}
-	if err := recovery.retryStrandedCredentialRecovery(t.Context(), account.ID); !errors.Is(err, ErrCredentialRecoveryPending) {
+	if _, err := recovery.retryStrandedCredentialRecovery(t.Context(), account.ID); !errors.Is(err, ErrCredentialRecoveryPending) {
 		t.Fatalf("fenced admission = %v, want ErrCredentialRecoveryPending", err)
 	}
 	fenced := recovery.StrandedCredentialRecoveries()
@@ -1817,8 +1817,9 @@ func TestStrandedCredentialRecoveryFencesAdmissionAndRetries(t *testing.T) {
 	if err := os.Symlink(linkTarget, account.ConfigDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := recovery.retryStrandedCredentialRecovery(t.Context(), account.ID); err != nil {
-		t.Fatalf("healed retry = %v", err)
+	cleared, err := recovery.retryStrandedCredentialRecovery(t.Context(), account.ID)
+	if err != nil || !cleared {
+		t.Fatalf("healed retry cleared=%v err=%v", cleared, err)
 	}
 	if _, err := st.CredentialOperationByToken(operation.Token); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("stranded lane survived retry = %v", err)
@@ -1829,8 +1830,8 @@ func TestStrandedCredentialRecoveryFencesAdmissionAndRetries(t *testing.T) {
 		!bytes.Equal(receipt.Owner, recovery.owner) {
 		t.Fatalf("settled receipt = %+v err=%v", receipt, err)
 	}
-	if err := recovery.retryStrandedCredentialRecovery(t.Context(), account.ID); err != nil {
-		t.Fatalf("unfenced account still errors = %v", err)
+	if cleared, err := recovery.retryStrandedCredentialRecovery(t.Context(), account.ID); err != nil || cleared {
+		t.Fatalf("unfenced account = cleared=%v err=%v", cleared, err)
 	}
 	if remaining := recovery.StrandedCredentialRecoveries(); len(remaining) != 0 {
 		t.Fatalf("fenced accounts after recovery = %+v", remaining)
@@ -1845,5 +1846,112 @@ func TestStrandedCredentialRecoveryFencesAdmissionAndRetries(t *testing.T) {
 	)
 	if admitted.Token == "" || !bytes.Equal(admitted.Owner, recovery.owner) {
 		t.Fatalf("healed account admission = %+v", admitted)
+	}
+}
+
+func TestStrandedRetryFencesObservedOperationsAndWaits(t *testing.T) {
+	st := openTestStore(t)
+	account := persistTestAccount(t, st, store.Account{
+		ID: 1, ConfigDir: t.TempDir(),
+		KeychainService: "service-fence-doors", KeychainAccount: "account-fence-doors",
+	})
+	credentials := credstest.NewFake()
+	old := credentialRecoveryManager(t, st, credentials, "fence-doors-old")
+	recovery := credentialRecoveryManager(t, st, credentials, "fence-doors-new")
+	before, err := old.credentialObservation(t.Context(), account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := beginRetiredCredentialOperation(
+		t, old, account, store.CredentialOperationEnsureFresh, store.CredentialTargetKeychain,
+		credentialIntentDigest(store.CredentialOperationEnsureFresh, "fence-doors"), before,
+	)
+	linkTarget, err := os.Readlink(account.ConfigDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(account.ConfigDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := recovery.ClaimForeignLanes(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	recovery.ClaimCredentialMutation = func(int) (func(), error) { return func() {}, nil }
+	_, err = runCredentialOperationObserved(
+		t.Context(), recovery, account, store.CredentialOperationEnsureFresh,
+		unitCredentialOperationCodec(store.CredentialTargetKeychain),
+		recovery.credentialObservation,
+		func(context.Context, *credentialOperationBoundary) (struct{}, error) {
+			return struct{}{}, nil
+		},
+	)
+	if !errors.Is(err, ErrCredentialRecoveryPending) {
+		t.Fatalf("observed operation on a fenced account = %v, want ErrCredentialRecoveryPending", err)
+	}
+	if _, err := recovery.waitCredentialOperation(t.Context(), operation.Token); !errors.Is(err, ErrCredentialRecoveryPending) {
+		t.Fatalf("wait on a stranded token = %v, want ErrCredentialRecoveryPending", err)
+	}
+	if err := os.Symlink(linkTarget, account.ConfigDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recovery.admitSyncedCredential(
+		t.Context(), account,
+		store.FileProviderPresentationIdentity{}, store.FileProviderPresentationIdentity{},
+		store.CredentialDigest{}, "",
+	); errors.Is(err, ErrCredentialRecoveryPending) {
+		t.Fatalf("synced admission still pending after heal = %v", err)
+	}
+	if remaining := recovery.StrandedCredentialRecoveries(); len(remaining) != 0 {
+		t.Fatalf("synced admission did not heal the fence = %+v", remaining)
+	}
+}
+
+func TestQuarantinedAccountRefusesObservedOperationsWithoutPanic(t *testing.T) {
+	st := openTestStore(t)
+	account := persistTestAccount(t, st, store.Account{
+		ID: 1, ConfigDir: t.TempDir(),
+		KeychainService: "service-quarantine-arm", KeychainAccount: "account-quarantine-arm",
+	})
+	credentials := credstest.NewFake()
+	old := credentialRecoveryManager(t, st, credentials, "quarantine-arm-old")
+	recovery := credentialRecoveryManager(t, st, credentials, "quarantine-arm-new")
+	before, err := old.credentialObservation(t.Context(), account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beginRetiredCredentialOperation(
+		t, old, account, store.CredentialOperationEnsureFresh, store.CredentialTargetKeychain,
+		credentialIntentDigest(store.CredentialOperationEnsureFresh, "quarantine-arm"), before,
+	)
+	linkTarget, err := os.Readlink(account.ConfigDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(account.ConfigDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := recovery.ClaimForeignLanes(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(linkTarget, account.ConfigDir); err != nil {
+		t.Fatal(err)
+	}
+	cleared, err := recovery.retryStrandedCredentialRecovery(t.Context(), account.ID)
+	if err != nil || !cleared {
+		t.Fatalf("healed retry cleared=%v err=%v", cleared, err)
+	}
+
+	recovery.ClaimCredentialMutation = func(int) (func(), error) { return func() {}, nil }
+	_, err = runCredentialOperationObserved(
+		t.Context(), recovery, account, store.CredentialOperationEnsureFresh,
+		unitCredentialOperationCodec(store.CredentialTargetKeychain),
+		recovery.credentialObservation,
+		func(context.Context, *credentialOperationBoundary) (struct{}, error) {
+			return struct{}{}, nil
+		},
+	)
+	if !errors.Is(err, store.ErrCredentialOperationRecoveryRequired) {
+		t.Fatalf("operation on a quarantined account = %v, want recovery-required refusal", err)
 	}
 }

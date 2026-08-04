@@ -130,12 +130,26 @@ func (m *Manager) StrandedCredentialRecoveries() []StrandedCredentialRecoverySta
 	return fenced
 }
 
-func (m *Manager) retryStrandedCredentialRecovery(ctx context.Context, accountID int) error {
+func (m *Manager) strandedTokenAccount(token string) (int, bool) {
+	m.credentialMu.Lock()
+	defer m.credentialMu.Unlock()
+	for accountID, strand := range m.strandedRecovery {
+		if strand.token == token {
+			return accountID, true
+		}
+	}
+	return 0, false
+}
+
+// retryStrandedCredentialRecovery re-attempts a fenced account's failed
+// settlement; cleared reports that a strand existed and is now resolved, so
+// callers holding pre-retry evidence re-derive it.
+func (m *Manager) retryStrandedCredentialRecovery(ctx context.Context, accountID int) (cleared bool, err error) {
 	m.credentialMu.Lock()
 	strand, stranded := m.strandedRecovery[accountID]
 	m.credentialMu.Unlock()
 	if !stranded {
-		return nil
+		return false, nil
 	}
 	pending := func(err error) error {
 		return fmt.Errorf("%w: account %d: %w", ErrCredentialRecoveryPending, accountID, err)
@@ -143,27 +157,27 @@ func (m *Manager) retryStrandedCredentialRecovery(ctx context.Context, accountID
 	operation, err := m.Store.CredentialOperationByToken(strand.token)
 	if errors.Is(err, sql.ErrNoRows) {
 		m.unstrandCredentialRecovery(accountID)
-		return nil
+		return true, nil
 	}
 	if err != nil {
-		return pending(err)
+		return false, pending(err)
 	}
 	account, err := m.credentialOperationAccount(operation)
 	if err != nil {
-		return pending(err)
+		return false, pending(err)
 	}
 	if !credentialOperationAccountCurrent(account, operation) {
-		return pending(store.ErrAccountGenerationChanged)
+		return false, pending(store.ErrAccountGenerationChanged)
 	}
 	if err := m.settleClaimedCredentialOperation(ctx, account, operation); err != nil {
 		var stranded strandedRecoveryError
 		if errors.As(err, &stranded) {
 			m.strandCredentialRecovery(accountID, stranded.token, stranded.cause)
 		}
-		return pending(err)
+		return false, pending(err)
 	}
 	m.unstrandCredentialRecovery(accountID)
-	return nil
+	return true, nil
 }
 
 func (m *Manager) claimForeignPendingAdds(

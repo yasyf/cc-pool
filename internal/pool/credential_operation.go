@@ -219,6 +219,9 @@ func runCredentialOperationObserved[T any](
 	arguments ...string,
 ) (T, error) {
 	var zero T
+	if _, err := manager.retryStrandedCredentialRecovery(ctx, account.ID); err != nil {
+		return zero, err
+	}
 	expected, err := observe(ctx, account)
 	if err != nil {
 		return zero, err
@@ -344,8 +347,12 @@ func executeCredentialOperation[T any](
 	if err != nil {
 		return zero, err
 	}
-	if err := manager.retryStrandedCredentialRecovery(ctx, account.ID); err != nil {
+	cleared, err := manager.retryStrandedCredentialRecovery(ctx, account.ID)
+	if err != nil {
 		return zero, err
+	}
+	if cleared {
+		return zero, errCredentialOperationRetry
 	}
 	for {
 		begin, err := manager.Store.BeginCredentialOperation(
@@ -394,6 +401,9 @@ func executeCredentialOperation[T any](
 			}
 			return replayCredentialOperation(ctx, manager, account, codec, receipt)
 		case errors.Is(err, store.ErrCredentialOperationRecoveryRequired):
+			if begin.Active == nil {
+				return zero, err
+			}
 			operation := *begin.Active
 			receipt, waitErr := manager.waitCredentialOperation(ctx, operation.Token)
 			if errors.Is(waitErr, sql.ErrNoRows) {
@@ -930,6 +940,11 @@ func (m *Manager) waitCredentialOperation(
 	ctx context.Context,
 	token string,
 ) (store.CredentialOperationReceipt, error) {
+	if accountID, stranded := m.strandedTokenAccount(token); stranded {
+		if _, err := m.retryStrandedCredentialRecovery(ctx, accountID); err != nil {
+			return store.CredentialOperationReceipt{}, err
+		}
+	}
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
 	for {

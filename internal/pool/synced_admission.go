@@ -99,6 +99,9 @@ func (m *Manager) admitSyncedCredential(
 		return false, err
 	}
 	defer func() { resultErr = errors.Join(resultErr, lease.Release(ctx)) }()
+	if _, err := m.retryStrandedCredentialRecovery(ctx, account.ID); err != nil {
+		return false, err
+	}
 	if err := m.requireCredentialMutationAllowed(account); err != nil {
 		return false, err
 	}
