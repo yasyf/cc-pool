@@ -23,7 +23,7 @@ const crossEraGateTimeout = 90 * time.Second
 // positive code reports a launchctl exit status; an error means the command
 // never ran.
 func launchctlRunner(ctx context.Context, path string, args ...string) (string, int, error) {
-	out, err := exec.CommandContext(ctx, path, args...).CombinedOutput()
+	out, err := exec.CommandContext(ctx, path, args...).CombinedOutput() //nolint:gosec // G204 flags args: daemonkit hands this runner the /bin/launchctl constant and its own ValidateLabel-checked verbs, and argv form reaches no shell.
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
 		return string(out), exitErr.ExitCode(), nil

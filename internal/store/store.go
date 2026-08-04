@@ -495,7 +495,7 @@ func canonicalDatabasePath(path string) (string, error) {
 }
 
 func requireSingleLinkDatabase(path string) error {
-	info, err := os.Lstat(path)
+	info, err := os.Lstat(path) //nolint:gosec // G703 traces the taint from this package's own TestMain os.Getenv; canonicalDatabasePath has already made path absolute and symlink-free, and every production caller names pool.DBPath().
 	if err != nil {
 		return fmt.Errorf("inspect store database: %w", err)
 	}
