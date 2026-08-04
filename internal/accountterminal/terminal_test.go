@@ -13,27 +13,30 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit"
 )
 
 const terminalTestTimeout = 8 * time.Second
 
-func newTerminalTestManager(t *testing.T) (*Manager, *proc.FileStore) {
+func newTerminalTestManager(t *testing.T) *Manager {
 	t.Helper()
-	store := &proc.FileStore{Path: filepath.Join(t.TempDir(), "processes.db")}
-	generation, err := proc.ProcessGeneration()
+	recordPath := filepath.Join(t.TempDir(), "processes.db")
+	openCtx, cancel := context.WithTimeout(context.Background(), terminalTestTimeout)
+	defer cancel()
+	owned, err := daemonkit.OwnProcesses(openCtx, recordPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reaper := &proc.Reaper{
-		Store: store, Generation: generation,
-		Grace: terminationGrace, Settlement: 2 * time.Second,
-	}
-	pool, err := NewManager(2, reaper)
+	t.Cleanup(func() { assertTerminalStoreEmpty(t, recordPath) })
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), terminalTestTimeout)
+		defer cancel()
+		if err := owned.Close(ctx); err != nil {
+			t.Errorf("close ownership scope: %v", err)
+		}
+	})
+	pool, err := NewManager(2, owned.Ctx(context.Background()))
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := pool.Recover(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -43,7 +46,7 @@ func newTerminalTestManager(t *testing.T) (*Manager, *proc.FileStore) {
 			t.Errorf("close terminal manager: %v", err)
 		}
 	})
-	return pool, store
+	return pool
 }
 
 func startTerminalTest(t *testing.T, pool *Manager, script string, size TerminalSize) *Terminal {
@@ -128,63 +131,51 @@ func waitTerminalTest(t *testing.T, terminal *Terminal) TerminalOutcome {
 	return outcome
 }
 
-func assertTerminalStoreEmpty(t *testing.T, store *proc.FileStore) {
+func assertTerminalStoreEmpty(t *testing.T, recordPath string) {
 	t.Helper()
-	records, err := store.Load(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), terminalTestTimeout)
+	defer cancel()
+	owned, err := daemonkit.OwnProcesses(ctx, recordPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(records) != 0 {
-		t.Fatalf("durable terminal records remain: %+v", records)
+	reclaimed := owned.Reclaimed()
+	if err := owned.Close(ctx); err != nil {
+		t.Errorf("close verification scope: %v", err)
+	}
+	if len(reclaimed) != 0 {
+		t.Fatalf("durable terminal records remain: %+v", reclaimed)
 	}
 }
 
-func TestManagerRequiresRecoveryAndPermanentlyClosesAdmission(t *testing.T) {
-	store := &proc.FileStore{Path: filepath.Join(t.TempDir(), "processes.db")}
-	generation, err := proc.ProcessGeneration()
+func TestManagerPermanentlyClosesAdmission(t *testing.T) {
+	openCtx, cancel := context.WithTimeout(context.Background(), terminalTestTimeout)
+	defer cancel()
+	owned, err := daemonkit.OwnProcesses(openCtx, filepath.Join(t.TempDir(), "processes.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager, err := NewManager(1, &proc.Reaper{Store: store, Generation: generation})
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), terminalTestTimeout)
+		defer cancel()
+		if err := owned.Close(ctx); err != nil {
+			t.Errorf("close ownership scope: %v", err)
+		}
+	}()
+	manager, err := NewManager(1, owned.Ctx(context.Background()))
 	if err != nil {
-		t.Fatal(err)
-	}
-	spec := TerminalSpec{Path: "/usr/bin/true"}
-	if _, err := manager.Start(t.Context(), spec); err == nil || !strings.Contains(err.Error(), "recovery has not completed") {
-		t.Fatalf("Start before recovery = %v", err)
-	}
-	if err := manager.Recover(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if err := manager.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := manager.Start(t.Context(), spec); err == nil || !strings.Contains(err.Error(), "manager is closed") {
+	if _, err := manager.Start(t.Context(), TerminalSpec{Path: "/usr/bin/true"}); err == nil || !strings.Contains(err.Error(), "manager is closed") {
 		t.Fatalf("Start after Close = %v", err)
 	}
 }
 
-func TestManagerCloseRetriesFailedRecoveryBeforeSettlement(t *testing.T) {
-	store := &proc.FileStore{Path: t.TempDir()}
-	generation, err := proc.ProcessGeneration()
-	if err != nil {
-		t.Fatal(err)
-	}
-	manager, err := NewManager(1, &proc.Reaper{Store: store, Generation: generation})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := manager.Recover(t.Context()); err == nil {
-		t.Fatal("Recover unexpectedly accepted a directory as its process store")
-	}
-	store.Path = filepath.Join(t.TempDir(), "processes.db")
-	if err := manager.Close(t.Context()); err != nil {
-		t.Fatalf("Close did not settle recovery after the store was repaired: %v", err)
-	}
-}
-
 func TestManagerCloseCancelsAndJoinsLiveTerminal(t *testing.T) {
-	manager, store := newTerminalTestManager(t)
+	manager := newTerminalTestManager(t)
 	terminal := startTerminalTest(t, manager, `trap '' HUP TERM; printf ready; while :; do sleep 1; done`, TerminalSize{})
 	attachment := attachTerminalTest(t, terminal, DetachOnDisconnect)
 	receiveUntil(t, attachment, "ready")
@@ -195,11 +186,10 @@ func TestManagerCloseCancelsAndJoinsLiveTerminal(t *testing.T) {
 	if err != nil || outcome.Kind != TerminalCanceled {
 		t.Fatalf("Wait after manager close = %+v, %v", outcome, err)
 	}
-	assertTerminalStoreEmpty(t, store)
 }
 
 func TestTerminalPTYResizeInputEOFAndTypedExit(t *testing.T) {
-	pool, store := newTerminalTestManager(t)
+	pool := newTerminalTestManager(t)
 	terminal := startTerminalTest(t, pool, `
 test -t 0 && test -t 1 && printf 'tty-ok\n'
 stty size
@@ -236,11 +226,10 @@ exit 7
 			t.Errorf("output missing %q: %q", want, output)
 		}
 	}
-	assertTerminalStoreEmpty(t, store)
 }
 
 func TestTerminalReportsSignalExactly(t *testing.T) {
-	pool, store := newTerminalTestManager(t)
+	pool := newTerminalTestManager(t)
 	terminal := startTerminalTest(t, pool, `kill -TERM $$`, TerminalSize{})
 	attachment := attachTerminalTest(t, terminal, DetachOnDisconnect)
 	_ = receiveAll(t, attachment)
@@ -248,11 +237,10 @@ func TestTerminalReportsSignalExactly(t *testing.T) {
 	if outcome.Kind != TerminalSignaled || outcome.Signal != syscall.SIGTERM || outcome.ExitCode != -1 {
 		t.Fatalf("outcome = %+v", outcome)
 	}
-	assertTerminalStoreEmpty(t, store)
 }
 
 func TestTerminalDetachAndReattach(t *testing.T) {
-	pool, store := newTerminalTestManager(t)
+	pool := newTerminalTestManager(t)
 	terminal := startTerminalTest(t, pool, `printf 'ready\n'; IFS= read -r line; printf 'done:%s\n' "$line"`, TerminalSize{})
 	first := attachTerminalTest(t, terminal, DetachOnDisconnect)
 	_ = receiveUntil(t, first, "ready")
@@ -271,11 +259,10 @@ func TestTerminalDetachAndReattach(t *testing.T) {
 	if outcome.Kind != TerminalExited || outcome.ExitCode != 0 || !strings.Contains(output, "done:right") {
 		t.Fatalf("outcome=%+v output=%q", outcome, output)
 	}
-	assertTerminalStoreEmpty(t, store)
 }
 
 func TestTerminalLostAttachNeverDispatches(t *testing.T) {
-	pool, store := newTerminalTestManager(t)
+	pool := newTerminalTestManager(t)
 	marker := filepath.Join(t.TempDir(), "dispatched")
 	ctx, cancel := context.WithTimeout(context.Background(), terminalTestTimeout)
 	defer cancel()
@@ -294,11 +281,10 @@ func TestTerminalLostAttachNeverDispatches(t *testing.T) {
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("undispatched marker exists or stat failed unexpectedly: %v", err)
 	}
-	assertTerminalStoreEmpty(t, store)
 }
 
 func TestTerminalSlowObserverDoesNotStallController(t *testing.T) {
-	pool, store := newTerminalTestManager(t)
+	pool := newTerminalTestManager(t)
 	terminal := startTerminalTest(t, pool, `
 printf 'ready-start\n'
 IFS= read -r _
@@ -341,9 +327,8 @@ printf 'done:%s\n' "$line"
 	if _, err := observer.Receive(context.Background()); !errors.Is(err, ErrTerminalOutputLagged) {
 		t.Fatalf("slow observer receive = %v, want ErrTerminalOutputLagged", err)
 	}
-	owned, err := pool.reaper.Owns(terminal.Record())
-	if err != nil || !owned {
-		t.Fatalf("slow observer stopped terminal: owned=%v err=%v", owned, err)
+	if err := syscall.Kill(terminal.PID(), 0); err != nil {
+		t.Fatalf("slow observer stopped terminal: %v", err)
 	}
 	if err := controller.Send(context.Background(), TerminalInput{Kind: TerminalInputBytes, Data: []byte("finish\n")}); err != nil {
 		t.Fatal(err)
@@ -353,11 +338,10 @@ printf 'done:%s\n' "$line"
 	if outcome.Kind != TerminalExited || outcome.ExitCode != 0 {
 		t.Fatalf("outcome = %+v", outcome)
 	}
-	assertTerminalStoreEmpty(t, store)
 }
 
 func TestTerminalObserversReplayAndControllerHandoff(t *testing.T) {
-	pool, store := newTerminalTestManager(t)
+	pool := newTerminalTestManager(t)
 	terminal := startTerminalTest(t, pool, `printf 'ready\n'; IFS= read -r line; printf 'done:%s\n' "$line"`, TerminalSize{})
 	firstObserver := observeTerminalTest(t, terminal)
 	controller := attachTerminalTest(t, terminal, CancelOnDisconnect)
@@ -389,7 +373,6 @@ func TestTerminalObserversReplayAndControllerHandoff(t *testing.T) {
 	if outcome.Kind != TerminalExited || outcome.ExitCode != 0 {
 		t.Fatalf("outcome = %+v", outcome)
 	}
-	assertTerminalStoreEmpty(t, store)
 }
 
 func TestTerminalExactReplayCursorAndSettledAcknowledgement(t *testing.T) {
@@ -450,7 +433,7 @@ func TestTerminalExactReplayCursorAndSettledAcknowledgement(t *testing.T) {
 }
 
 func TestTerminalControllerLeaseRenewalAndExpiryFence(t *testing.T) {
-	pool, store := newTerminalTestManager(t)
+	pool := newTerminalTestManager(t)
 	terminal := startTerminalTest(t, pool, `IFS= read -r line; printf 'done:%s\n' "$line"`, TerminalSize{})
 	observer := observeTerminalTest(t, terminal)
 	first, err := observer.ClaimControl(context.Background(), DetachOnDisconnect, 80*time.Millisecond)
@@ -489,11 +472,10 @@ func TestTerminalControllerLeaseRenewalAndExpiryFence(t *testing.T) {
 	if outcome.Kind != TerminalExited {
 		t.Fatalf("outcome = %+v", outcome)
 	}
-	assertTerminalStoreEmpty(t, store)
 }
 
 func TestTerminalDetachedSessionExpiresAndReaps(t *testing.T) {
-	pool, store := newTerminalTestManager(t)
+	pool := newTerminalTestManager(t)
 	ctx, cancel := context.WithTimeout(context.Background(), terminalTestTimeout)
 	defer cancel()
 	terminal, err := pool.Start(ctx, TerminalSpec{
@@ -516,30 +498,19 @@ func TestTerminalDetachedSessionExpiresAndReaps(t *testing.T) {
 	if _, err := terminal.Attach(context.Background(), TerminalAttachmentSpec{Role: TerminalObserver}); !errors.Is(err, ErrTerminalDetachExpired) {
 		t.Fatalf("attach after detached deadline = %v", err)
 	}
-	assertTerminalStoreEmpty(t, store)
 }
 
-func TestTerminalOutcomeDigestBindsCompleteRecord(t *testing.T) {
-	generation, err := proc.ProcessGeneration()
-	if err != nil {
-		t.Fatal(err)
-	}
-	base := TerminalOutcome{
-		Kind: TerminalExited, ExitCode: 0,
-		Record: proc.Record{
-			RecoveryID: RecoveryID, PID: 42, StartTime: "start", Boot: "boot-a",
-			Comm: "task", Executable: "/bin/task", Generation: generation, ProcessGroup: true, SessionID: 42,
-		},
-	}
+func TestTerminalOutcomeDigestBindsProcessIdentity(t *testing.T) {
+	base := TerminalOutcome{Kind: TerminalExited, ExitCode: 0, PID: 42}
 	changed := base
-	changed.Record.Boot = "boot-b"
+	changed.PID = 43
 	if terminalOutcomeDigest(base) == terminalOutcomeDigest(changed) {
-		t.Fatal("terminal digest ignored boot identity")
+		t.Fatal("terminal digest ignored process identity")
 	}
 }
 
 func TestTerminalAttachmentLimitAndReleasedControllerClaim(t *testing.T) {
-	pool, store := newTerminalTestManager(t)
+	pool := newTerminalTestManager(t)
 	terminal := startTerminalTest(t, pool, `IFS= read -r line; printf 'done:%s\n' "$line"`, TerminalSize{})
 	attachments := make([]*TerminalAttachment, 0, TerminalAttachmentLimit)
 	for range TerminalAttachmentLimit - 1 {
@@ -567,11 +538,10 @@ func TestTerminalAttachmentLimitAndReleasedControllerClaim(t *testing.T) {
 	if outcome.Kind != TerminalExited || outcome.ExitCode != 0 {
 		t.Fatalf("outcome = %+v", outcome)
 	}
-	assertTerminalStoreEmpty(t, store)
 }
 
 func TestTerminalAcceptedInputSettlesAfterContextCancellation(t *testing.T) {
-	pool, store := newTerminalTestManager(t)
+	pool := newTerminalTestManager(t)
 	terminal := startTerminalTest(t, pool, `sleep 60`, TerminalSize{})
 	writeStarted := make(chan struct{})
 	releaseWrite := make(chan struct{})
@@ -611,11 +581,10 @@ func TestTerminalAcceptedInputSettlesAfterContextCancellation(t *testing.T) {
 	if outcome.Kind != TerminalCanceled {
 		t.Fatalf("outcome = %+v", outcome)
 	}
-	assertTerminalStoreEmpty(t, store)
 }
 
 func TestTerminalCancellationKillsAndReapsDescendant(t *testing.T) {
-	pool, store := newTerminalTestManager(t)
+	pool := newTerminalTestManager(t)
 	pidPath := filepath.Join(t.TempDir(), "descendant.pid")
 	script := fmt.Sprintf(`(trap '' TERM; while :; do sleep 1; done) & child=$!; printf '%%s' "$child" > %q; wait`, pidPath)
 	terminal := startTerminalTest(t, pool, script, TerminalSize{})
@@ -654,5 +623,4 @@ func TestTerminalCancellationKillsAndReapsDescendant(t *testing.T) {
 	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
 		t.Fatalf("descendant %d remains: %v", pid, err)
 	}
-	assertTerminalStoreEmpty(t, store)
 }
