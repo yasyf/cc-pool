@@ -260,7 +260,7 @@ func newMaterializeService(t *testing.T) (*Service, *pool.Manager, *credstest.Fa
 		credentialClaim.Lock()
 		return credentialClaim.Unlock, nil
 	}
-	t.Cleanup(func() { _ = m.Close(t.Context()) })
+	t.Cleanup(func() { _ = m.Close() })
 	m.Creds = credentials
 	m.OAuth = stubRefresher{}
 	m.BuildCredentialWritePublication = func(

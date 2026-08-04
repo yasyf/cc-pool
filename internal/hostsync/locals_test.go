@@ -14,6 +14,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/testhome"
+	"github.com/yasyf/daemonkit"
 )
 
 // localsFixture is a temp-dir pool Manager for the Locals builder:
@@ -23,14 +24,32 @@ type localsFixture struct {
 	fk *credstest.Fake
 }
 
-func newLocalsFixture(t *testing.T) *localsFixture {
+func hostSyncTestScope(t *testing.T) daemonkit.Ctx {
 	t.Helper()
-	testhome.Sandbox(t, t.TempDir())
-	m, err := pool.OpenHostSyncWorker(t.Context())
+	scopeCtx, cancelScope := context.WithTimeout(t.Context(), time.Minute)
+	t.Cleanup(cancelScope)
+	owned, err := daemonkit.OwnProcesses(scopeCtx, filepath.Join(t.TempDir(), "workers.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = m.Close(t.Context()) })
+	t.Cleanup(func() {
+		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
+		defer cancel()
+		if err := owned.Close(closeCtx); err != nil {
+			t.Errorf("close test process scope: %v", err)
+		}
+	})
+	return owned.Ctx(scopeCtx)
+}
+
+func newLocalsFixture(t *testing.T) *localsFixture {
+	t.Helper()
+	testhome.Sandbox(t, t.TempDir())
+	m, err := pool.OpenHostSyncWorker(hostSyncTestScope(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
 	fk := credstest.NewFake()
 	m.Creds = backingCredentials{fk}
 	m.OAuth = stubRefresher{}
