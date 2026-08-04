@@ -98,7 +98,7 @@ func boundDomain(id catalog.TenantID) (catalogproto.DomainID, error) {
 }
 
 func validCatalogIdentity(uid int, identity catalogservice.Identity) bool {
-	return identity.Caller.PID > 1 && identity.Caller.UID == uint32(uid)
+	return identity.Caller.PID > 1 && int64(identity.Caller.UID) == int64(uid)
 }
 
 var (
