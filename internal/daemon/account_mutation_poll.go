@@ -124,7 +124,7 @@ func (s *Server) handleAccountMutationPoll(
 			})
 		}
 	}
-	pa, err := s.accountMutationAttachment(req.Session, operationID, running, &poll.TerminalCursor)
+	pa, err := s.accountMutationAttachment(req.Session, operationID, running, &poll.TerminalCursor) //nolint:contextcheck // the attachment and its teardown follow the daemon lifetime, not this poll.
 	if err != nil {
 		return daemonkit.Reply{}, &daemonkit.ProductError{Message: err.Error()}
 	}
@@ -535,7 +535,7 @@ func (pa *pollAttachment) reposition(
 	if lifetime == nil {
 		return errors.New("account mutation lifetime is unavailable")
 	}
-	attachment, err := running.terminal.Attach(lifetime, accountterminal.TerminalAttachmentSpec{
+	attachment, err := running.terminal.Attach(lifetime, accountterminal.TerminalAttachmentSpec{ //nolint:contextcheck // the replacement outlives this poll; its life is the daemon lifetime, which never carries a deadline.
 		Role:             accountterminal.TerminalObserver,
 		DisconnectPolicy: accountterminal.DetachOnDisconnect,
 		Cursor:           &accountterminal.TerminalOutputCursor{NextSequence: cursor},
@@ -607,7 +607,7 @@ func (pa *pollAttachment) page(parkCtx context.Context) (chunks [][]byte, settle
 	buffered, cancel := context.WithCancel(context.Background())
 	cancel()
 	for len(chunks) < PollPageChunks {
-		output, receiveErr := attachment.Receive(buffered)
+		output, receiveErr := attachment.Receive(buffered) //nolint:contextcheck // deliberately spent: drains buffered output without parking.
 		if receiveErr == nil {
 			pa.observe(output)
 			chunks = append(chunks, output.Data)
@@ -637,7 +637,7 @@ func (pa *pollAttachment) page(parkCtx context.Context) (chunks [][]byte, settle
 	pa.observe(output)
 	chunks = [][]byte{output.Data}
 	for len(chunks) < PollPageChunks {
-		output, receiveErr := attachment.Receive(buffered)
+		output, receiveErr := attachment.Receive(buffered) //nolint:contextcheck // deliberately spent: drains buffered output without parking.
 		if receiveErr != nil {
 			break
 		}
@@ -645,14 +645,6 @@ func (pa *pollAttachment) page(parkCtx context.Context) (chunks [][]byte, settle
 		chunks = append(chunks, output.Data)
 	}
 	return chunks, false, nil
-}
-
-// ensureControl claims the terminal controller for this attachment, waiting
-// out a still-leased predecessor under the caller's own deadline.
-func (pa *pollAttachment) ensureControl(ctx context.Context) error {
-	pa.controlMu.Lock()
-	defer pa.controlMu.Unlock()
-	return pa.claimControlLocked(ctx)
 }
 
 // sendInput claims control if needed and sends under the same controlMu hold,
@@ -690,7 +682,7 @@ func (pa *pollAttachment) claimControlLocked(ctx context.Context) error {
 			pa.mu.Lock()
 			pa.controller = true
 			pa.mu.Unlock()
-			pa.startControlRenewal()
+			pa.startControlRenewal() //nolint:contextcheck // renewal follows the daemon lifetime, not this claim's caller.
 			return nil
 		case errors.Is(err, accountterminal.ErrTerminalControllerAttached):
 		default:

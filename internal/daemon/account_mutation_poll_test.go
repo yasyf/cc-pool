@@ -52,7 +52,7 @@ func TestPollSupersessionSerializesPagesAndRepositionsTheCursor(t *testing.T) {
 	}
 
 	pa.pageMu.Lock()
-	chunksA, settled, err := pa.page(nil)
+	chunksA, settled, err := pa.page(t.Context())
 	if err != nil || settled || len(chunksA) != 1 || string(chunksA[0]) != "c0" {
 		t.Fatalf("predecessor page = %q settled=%t err=%v", chunksA, settled, err)
 	}
@@ -69,7 +69,7 @@ func TestPollSupersessionSerializesPagesAndRepositionsTheCursor(t *testing.T) {
 			second <- pollResult{err: err}
 			return
 		}
-		chunks, _, err := pa.page(nil)
+		chunks, _, err := pa.page(t.Context())
 		second <- pollResult{chunks: chunks, err: err}
 	}()
 

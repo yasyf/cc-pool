@@ -188,7 +188,10 @@ func (c *Client) HealthContext(ctx context.Context) (*HealthResponse, error) {
 
 // ObserveHealthContext reads the product half of Health.Detail through the
 // control lane, which answers during drain and without readiness. daemonkit
-// itself pins the serving PID and generation at attach.
+// itself pins the serving PID and generation at attach. Lifecycle readiness
+// derives from the live Health.Phase, which daemonkit recomputes on every
+// call, folded over the decoded detail: the detail replays the last report,
+// so on its own it can say a draining daemon still serves.
 func (c *Client) ObserveHealthContext(ctx context.Context) (*HealthResponse, error) {
 	if _, stated := ctx.Deadline(); !stated {
 		var cancel context.CancelFunc
@@ -225,6 +228,8 @@ func decodeDaemonHealthDetail(health daemonkit.Health) (*HealthResponse, error) 
 			response.Schema, response.RuntimeBuild, response.State,
 		)
 	}
+	response.Ready = response.Ready && health.Phase == daemonkit.PhaseReady
+	response.Draining = response.Draining || health.Phase == daemonkit.PhaseDraining
 	return &response, nil
 }
 

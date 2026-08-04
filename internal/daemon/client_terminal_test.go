@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -86,7 +87,7 @@ func TestAccountMutationTerminalEndpointDrainsBufferedPageBeforeEOF(t *testing.T
 	if second.Sequence != 4 || string(second.Data) != "second" {
 		t.Fatalf("second output = %#v", second)
 	}
-	if _, err := endpoint.Receive(t.Context()); err != io.EOF {
+	if _, err := endpoint.Receive(t.Context()); !errors.Is(err, io.EOF) {
 		t.Fatalf("drained endpoint Receive = %v, want io.EOF", err)
 	}
 	if endpoint.next != 5 {

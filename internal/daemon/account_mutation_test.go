@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -513,6 +514,7 @@ func TestAccountMutationDisconnectBeforeInputLeavesAwaitingInput(t *testing.T) {
 		t.Fatalf("resume after disconnect = %+v err=%v", resumed, err)
 	}
 }
+
 func TestAccountMutationDuplicateTerminalAttachRunsOneSemanticOperation(t *testing.T) {
 	s, _, account := newAccountMutationTestServer(t, true)
 	started := make(chan struct{})
@@ -564,6 +566,124 @@ func TestAccountMutationDuplicateTerminalAttachRunsOneSemanticOperation(t *testi
 	}
 	if loginCalls.Load() != 1 {
 		t.Fatalf("duplicate attach started %d terminal workers, want 1", loginCalls.Load())
+	}
+}
+
+// heldTerminal acknowledges Cancel without settling, so the shutdown watcher
+// parks mid-settlement until the test settles the terminal itself.
+type heldTerminal struct {
+	*testAccountMutationTerminal
+	cancelRequested chan struct{}
+	once            sync.Once
+}
+
+func (t *heldTerminal) Cancel(context.Context) error {
+	t.once.Do(func() { close(t.cancelRequested) })
+	return nil
+}
+
+type heldTerminalStarter struct {
+	terminal *heldTerminal
+	started  chan struct{}
+}
+
+func (s heldTerminalStarter) Start(
+	context.Context,
+	store.AccountMutation,
+	accountterminal.TerminalSize,
+) (accountMutationTerminal, error) {
+	s.terminal.start = func(accountterminal.TerminalInput) { close(s.started) }
+	return s.terminal, nil
+}
+
+func (heldTerminalStarter) LoginReady(context.Context, store.AccountMutation) (bool, error) {
+	return false, nil
+}
+
+// TestCloseRefusesTeardownWhileMutationSettlementRuns drives the shutdown
+// interleaving that freed the store under a live saga: the drain budget
+// expires with the terminal watcher still settling, Product.Close runs, and
+// the watcher resumes into the store. Close must hold everything until the
+// worker join completes — leaking on a pathological shutdown, never freeing.
+func TestCloseRefusesTeardownWhileMutationSettlementRuns(t *testing.T) {
+	s, _, account := newAccountMutationTestServer(t, true)
+	lifetime, cancelLifetime := context.WithCancel(t.Context())
+	s.accountMutationLifetime = lifetime
+	terminal := &heldTerminal{
+		testAccountMutationTerminal: newTestAccountMutationTerminal(),
+		cancelRequested:             make(chan struct{}),
+	}
+	started := make(chan struct{})
+	s.accountMutationTerminal = heldTerminalStarter{terminal: terminal, started: started}
+
+	request := AccountMutationRequest{
+		Kind: AccountMutationRelogin, Action: AccountMutationStartOrAttach, AccountID: account.ID,
+	}
+	begin, err := runAccountMutationTest(t, s, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Action = AccountMutationProvideInput
+	request.Fence = begin.Fence
+	request.Input = accountMutationInputPayload(t, []byte("\n"))
+	if _, err := runAccountMutationTest(t, s, request); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("terminal did not dispatch")
+	}
+
+	cancelLifetime()
+	select {
+	case <-terminal.cancelRequested:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not cancel the live terminal")
+	}
+
+	if err := s.Drain(daemonkit.Budget{}); err == nil {
+		t.Fatal("expired drain budget reported the worker join settled")
+	}
+	if err := s.Close(daemonkit.Budget{}); err == nil {
+		t.Fatal("Close released the store while the settlement watcher still ran")
+	}
+	if s.m == nil {
+		t.Fatal("Close nilled the manager under a live settlement watcher")
+	}
+
+	terminal.settle(accountterminal.TerminalOutcome{
+		Kind: accountterminal.TerminalCanceled, Digest: [32]byte{1},
+	}, nil)
+	joined := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(joined)
+	}()
+	select {
+	case <-joined:
+	case <-time.After(5 * time.Second):
+		t.Fatal("settlement watcher did not join after the terminal settled")
+	}
+	rearmed, err := s.m.Store.AccountMutation(store.AccountMutationID(begin.OperationID))
+	if err != nil {
+		t.Fatalf("resumed settlement lost the store: %v", err)
+	}
+	if rearmed.State != store.AccountMutationAwaitingInput {
+		t.Fatalf("resumed settlement state = %s, want the rearmed row", rearmed.State)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if err := s.Close(daemonkit.Budget{}); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("post-join close never proceeded")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if s.m != nil {
+		t.Fatal("post-join close retained the manager")
 	}
 }
 
