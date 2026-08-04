@@ -1,1 +1,1 @@
-{"v":1,"lamport":2,"session":"cfa0f537-f63b-4af9-844c-1efcf2ab6814","ops":[{"kind":"add_comment","body":"accountterminal migrated to daemonkit v0.21 Adopt/Tracked on branch dk-v021-migration: the three TerminateWithin sites (terminal.go :516/:1190/:1201) are gone — settlement rides Tracked.Stop under the package settleBudget; TrackGroup/Untrack/Reap/RecoveryID/proc.Record removed with them."}]}
+{"v":1,"lamport":3,"session":"cfa0f537-f63b-4af9-844c-1efcf2ab6814","ops":[{"kind":"set_criterion_status","id":"7467df7bf660767d625a5e60ab0356de","status":"met"}]}
