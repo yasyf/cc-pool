@@ -491,7 +491,10 @@ func TestCredentialCASRefreshPreservesTypedInvalidGrant(t *testing.T) {
 		t.Fatalf("invalid_grant changed credential: %+v, %v", got, err)
 	}
 	assertCredentialCASLocksGone(t, account.ConfigDir)
-	manager := &Manager{taskRunner: credentialCASTestTaskRunner{}, workerExecutable: "test-worker"}
+	manager := &Manager{
+		owner:      mintCredentialLockOwner(t),
+		taskRunner: credentialCASTestTaskRunner{}, workerExecutable: "test-worker",
+	}
 	publicPath, err := os.Readlink(account.ConfigDir)
 	if err != nil {
 		t.Fatal(err)
