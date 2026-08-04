@@ -1774,10 +1774,21 @@ func TestStrandedCredentialRecoveryFencesAdmissionAndRetries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	operation := beginRetiredCredentialOperation(
+	operation := beginCredentialOperation(
 		t, old, account, store.CredentialOperationEnsureFresh, store.CredentialTargetKeychain,
 		credentialIntentDigest(store.CredentialOperationEnsureFresh, "stranded"), before,
 	)
+	operation, err = st.MarkCredentialOperationApplying(operation.Fence(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, err = st.MarkCredentialOperationApplied(
+		operation.Fence(), before, store.CredentialTerminalSucceeded,
+		store.CredentialResultUnchanged, store.CredentialFailureNone, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	linkTarget, err := os.Readlink(account.ConfigDir)
 	if err != nil {
@@ -1797,6 +1808,11 @@ func TestStrandedCredentialRecoveryFencesAdmissionAndRetries(t *testing.T) {
 	if err := recovery.retryStrandedCredentialRecovery(t.Context(), account.ID); !errors.Is(err, ErrCredentialRecoveryPending) {
 		t.Fatalf("fenced admission = %v, want ErrCredentialRecoveryPending", err)
 	}
+	fenced := recovery.StrandedCredentialRecoveries()
+	if len(fenced) != 1 || fenced[0].AccountID != account.ID ||
+		fenced[0].Token != operation.Token || fenced[0].Cause == "" {
+		t.Fatalf("fenced accounts = %+v", fenced)
+	}
 
 	if err := os.Symlink(linkTarget, account.ConfigDir); err != nil {
 		t.Fatal(err)
@@ -1808,12 +1824,26 @@ func TestStrandedCredentialRecoveryFencesAdmissionAndRetries(t *testing.T) {
 		t.Fatalf("stranded lane survived retry = %v", err)
 	}
 	receipt, err := st.CredentialOperationReceipt(operation.Token)
-	if err != nil || receipt.TerminalStatus != store.CredentialTerminalQuarantined ||
-		receipt.Result != store.CredentialResultAmbiguous ||
+	if err != nil || receipt.TerminalStatus != store.CredentialTerminalSucceeded ||
+		receipt.Result != store.CredentialResultUnchanged ||
 		!bytes.Equal(receipt.Owner, recovery.owner) {
 		t.Fatalf("settled receipt = %+v err=%v", receipt, err)
 	}
 	if err := recovery.retryStrandedCredentialRecovery(t.Context(), account.ID); err != nil {
 		t.Fatalf("unfenced account still errors = %v", err)
+	}
+	if remaining := recovery.StrandedCredentialRecoveries(); len(remaining) != 0 {
+		t.Fatalf("fenced accounts after recovery = %+v", remaining)
+	}
+	after, err := recovery.credentialObservation(t.Context(), account)
+	if err != nil {
+		t.Fatalf("healed account observation = %v", err)
+	}
+	admitted := beginCredentialOperation(
+		t, recovery, account, store.CredentialOperationEnsureFresh, store.CredentialTargetKeychain,
+		credentialIntentDigest(store.CredentialOperationEnsureFresh, "stranded-after"), after,
+	)
+	if admitted.Token == "" || !bytes.Equal(admitted.Owner, recovery.owner) {
+		t.Fatalf("healed account admission = %+v", admitted)
 	}
 }

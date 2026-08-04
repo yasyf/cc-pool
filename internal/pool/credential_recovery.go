@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/store"
@@ -102,6 +103,31 @@ func (m *Manager) unstrandCredentialRecovery(accountID int) {
 	m.credentialMu.Lock()
 	defer m.credentialMu.Unlock()
 	delete(m.strandedRecovery, accountID)
+}
+
+// StrandedCredentialRecoveryStatus names one fenced account: a claimed lane
+// whose post-takeover settlement failed and awaits a successful retry.
+type StrandedCredentialRecoveryStatus struct {
+	AccountID int
+	Token     string
+	Cause     string
+}
+
+// StrandedCredentialRecoveries reports every account currently fenced from
+// credential admission, oldest account first, for the status and doctor
+// surfaces — a silently fenced account is otherwise visible only to a caller
+// who trips over ErrCredentialRecoveryPending.
+func (m *Manager) StrandedCredentialRecoveries() []StrandedCredentialRecoveryStatus {
+	m.credentialMu.Lock()
+	defer m.credentialMu.Unlock()
+	fenced := make([]StrandedCredentialRecoveryStatus, 0, len(m.strandedRecovery))
+	for accountID, strand := range m.strandedRecovery {
+		fenced = append(fenced, StrandedCredentialRecoveryStatus{
+			AccountID: accountID, Token: strand.token, Cause: strand.cause.Error(),
+		})
+	}
+	sort.Slice(fenced, func(i, j int) bool { return fenced[i].AccountID < fenced[j].AccountID })
+	return fenced
 }
 
 func (m *Manager) retryStrandedCredentialRecovery(ctx context.Context, accountID int) error {
