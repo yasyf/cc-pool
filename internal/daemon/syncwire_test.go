@@ -19,6 +19,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/testhome"
+	"github.com/yasyf/cc-pool/internal/workerexec"
 	"github.com/yasyf/synckit/hostregistry"
 )
 
@@ -226,6 +227,29 @@ func TestStartProductRuntimeClaimsForeignLanesBeforeTheHelperGoesLive(t *testing
 		t.Fatalf(
 			"retired = %v: the claim scan retired live host-sync worker reservation acct-%02d",
 			retired, live.ID,
+		)
+	}
+}
+
+// TestScopeRunnerRetainsAMaximalWorkerFrame pins the disposable-command output
+// bound at the host-sync worker protocol's own ceiling: daemonkit's 4 MiB
+// default cuts a legitimate 4–12 MiB worker response into ErrTruncated before
+// hostsync's frame check can judge it.
+func TestScopeRunnerRetainsAMaximalWorkerFrame(t *testing.T) {
+	const megabytes = 8
+	runner := scopeRunner{scope: daemonTestScope(t)}
+	result, err := runner.Run(t.Context(), workerexec.CommandRequest{
+		Path:         "/bin/dd",
+		Args:         []string{"if=/dev/zero", "bs=1048576", fmt.Sprintf("count=%d", megabytes)},
+		TotalTimeout: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("run a %d MiB worker response: %v", megabytes, err)
+	}
+	if len(result.Stdout) != megabytes<<20 {
+		t.Fatalf(
+			"retained %d stdout bytes, want the whole %d-byte stream",
+			len(result.Stdout), megabytes<<20,
 		)
 	}
 }

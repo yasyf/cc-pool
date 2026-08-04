@@ -30,7 +30,9 @@ func (syncHelperProduct) Drain(context.Context) error { return nil }
 func (syncHelperProduct) Close(context.Context) error { return nil }
 
 // scopeRunner adapts one daemonkit process scope to cc-pool's disposable
-// command boundary: every run is a dedicated-session child, reap included.
+// command boundary: every run is a dedicated-session child, reap included, and
+// retains a whole maximal host-sync worker frame — daemonkit's 4 MiB default
+// would turn a legitimate larger response into ErrTruncated.
 type scopeRunner struct {
 	scope daemonkit.Ctx
 }
@@ -46,7 +48,8 @@ func (r scopeRunner) Run(
 	defer cancel()
 	result, err := r.scope.Run(runCtx, daemonkit.Cmd{
 		Path: request.Path, Args: request.Args, Dir: request.Dir, Env: request.Env,
-		Stdin: request.Stdin, Exec: daemonkit.ServingSameUser(),
+		Stdin: request.Stdin, MaxOutput: hostsync.MaxWorkerResponse,
+		Exec: daemonkit.ServingSameUser(),
 	})
 	observed := workerexec.CommandResult{
 		Stdout: result.Stdout, Stderr: result.Stderr, ExitCode: result.Exit.Code,

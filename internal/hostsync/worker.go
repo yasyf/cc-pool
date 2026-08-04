@@ -23,6 +23,12 @@ const (
 	hostSyncWorkerProtocol = "cc-pool.hostsync.worker.v1"
 	maxHostSyncWorkerFrame = 12 << 20
 	hostSyncWorkerTimeout  = 2 * time.Minute
+
+	// MaxWorkerResponse is the largest complete frame a worker can write: the
+	// payload ceiling plus its four-byte length header. A runner retaining
+	// worker stdout must admit exactly this, or a legitimate maximal response
+	// is cut short before readWorkerFrame can judge it.
+	MaxWorkerResponse = maxHostSyncWorkerFrame + 4
 )
 
 var (
