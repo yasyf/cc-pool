@@ -234,7 +234,7 @@ func (s *Server) provideAccountMutationInput(
 	if err := pa.ensureControl(ctx); err != nil {
 		return AccountMutationResult{}, err
 	}
-	if err := pa.attachment.Send(ctx, event); err != nil {
+	if err := pa.current().Send(ctx, event); err != nil {
 		return AccountMutationResult{}, err
 	}
 	return accountMutationActiveResult(active), nil

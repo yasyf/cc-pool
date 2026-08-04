@@ -30,17 +30,29 @@ type pollKey struct {
 // terminal attachment whose replay cursor advances as polls page it, plus the
 // at-most-one parked poll admission owns.
 type pollAttachment struct {
-	server     *Server
-	key        pollKey
-	attachment accountMutationTerminalAttachment
+	server *Server
+	key    pollKey
+
+	// pageMu serializes cursor validation through page completion. Without it
+	// a superseding poll pages concurrently with its released predecessor and
+	// returns its neighbour's chunks under its own request cursor — lost,
+	// duplicated, or misordered terminal output.
+	pageMu sync.Mutex
 
 	mu         sync.Mutex
+	attachment accountMutationTerminalAttachment
 	controller bool
 	renewing   bool
 	closed     chan struct{}
 	parked     chan struct{}
 	next       uint64
 	haveNext   bool
+}
+
+func (pa *pollAttachment) current() accountMutationTerminalAttachment {
+	pa.mu.Lock()
+	defer pa.mu.Unlock()
+	return pa.attachment
 }
 
 func (s *Server) handleAccountMutationPoll(
@@ -92,6 +104,11 @@ func (s *Server) handleAccountMutationPoll(
 	}
 	token := pa.park()
 	defer pa.unpark(token)
+	pa.pageMu.Lock()
+	defer pa.pageMu.Unlock()
+	if err := pa.reposition(ctx, running, poll.TerminalCursor); err != nil {
+		return daemonkit.Reply{}, &daemonkit.ProductError{Message: err.Error()}
+	}
 	chunks, settled, err := pa.page(s.pollParkContext(ctx, poll.WaitMillis, token))
 	if err != nil {
 		return daemonkit.Reply{}, &daemonkit.ProductError{Message: err.Error()}
@@ -189,8 +206,8 @@ func (s *Server) accountMutationPollState(
 }
 
 // accountMutationAttachment returns the session's attachment for one
-// operation, re-attaching at the requested cursor when the client's view
-// diverged (a lost reply re-polls a cursor the attachment already passed).
+// operation, creating it at the requested cursor; a cursor the existing
+// attachment has moved past is the poll path's to reposition, under pageMu.
 func (s *Server) accountMutationAttachment(
 	session daemonkit.Session,
 	operationID store.AccountMutationID,
@@ -202,10 +219,7 @@ func (s *Server) accountMutationAttachment(
 	pa := s.pollAttachments[key]
 	s.pollMu.Unlock()
 	if pa != nil {
-		if cursor == nil || pa.cursorMatches(*cursor) {
-			return pa, nil
-		}
-		pa.close()
+		return pa, nil
 	}
 	lifetime := s.accountMutationLifetime
 	if lifetime == nil {
@@ -335,6 +349,44 @@ func (pa *pollAttachment) cursorMatches(cursor uint64) bool {
 	return !pa.haveNext || pa.next == cursor
 }
 
+// reposition re-attaches at cursor when the client's view diverged — a lost
+// reply re-polls a cursor the attachment already passed — replaying from the
+// terminal's retained window. Callers hold pageMu, so no page is in flight;
+// a controller re-claims on the fresh attachment.
+func (pa *pollAttachment) reposition(
+	ctx context.Context,
+	running *accountMutationRun,
+	cursor uint64,
+) error {
+	if pa.cursorMatches(cursor) {
+		return nil
+	}
+	lifetime := pa.server.accountMutationLifetime
+	if lifetime == nil {
+		return errors.New("account mutation lifetime is unavailable")
+	}
+	attachment, err := running.terminal.Attach(lifetime, accountterminal.TerminalAttachmentSpec{
+		Role:             accountterminal.TerminalObserver,
+		DisconnectPolicy: accountterminal.DetachOnDisconnect,
+		Cursor:           &accountterminal.TerminalOutputCursor{NextSequence: cursor},
+	})
+	if err != nil {
+		return err
+	}
+	pa.mu.Lock()
+	previous := pa.attachment
+	wasController := pa.controller
+	pa.attachment = attachment
+	pa.controller = false
+	pa.next, pa.haveNext = cursor, true
+	pa.mu.Unlock()
+	_ = previous.Close()
+	if wasController {
+		return pa.ensureControl(ctx)
+	}
+	return nil
+}
+
 func (pa *pollAttachment) observe(output accountterminal.TerminalOutput) {
 	pa.mu.Lock()
 	pa.next, pa.haveNext = output.Sequence+1, true
@@ -366,10 +418,11 @@ func (pa *pollAttachment) unpark(token chan struct{}) {
 // parkCtx only when nothing is buffered. A released park returns an empty
 // page, never an error; settled reports the terminal's own EOF.
 func (pa *pollAttachment) page(parkCtx context.Context) (chunks [][]byte, settled bool, err error) {
+	attachment := pa.current()
 	buffered, cancel := context.WithCancel(context.Background())
 	cancel()
 	for len(chunks) < PollPageChunks {
-		output, receiveErr := pa.attachment.Receive(buffered)
+		output, receiveErr := attachment.Receive(buffered)
 		if receiveErr == nil {
 			pa.observe(output)
 			chunks = append(chunks, output.Data)
@@ -386,7 +439,7 @@ func (pa *pollAttachment) page(parkCtx context.Context) (chunks [][]byte, settle
 	if len(chunks) > 0 || parkCtx == nil {
 		return chunks, false, nil
 	}
-	output, receiveErr := pa.attachment.Receive(parkCtx)
+	output, receiveErr := attachment.Receive(parkCtx)
 	if receiveErr != nil {
 		if errors.Is(receiveErr, io.EOF) {
 			return nil, true, nil
@@ -399,7 +452,7 @@ func (pa *pollAttachment) page(parkCtx context.Context) (chunks [][]byte, settle
 	pa.observe(output)
 	chunks = [][]byte{output.Data}
 	for len(chunks) < PollPageChunks {
-		output, receiveErr := pa.attachment.Receive(buffered)
+		output, receiveErr := attachment.Receive(buffered)
 		if receiveErr != nil {
 			break
 		}
@@ -421,7 +474,7 @@ func (pa *pollAttachment) ensureControl(ctx context.Context) error {
 	retry := time.NewTicker(25 * time.Millisecond)
 	defer retry.Stop()
 	for {
-		_, err := pa.attachment.ClaimControl(
+		_, err := pa.current().ClaimControl(
 			ctx, accountterminal.DetachOnDisconnect, accountterminal.DefaultTerminalControlLease,
 		)
 		switch {
@@ -468,10 +521,17 @@ func (pa *pollAttachment) startControlRenewal() {
 			case <-pa.closed:
 				return
 			case <-renew.C:
+				attachment := pa.current()
 				renewCtx, cancel := context.WithTimeout(lifetime, accountMutationProbeWait)
-				_, err := pa.attachment.RenewControl(renewCtx)
+				_, err := attachment.RenewControl(renewCtx)
 				cancel()
 				if err != nil {
+					pa.mu.Lock()
+					stale := pa.attachment != attachment
+					pa.mu.Unlock()
+					if stale {
+						continue
+					}
 					pa.close()
 					return
 				}
@@ -493,8 +553,9 @@ func (pa *pollAttachment) close() {
 		close(pa.parked)
 		pa.parked = nil
 	}
+	attachment := pa.attachment
 	pa.mu.Unlock()
-	_ = pa.attachment.Close()
+	_ = attachment.Close()
 	s := pa.server
 	s.pollMu.Lock()
 	if s.pollAttachments[pa.key] == pa {
