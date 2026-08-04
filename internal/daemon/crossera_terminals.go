@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -43,15 +44,19 @@ func sweepLegacyAccountTerminals() error {
 		return fmt.Errorf(
 			"cc-pool refused to start: %d interactive login terminal(s) from before the upgrade are "+
 				"still recorded, and a surviving login would overwrite credentials this daemon manages. "+
-				"Confirm no `claude auth login` window is open, then run `rm '%s'`; the daemon retries "+
+				"Confirm no `claude auth login` window is open, then run `rm %s`; the daemon retries "+
 				"automatically and starts once the ledger is cleared",
-			count, path,
+			count, shellQuote(path),
 		)
 	}
 	if err := os.Rename(path, path+".archived"); err != nil {
 		return fmt.Errorf("archive legacy account-terminal ledger: %w", err)
 	}
 	return nil
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func countLegacyTerminalRecords(path string) (int, error) {

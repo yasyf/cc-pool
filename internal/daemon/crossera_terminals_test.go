@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -40,46 +42,81 @@ func writeLegacyTerminalLedger(t *testing.T, records int) string {
 	return path
 }
 
+// advertisedRecovery extracts the one command a refusal tells the user to run,
+// so a test can run exactly what the user would rather than a paraphrase of it.
+func advertisedRecovery(t *testing.T, refusal error) string {
+	t.Helper()
+	const prefix = "then run `"
+	message := refusal.Error()
+	start := strings.Index(message, prefix)
+	if start < 0 {
+		t.Fatalf("refusal %q advertises no recovery command", message)
+	}
+	command, _, terminated := strings.Cut(message[start+len(prefix):], "`")
+	if !terminated {
+		t.Fatalf("refusal %q leaves its recovery command unterminated", message)
+	}
+	return command
+}
+
 // TestSweepLegacyAccountTerminalsRefusesWhileRecordsRemain pins the whole
-// design: any recorded login refuses the boot with the exact command that
-// clears the ledger, touches no process, and archives nothing. The machine
-// does not try to prove the login is gone — the human confirms it and clears
-// the ledger, which is the only race-free version of this check.
+// design: any recorded login refuses the boot with a recovery command that
+// runs, touches no process, and archives nothing. The advertised command is
+// the only documented way out of the refusal, so the test executes it through
+// `/bin/sh` — including from a home directory whose name carries an
+// apostrophe, where an unquoted path renders a command the shell cannot parse.
 func TestSweepLegacyAccountTerminalsRefusesWhileRecordsRemain(t *testing.T) {
-	testhome.Sandbox(t, t.TempDir())
-	if err := pool.EnsureStateDir(); err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name string
+		home string
+	}{
+		{"plain home", "home"},
+		{"home carrying an apostrophe", "O'Connor"},
 	}
-	path := writeLegacyTerminalLedger(t, 2)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := filepath.Join(t.TempDir(), tt.home)
+			if err := os.MkdirAll(home, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			testhome.Sandbox(t, home)
+			if err := pool.EnsureStateDir(); err != nil {
+				t.Fatal(err)
+			}
+			path := writeLegacyTerminalLedger(t, 2)
 
-	err := sweepLegacyAccountTerminals()
-	if err == nil {
-		t.Fatal("sweep with recorded terminals did not refuse")
-	}
-	for _, want := range []string{
-		"2 interactive login terminal(s)",
-		"claude auth login",
-		fmt.Sprintf("rm '%s'", path),
-		"retries automatically",
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("refusal %q does not carry %q", err, want)
-		}
-	}
-	if _, err := os.Lstat(path); err != nil {
-		t.Fatalf("refusal disturbed the ledger: %v", err)
-	}
-	if _, err := os.Lstat(path + ".archived"); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("refusal created an archive: %v", err)
-	}
+			refusal := sweepLegacyAccountTerminals()
+			if refusal == nil {
+				t.Fatal("sweep with recorded terminals did not refuse")
+			}
+			for _, want := range []string{
+				"2 interactive login terminal(s)",
+				"claude auth login",
+				"retries automatically",
+			} {
+				if !strings.Contains(refusal.Error(), want) {
+					t.Fatalf("refusal %q does not carry %q", refusal, want)
+				}
+			}
+			if _, err := os.Lstat(path); err != nil {
+				t.Fatalf("refusal disturbed the ledger: %v", err)
+			}
+			if _, err := os.Lstat(path + ".archived"); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("refusal created an archive: %v", err)
+			}
 
-	// The user's advertised command is the recovery: after it, the boot
-	// proceeds and nothing is left to archive.
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-	if err := sweepLegacyAccountTerminals(); err != nil {
-		t.Fatalf("sweep after the advertised command = %v, want a clean boot", err)
+			command := advertisedRecovery(t, refusal)
+			output, err := exec.Command("/bin/sh", "-c", command).CombinedOutput()
+			if err != nil {
+				t.Fatalf("advertised recovery %s = %v: %s", command, err, output)
+			}
+			if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("advertised recovery left the ledger behind: %v", err)
+			}
+			if err := sweepLegacyAccountTerminals(); err != nil {
+				t.Fatalf("sweep after the advertised command = %v, want a clean boot", err)
+			}
+		})
 	}
 }
 
