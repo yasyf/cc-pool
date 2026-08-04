@@ -294,14 +294,8 @@ func installDaemonService(ctx context.Context) (err error) {
 	}
 	ensureCtx, cancel := budgeted(ctx, daemonServiceEnsureTimeout)
 	defer cancel()
-	ensured, err := ensureDaemonService(ensureCtx)
-	if err != nil {
+	if _, err := ensureDaemonService(ensureCtx); err != nil {
 		return fmt.Errorf("ensure cc-pool daemon: %w", err)
-	}
-	if ensured.After.Build != version.String() {
-		return fmt.Errorf(
-			"ensured daemon build %q is not this build %q", ensured.After.Build, version.String(),
-		)
 	}
 	holderInstall.Commit()
 	return nil

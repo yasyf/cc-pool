@@ -2,11 +2,12 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"testing"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/daemonkit"
 )
 
@@ -39,10 +40,10 @@ func TestBudgetedStatesTheDefaultWhenNoneIsCarried(t *testing.T) {
 
 func TestInstallDaemonServiceRollsBackHolderOnEnsureFailure(t *testing.T) {
 	ensureFailed := errors.New("ensure failed")
-	rollbacks := 0
+	commits, rollbacks := 0, 0
 	swapVar(t, &removeLegacyDaemon, func(context.Context) error { return nil })
 	swapVar(t, &ensureHolder, func(context.Context) (holderServiceInstall, error) {
-		return testHolderInstall{rollback: func() { rollbacks++ }}, nil
+		return testHolderInstall{commit: func() { commits++ }, rollback: func() { rollbacks++ }}, nil
 	})
 	swapVar(t, &ensureDaemonService, func(context.Context) (daemonkit.Ensured, error) {
 		return daemonkit.Ensured{}, ensureFailed
@@ -51,27 +52,63 @@ func TestInstallDaemonServiceRollsBackHolderOnEnsureFailure(t *testing.T) {
 		t.Fatalf("install = %v, want the ensure failure", err)
 	}
 	if rollbacks != 1 {
-		t.Fatalf("holder rollbacks = %d, want exactly 1", rollbacks)
+		t.Errorf("holder rollbacks = %d, want exactly 1", rollbacks)
+	}
+	if commits != 0 {
+		t.Errorf("holder commits = %d, want none behind a failed ensure", commits)
 	}
 }
 
+func daemonkitExecutableDigest(image string) string {
+	sum := sha256.Sum256([]byte(image))
+	return hex.EncodeToString(sum[:])
+}
+
 func TestInstallDaemonServiceCommitsHolderOnEnsureSuccess(t *testing.T) {
-	commits := 0
-	swapVar(t, &removeLegacyDaemon, func(context.Context) error { return nil })
-	swapVar(t, &ensureHolder, func(context.Context) (holderServiceInstall, error) {
-		return testHolderInstall{commit: func() { commits++ }}, nil
-	})
-	swapVar(t, &ensureDaemonService, func(ctx context.Context) (daemonkit.Ensured, error) {
-		if _, stated := ctx.Deadline(); !stated {
-			t.Error("ensure ran without a stated deadline")
-		}
-		return daemonkit.Ensured{After: daemonkit.Health{Build: version.String()}}, nil
-	})
-	if err := installDaemonService(t.Context()); err != nil {
-		t.Fatal(err)
+	digest := daemonkitExecutableDigest("cc-pool daemon executable")
+	tests := []struct {
+		name    string
+		ensured daemonkit.Ensured
+	}{
+		{
+			name: "ensure started the wanted daemon",
+			ensured: daemonkit.Ensured{
+				Did:   daemonkit.ActionStarted,
+				After: daemonkit.Health{Phase: daemonkit.PhaseReady, Build: digest},
+			},
+		},
+		{
+			name: "the wanted daemon already served",
+			ensured: daemonkit.Ensured{
+				Before: daemonkit.Health{Phase: daemonkit.PhaseReady, Build: digest},
+				Did:    daemonkit.ActionNothing,
+				After:  daemonkit.Health{Phase: daemonkit.PhaseReady, Build: digest},
+			},
+		},
 	}
-	if commits != 1 {
-		t.Fatalf("holder commits = %d, want exactly 1", commits)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			commits, rollbacks := 0, 0
+			swapVar(t, &removeLegacyDaemon, func(context.Context) error { return nil })
+			swapVar(t, &ensureHolder, func(context.Context) (holderServiceInstall, error) {
+				return testHolderInstall{commit: func() { commits++ }, rollback: func() { rollbacks++ }}, nil
+			})
+			swapVar(t, &ensureDaemonService, func(ctx context.Context) (daemonkit.Ensured, error) {
+				if _, stated := ctx.Deadline(); !stated {
+					t.Error("ensure ran without a stated deadline")
+				}
+				return tt.ensured, nil
+			})
+			if err := installDaemonService(t.Context()); err != nil {
+				t.Fatalf("install = %v, want nil", err)
+			}
+			if commits != 1 {
+				t.Errorf("holder commits = %d, want exactly 1", commits)
+			}
+			if rollbacks != 0 {
+				t.Errorf("holder rollbacks = %d, want none behind a successful ensure", rollbacks)
+			}
+		})
 	}
 }
 
