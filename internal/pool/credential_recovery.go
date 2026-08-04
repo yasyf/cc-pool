@@ -2,11 +2,19 @@ package pool
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"fmt"
 	"log"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/store"
 )
+
+// ErrCredentialRecoveryPending refuses an account whose claimed lane failed
+// its post-takeover settlement; each later access retries the settlement and
+// lifts the fence on success.
+var ErrCredentialRecoveryPending = errors.New("credential operation recovery is pending")
 
 const (
 	credentialRecoveryLanePage = 64
@@ -50,6 +58,10 @@ func (m *Manager) claimForeignCredentialOperations(
 		}
 		for _, operation := range operations {
 			if err := m.recoverCredentialOperation(ctx, operation); err != nil {
+				var stranded strandedRecoveryError
+				if errors.As(err, &stranded) {
+					m.strandCredentialRecovery(operation.AccountID, stranded.token, stranded.cause)
+				}
 				log.Printf(
 					"credential recovery deferred: account=%d token=%s: %v",
 					operation.AccountID, operation.Token, err,
@@ -61,6 +73,71 @@ func (m *Manager) claimForeignCredentialOperations(
 			return nil
 		}
 	}
+}
+
+type strandedCredentialRecovery struct {
+	token string
+	cause error
+}
+
+type strandedRecoveryError struct {
+	token string
+	cause error
+}
+
+func (e strandedRecoveryError) Error() string { return e.cause.Error() }
+
+func (e strandedRecoveryError) Unwrap() error { return e.cause }
+
+func (m *Manager) strandCredentialRecovery(accountID int, token string, cause error) {
+	m.credentialMu.Lock()
+	defer m.credentialMu.Unlock()
+	if m.strandedRecovery == nil {
+		m.strandedRecovery = make(map[int]strandedCredentialRecovery)
+	}
+	m.strandedRecovery[accountID] = strandedCredentialRecovery{token: token, cause: cause}
+}
+
+func (m *Manager) unstrandCredentialRecovery(accountID int) {
+	m.credentialMu.Lock()
+	defer m.credentialMu.Unlock()
+	delete(m.strandedRecovery, accountID)
+}
+
+func (m *Manager) retryStrandedCredentialRecovery(ctx context.Context, accountID int) error {
+	m.credentialMu.Lock()
+	strand, stranded := m.strandedRecovery[accountID]
+	m.credentialMu.Unlock()
+	if !stranded {
+		return nil
+	}
+	pending := func(err error) error {
+		return fmt.Errorf("%w: account %d: %w", ErrCredentialRecoveryPending, accountID, err)
+	}
+	operation, err := m.Store.CredentialOperationByToken(strand.token)
+	if errors.Is(err, sql.ErrNoRows) {
+		m.unstrandCredentialRecovery(accountID)
+		return nil
+	}
+	if err != nil {
+		return pending(err)
+	}
+	account, err := m.credentialOperationAccount(operation)
+	if err != nil {
+		return pending(err)
+	}
+	if !credentialOperationAccountCurrent(account, operation) {
+		return pending(store.ErrAccountGenerationChanged)
+	}
+	if err := m.settleClaimedCredentialOperation(ctx, account, operation); err != nil {
+		var stranded strandedRecoveryError
+		if errors.As(err, &stranded) {
+			m.strandCredentialRecovery(accountID, stranded.token, stranded.cause)
+		}
+		return pending(err)
+	}
+	m.unstrandCredentialRecovery(accountID)
+	return nil
 }
 
 func (m *Manager) claimForeignPendingAdds(

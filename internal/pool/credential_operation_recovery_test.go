@@ -1758,3 +1758,62 @@ func (f *boundaryFailureRefresher) Refresh(ctx context.Context, _, _ string) (*o
 func (*boundaryFailureRefresher) Usage(context.Context, string) (*oauth.Usage, error) {
 	return nil, errors.New("unexpected OAuth usage")
 }
+
+func TestStrandedCredentialRecoveryFencesAdmissionAndRetries(t *testing.T) {
+	st := openTestStore(t)
+	account := persistTestAccount(t, st, store.Account{
+		ID: 1, ConfigDir: t.TempDir(),
+		KeychainService: "service-stranded", KeychainAccount: "account-stranded",
+	})
+	credentials := credstest.NewFake()
+	old := credentialRecoveryManager(t, st, credentials, "stranded-old")
+	recovery := credentialRecoveryManager(t, st, credentials, "stranded-new")
+	installTestBackingRunner(recovery)
+
+	before, err := old.credentialObservation(t.Context(), account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := beginRetiredCredentialOperation(
+		t, old, account, store.CredentialOperationEnsureFresh, store.CredentialTargetKeychain,
+		credentialIntentDigest(store.CredentialOperationEnsureFresh, "stranded"), before,
+	)
+
+	linkTarget, err := os.Readlink(account.ConfigDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(account.ConfigDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := recovery.ClaimForeignLanes(t.Context()); err != nil {
+		t.Fatalf("claim pass failed instead of deferring: %v", err)
+	}
+	claimed, err := st.CredentialOperationByToken(operation.Token)
+	if err != nil || !bytes.Equal(claimed.Owner, recovery.owner) ||
+		claimed.OwnerEpoch != operation.OwnerEpoch+1 {
+		t.Fatalf("stranded lane after claim = %+v err=%v", claimed, err)
+	}
+	if err := recovery.retryStrandedCredentialRecovery(t.Context(), account.ID); !errors.Is(err, ErrCredentialRecoveryPending) {
+		t.Fatalf("fenced admission = %v, want ErrCredentialRecoveryPending", err)
+	}
+
+	if err := os.Symlink(linkTarget, account.ConfigDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := recovery.retryStrandedCredentialRecovery(t.Context(), account.ID); err != nil {
+		t.Fatalf("healed retry = %v", err)
+	}
+	if _, err := st.CredentialOperationByToken(operation.Token); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("stranded lane survived retry = %v", err)
+	}
+	receipt, err := st.CredentialOperationReceipt(operation.Token)
+	if err != nil || receipt.TerminalStatus != store.CredentialTerminalQuarantined ||
+		receipt.Result != store.CredentialResultAmbiguous ||
+		!bytes.Equal(receipt.Owner, recovery.owner) {
+		t.Fatalf("settled receipt = %+v err=%v", receipt, err)
+	}
+	if err := recovery.retryStrandedCredentialRecovery(t.Context(), account.ID); err != nil {
+		t.Fatalf("unfenced account still errors = %v", err)
+	}
+}

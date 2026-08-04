@@ -91,6 +91,7 @@ type Manager struct {
 
 	credentialMu      sync.Mutex
 	credentialFlights map[int]*credentialFlight
+	strandedRecovery  map[int]strandedCredentialRecovery
 
 	owner            store.OwnerRecord
 	workers          *workerRuntime

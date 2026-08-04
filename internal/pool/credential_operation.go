@@ -344,6 +344,9 @@ func executeCredentialOperation[T any](
 	if err != nil {
 		return zero, err
 	}
+	if err := manager.retryStrandedCredentialRecovery(ctx, account.ID); err != nil {
+		return zero, err
+	}
 	for {
 		begin, err := manager.Store.BeginCredentialOperation(
 			store.BeginCredentialOperationRequest{
@@ -1470,15 +1473,7 @@ func (m *Manager) recoverCredentialOperation(
 	if err != nil {
 		return err
 	}
-	if account.InstanceID != operation.AccountInstanceID ||
-		account.Generation != operation.AccountGeneration ||
-		account.ConfigDir != operation.ConfigDir ||
-		account.KeychainService != operation.KeychainService ||
-		account.KeychainAccount != operation.KeychainAccount ||
-		store.CredentialKeychainLocatorDigest(
-			account.KeychainService,
-			account.KeychainAccount,
-		) != operation.LocatorDigest {
+	if !credentialOperationAccountCurrent(account, operation) {
 		return store.ErrAccountGenerationChanged
 	}
 	owner, err := m.MutationOwner()
@@ -1489,11 +1484,43 @@ func (m *Manager) recoverCredentialOperation(
 	if err != nil {
 		return err
 	}
+	return m.settleClaimedCredentialOperation(ctx, account, operation)
+}
+
+func credentialOperationAccountCurrent(
+	account store.Account,
+	operation store.CredentialOperation,
+) bool {
+	return account.InstanceID == operation.AccountInstanceID &&
+		account.Generation == operation.AccountGeneration &&
+		account.ConfigDir == operation.ConfigDir &&
+		account.KeychainService == operation.KeychainService &&
+		account.KeychainAccount == operation.KeychainAccount &&
+		store.CredentialKeychainLocatorDigest(
+			account.KeychainService,
+			account.KeychainAccount,
+		) == operation.LocatorDigest
+}
+
+// settleClaimedCredentialOperation is the post-takeover half of recovery: a
+// failure here leaves a self-owned row no foreign scan re-presents, so it is
+// reported as a strand for the admission fence to retry.
+func (m *Manager) settleClaimedCredentialOperation(
+	ctx context.Context,
+	account store.Account,
+	operation store.CredentialOperation,
+) error {
 	if operation.State == store.CredentialOperationPrepared &&
 		operation.Kind != store.CredentialOperationRemove {
-		return m.Store.AbandonPreparedCredentialOperation(operation.Fence())
+		if err := m.Store.AbandonPreparedCredentialOperation(operation.Fence()); err != nil {
+			return strandedRecoveryError{token: operation.Token, cause: err}
+		}
+		return nil
 	}
-	return m.recoverRetiredCredentialOperation(ctx, account, operation)
+	if err := m.recoverRetiredCredentialOperation(ctx, account, operation); err != nil {
+		return strandedRecoveryError{token: operation.Token, cause: err}
+	}
+	return nil
 }
 
 func (m *Manager) credentialOperationAccount(
