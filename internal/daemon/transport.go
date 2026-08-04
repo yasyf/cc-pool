@@ -14,8 +14,11 @@ var errHolderSessionLost = errors.New("daemon: FuseKit runtime session lost")
 
 // Handle dispatches one business request. The client's own deadline rides the
 // wire into ctx, so the retired per-op server ladder has no successor here:
-// each op's budget is the one its caller stated.
+// each op's budget is the one its caller stated. Every dispatch republishes
+// the product health detail, so a control health read after any business op
+// observes live counts rather than the startup snapshot.
 func (s *Server) Handle(ctx context.Context, req daemonkit.Request) (daemonkit.Reply, error) {
+	defer s.publishHealth()
 	op := Op(req.Op)
 	var request Request
 	if err := decodeStrict(req.Body, &request); err != nil {
@@ -61,6 +64,7 @@ func (s *Server) Drain(budget daemonkit.Budget) error {
 func (s *Server) drainProduct(ctx context.Context) error {
 	s.markClosing()
 	s.runtimePublished.Store(false)
+	s.publishHealth()
 	s.cancelHolderMonitor()
 	s.execMu.Lock()
 	execCancel := s.execCancel

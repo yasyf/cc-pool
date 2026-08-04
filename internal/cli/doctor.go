@@ -46,6 +46,17 @@ func runDoctor(cmd *cobra.Command, manager *pool.Manager) error {
 	defer func() { _ = client.Close() }()
 	ctx, cancel := context.WithTimeout(cmd.Context(), 3*time.Second)
 	defer cancel()
+	// The status op runs first: every business dispatch republishes the
+	// health detail, so the health read below carries live counts.
+	status, err := client.StatusContext(ctx)
+	switch {
+	case err != nil:
+		fail(cmd.ErrOrStderr(), "daemon status op: %v", err)
+		return fmt.Errorf("doctor found unhealthy state")
+	case !status.OK:
+		fail(cmd.ErrOrStderr(), "daemon status op: %s", status.Error)
+		return fmt.Errorf("doctor found unhealthy state")
+	}
 	health, err := daemonHealthContext(ctx, client)
 	if err != nil {
 		fail(cmd.ErrOrStderr(), "daemon/FuseKit readiness: %v", err)
