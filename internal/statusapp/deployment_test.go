@@ -251,39 +251,66 @@ func TestRequireActiveServiceRefusesAPIDNotPinnedAcrossTheObservation(t *testing
 		return daemonkit.Health{Phase: daemonkit.PhaseReady, PID: 4242}, nil
 	})
 	tests := []struct {
-		name   string
-		before deploy.Survivors
-		after  deploy.Survivors
+		name        string
+		inventories []deploy.Survivors
 	}{
 		{
-			"the installed binary held the pid only after the answer",
-			deploy.Survivors{},
-			deploy.Survivors{Live: []deploy.LiveProcess{{PID: 4242, Start: 2, Boot: 1}}},
+			"the pid crossed the observation as two instances",
+			[]deploy.Survivors{
+				{Live: []deploy.LiveProcess{{PID: 4242, Start: 1, Boot: 1}}},
+				{Live: []deploy.LiveProcess{{PID: 4242, Start: 2, Boot: 1}}},
+			},
 		},
 		{
-			"the pid crossed the observation as two instances",
-			deploy.Survivors{Live: []deploy.LiveProcess{{PID: 4242, Start: 1, Boot: 1}}},
-			deploy.Survivors{Live: []deploy.LiveProcess{{PID: 4242, Start: 2, Boot: 1}}},
+			"the pid kept arriving as a fresh instance across the retried bracket",
+			[]deploy.Survivors{
+				{},
+				{Live: []deploy.LiveProcess{{PID: 4242, Start: 2, Boot: 1}}},
+				{Live: []deploy.LiveProcess{{PID: 4242, Start: 3, Boot: 1}}},
+			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			calls := 0
 			swapDeploymentVar(t, &deployInventory, func(...string) (deploy.Survivors, error) {
+				next := tt.inventories[calls]
 				calls++
-				if calls == 1 {
-					return tt.before, nil
-				}
-				return tt.after, nil
+				return next, nil
 			})
 			if err := RequireActiveService(t.Context()); err == nil ||
 				!strings.Contains(err.Error(), "does not run the installed application") {
 				t.Fatalf("unpinned pid = %v, want an installed-runtime refusal", err)
 			}
-			if calls != 2 {
-				t.Fatalf("inventory bracket ran %d calls, want 2", calls)
+			if calls != len(tt.inventories) {
+				t.Fatalf("inventory bracket ran %d calls, want %d", calls, len(tt.inventories))
 			}
 		})
+	}
+}
+
+func TestRequireActiveServiceRetriesTheBracketForAHolderStartedMidObservation(t *testing.T) {
+	observations := 0
+	swapDeploymentVar(t, &tenantLaneReady, func(context.Context) (daemonkit.Health, error) {
+		observations++
+		return daemonkit.Health{Phase: daemonkit.PhaseReady, PID: 4242}, nil
+	})
+	inventories := []deploy.Survivors{
+		{},
+		{Live: []deploy.LiveProcess{{PID: 4242, Start: 2, Boot: 1}}},
+		{Live: []deploy.LiveProcess{{PID: 4242, Start: 2, Boot: 1}}},
+	}
+	calls := 0
+	swapDeploymentVar(t, &deployInventory, func(...string) (deploy.Survivors, error) {
+		next := inventories[calls]
+		calls++
+		return next, nil
+	})
+	if err := RequireActiveService(t.Context()); err != nil {
+		t.Fatalf("mid-observation holder start = %v, want a retried pass", err)
+	}
+	if calls != 3 || observations != 2 {
+		t.Fatalf("bracket retry ran %d inventories and %d observations, want 3 and 2", calls, observations)
 	}
 }
 

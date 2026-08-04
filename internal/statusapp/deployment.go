@@ -98,38 +98,49 @@ func ApplyPackagedApp(ctx context.Context, candidateSourcePath string) (ServiceI
 // one. WaitReady alone proves live-and-ready under the tenant lane's
 // same-user floor, which any same-UID listener clears — the executable-scoped
 // inventory is what ties the answering PID to the installed application's own
-// runtime binary. The health observation is bracketed between two
-// inventories that must both pin the answering PID to one process instance
-// ({Start, Boot}), so a PID reused or exec'd across the observation cannot
-// correlate.
+// runtime binary. The health observation is bracketed between two inventories
+// that must both pin the answering PID to one process instance
+// ({Start, Boot}), so a reused PID cannot correlate; an exec within one
+// instance keeps its triple and is not excluded. A holder that first appears
+// during the observation — a restart launchd was still completing — re-runs
+// the complete bracket within ctx instead of being refused.
 func RequireActiveService(ctx context.Context) error {
 	executable := bundle.ExePath(installedAppPath(), holderbridge.ExecutableName)
 	before, err := deployInventory(executable)
 	if err != nil {
 		return fmt.Errorf("CCPoolStatus: inventory the installed runtime: %w", err)
 	}
-	health, err := tenantLaneReady(ctx)
-	if err != nil {
-		return fmt.Errorf("CCPoolStatus: require the live FuseKit runtime: %w", err)
-	}
-	after, err := deployInventory(executable)
-	if err != nil {
-		return fmt.Errorf("CCPoolStatus: inventory the installed runtime: %w", err)
-	}
-	for _, first := range before.Live {
-		if first.PID != health.PID {
-			continue
+	for {
+		health, err := tenantLaneReady(ctx)
+		if err != nil {
+			return fmt.Errorf("CCPoolStatus: require the live FuseKit runtime: %w", err)
 		}
-		for _, second := range after.Live {
-			if second.PID == first.PID && second.Start == first.Start && second.Boot == first.Boot {
-				return nil
-			}
+		after, err := deployInventory(executable)
+		if err != nil {
+			return fmt.Errorf("CCPoolStatus: inventory the installed runtime: %w", err)
+		}
+		first, held := inventoryPin(before, health.PID)
+		second, serving := inventoryPin(after, health.PID)
+		if held && serving && first.Start == second.Start && first.Boot == second.Boot {
+			return nil
+		}
+		if held || !serving || ctx.Err() != nil {
+			return fmt.Errorf(
+				"CCPoolStatus: the process serving the tenant lane (pid %d) does not run the installed application",
+				health.PID,
+			)
+		}
+		before = after
+	}
+}
+
+func inventoryPin(survivors deploy.Survivors, pid int) (deploy.LiveProcess, bool) {
+	for _, live := range survivors.Live {
+		if live.PID == pid {
+			return live, true
 		}
 	}
-	return fmt.Errorf(
-		"CCPoolStatus: the process serving the tenant lane (pid %d) does not run the installed application",
-		health.PID,
-	)
+	return deploy.LiveProcess{}, false
 }
 
 // UninstallPackagedApp quiesces and removes the exact deploy-sealed installed application.
