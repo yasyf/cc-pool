@@ -3,29 +3,26 @@ package daemon
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/accountterminal"
-	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
-	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 )
 
 // ErrDaemonUnavailable means the daemon socket could not be reached.
 var ErrDaemonUnavailable = errors.New("daemon not running")
 
-// ErrDaemonBuildMismatch means the authenticated transport peer is not this
-// exact cc-pool build.
+// ErrDaemonBuildMismatch means the serving daemon is not this exact cc-pool
+// build. The wire-era rejection moved to business-attach schema membership;
+// this sentinel now names only a health report whose runtime build disagrees.
 var ErrDaemonBuildMismatch = errors.New("daemon build mismatch")
 
 // ErrAccountMutationCancelled means the daemon durably aborted the operation.
@@ -37,62 +34,36 @@ var ErrAccountMutationSuperseded = errors.New("account mutation superseded")
 // ErrAccountMutationQuarantined means external credential state needs manual recovery.
 var ErrAccountMutationQuarantined = errors.New("account mutation quarantined")
 
-// CallError preserves daemonkit's delivery proof for one failed operation.
-type CallError struct {
-	Op      wire.Op
-	Outcome wire.Outcome
-	Reason  string
-	Err     error
-}
+// pollWaitMillis is the wait every client poll requests, under the protocol's
+// MaxPollWaitMillis ceiling.
+const pollWaitMillis = 25_000
 
-// Error describes the failed operation and its exact delivery outcome.
-func (e *CallError) Error() string {
-	detail := e.Reason
-	if detail == "" && e.Err != nil {
-		detail = e.Err.Error()
-	}
-	if detail == "" {
-		detail = "no terminal response"
-	}
-	return fmt.Sprintf("daemon call %s %s: %s", e.Op, e.Outcome, detail)
-}
-
-// Unwrap returns the underlying transport error, when present.
-func (e *CallError) Unwrap() error { return e.Err }
-
-type clientSession struct {
-	wire       *wire.Client
-	generation uint64
-	active     int
-	stale      bool
-}
-
-// Client maintains one generation-aware persistent daemonkit session. A
-// failed operation is never replayed; the next operation opens a new session.
+// Client reaches the daemon over one persistent daemonkit business lane; the
+// lane re-acquires its session after any failure and never replays a request.
 type Client struct {
-	socket       string
-	build        string
+	client       *daemonkit.Client
+	business     *daemonkit.Business
 	runtimeBuild string
 
-	mu         sync.Mutex
-	current    *clientSession
-	sessions   map[*clientSession]struct{}
-	dialing    chan struct{}
-	generation uint64
-	closed     bool
+	mu     sync.Mutex
+	closed bool
 }
 
-// NewClient returns a lazy client for the default daemon socket and exact build.
+// NewClient returns a lazy client for the daemon's own identity. The spec is a
+// fixed value, so a construction failure is a build defect, not a condition.
 func NewClient() *Client {
+	client, err := daemonkit.Open(Spec(daemonkit.Program{}, nil))
+	if err != nil {
+		panic(fmt.Sprintf("daemon: open client for the fixed spec: %v", err))
+	}
 	return &Client{
-		socket:       pool.SocketPath(),
-		build:        WireBuild,
+		client:       client,
+		business:     client.Business(),
 		runtimeBuild: version.String(),
-		sessions:     make(map[*clientSession]struct{}),
 	}
 }
 
-// Close permanently closes every current or retiring daemon session.
+// Close permanently releases the business lane.
 func (c *Client) Close() error {
 	c.mu.Lock()
 	if c.closed {
@@ -100,23 +71,16 @@ func (c *Client) Close() error {
 		return nil
 	}
 	c.closed = true
-	sessions := make([]*clientSession, 0, len(c.sessions))
-	for session := range c.sessions {
-		sessions = append(sessions, session)
-	}
-	c.current = nil
-	clear(c.sessions)
 	c.mu.Unlock()
-	var errs []error
-	for _, session := range sessions {
-		if err := session.wire.Close(); err != nil {
-			errs = append(errs, err)
-		}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.business.Close(ctx); err != nil && !errors.Is(err, daemonkit.ErrLaneClosed) {
+		return err
 	}
-	return errors.Join(errs...)
+	return nil
 }
 
-// Available reports whether an exact ready business session can reach the daemon.
+// Available reports whether a ready daemon of this exact build answers.
 func (c *Client) Available() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
@@ -128,8 +92,11 @@ func (c *Client) do(req Request, timeout time.Duration) (*Response, error) {
 	return c.doContext(context.Background(), req, timeout)
 }
 
+// doContext sends one unary op. timeout is this package's default budget for
+// the op — a caller that stated its own deadline keeps it, per the fleet
+// deadline-budget convention.
 func (c *Client) doContext(ctx context.Context, req Request, timeout time.Duration) (*Response, error) {
-	if _, ok := ctx.Deadline(); !ok {
+	if _, stated := ctx.Deadline(); !stated {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
@@ -138,15 +105,15 @@ func (c *Client) doContext(ctx context.Context, req Request, timeout time.Durati
 	if err != nil {
 		return nil, fmt.Errorf("encode %s: %w", req.Op, err)
 	}
-	result, err := c.call(ctx, wire.Op(req.Op), payload)
+	reply, err := c.business.Call(ctx, string(req.Op), payload)
 	if err != nil {
+		if errors.Is(err, daemonkit.ErrAbsent) {
+			return nil, fmt.Errorf("%w: %w", ErrDaemonUnavailable, err)
+		}
 		return nil, err
 	}
-	if result.Response.Err != "" {
-		return nil, errors.New(result.Response.Err)
-	}
 	var response Response
-	if err := decodeStrict(result.Response.Payload, &response); err != nil {
+	if err := decodeStrict(reply.Body, &response); err != nil {
 		return nil, fmt.Errorf("decode %s response: %w", req.Op, err)
 	}
 	return &response, nil
@@ -168,8 +135,7 @@ func (c *Client) Select(ctx context.Context, account *int, process store.Process
 }
 
 // CommitSelection consumes a provisional selection and records its session and
-// sticky state. daemonkit's terminal acknowledgement makes the single call's
-// delivery outcome exact; post-send failures are never replayed.
+// sticky state. A post-send failure is never replayed.
 func (c *Client) CommitSelection(ctx context.Context, token string) error {
 	r, err := c.doContext(ctx, Request{Op: OpSelectCommit, ReservationToken: token}, 3*time.Second)
 	if err != nil {
@@ -203,7 +169,7 @@ func (c *Client) StatusContext(ctx context.Context) (*Response, error) {
 	return c.doContext(ctx, Request{Op: OpStatus}, 5*time.Second)
 }
 
-// Health probes daemon readiness over the ordinary business session.
+// Health probes daemon readiness and requires this exact build.
 func (c *Client) Health() (*HealthResponse, error) {
 	return c.HealthContext(context.Background())
 }
@@ -214,50 +180,52 @@ func (c *Client) HealthContext(ctx context.Context) (*HealthResponse, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := validateDaemonHealth(*response, c.clientRuntimeBuild()); err != nil {
+	if err := validateDaemonHealth(*response, c.runtimeBuild); err != nil {
 		return nil, err
 	}
 	return response, nil
 }
 
-// ObserveHealthContext reads exact structural runtime identity without requiring readiness or the current release.
+// ObserveHealthContext reads the product half of Health.Detail through the
+// control lane, which answers during drain and without readiness. daemonkit
+// itself pins the serving PID and generation at attach.
 func (c *Client) ObserveHealthContext(ctx context.Context) (*HealthResponse, error) {
-	if _, ok := ctx.Deadline(); !ok {
+	if _, stated := ctx.Deadline(); !stated {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, 2*time.Second)
 		defer cancel()
 	}
-	payload, err := json.Marshal(HealthRequest{Schema: DaemonHealthSchema})
+	control, err := c.client.Control(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("encode daemon health request: %w", err)
+		if errors.Is(err, daemonkit.ErrAbsent) {
+			return nil, fmt.Errorf("%w: %w", ErrDaemonUnavailable, err)
+		}
+		return nil, err
 	}
-	result, err := c.call(ctx, wire.Op(OpHealth), payload)
+	defer func() { _ = control.Close(ctx) }()
+	health, err := control.Health(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if result.Response.Err != "" {
-		return nil, errors.New(result.Response.Err)
-	}
-	var response HealthResponse
-	if err := decodeStrict(result.Response.Payload, &response); err != nil {
-		return nil, fmt.Errorf("decode daemon health response: %w", err)
-	}
-	if err := validateDaemonHealthIdentity(response); err != nil {
-		return nil, err
-	}
-	return &response, nil
+	return decodeDaemonHealthDetail(health)
 }
 
-func validateDaemonHealthIdentity(response HealthResponse) error {
+func decodeDaemonHealthDetail(health daemonkit.Health) (*HealthResponse, error) {
+	if len(health.Detail) == 0 {
+		return nil, errors.New("daemon health carries no product detail")
+	}
+	var response HealthResponse
+	if err := decodeStrict(health.Detail, &response); err != nil {
+		return nil, fmt.Errorf("decode daemon health detail: %w", err)
+	}
 	if response.Schema != DaemonHealthSchema || response.RuntimeBuild == "" ||
-		response.RuntimeProtocol != int(wire.ProtocolVersion) || response.PID <= 1 || response.ProcessGeneration == "" ||
 		!validDaemonRuntimeState(response.State) {
-		return fmt.Errorf(
-			"daemon runtime identity is not exact: schema=%d build=%q protocol=%d pid=%d generation=%q",
-			response.Schema, response.RuntimeBuild, response.RuntimeProtocol, response.PID, response.ProcessGeneration,
+		return nil, fmt.Errorf(
+			"daemon runtime identity is not exact: schema=%d build=%q state=%q",
+			response.Schema, response.RuntimeBuild, response.State,
 		)
 	}
-	return nil
+	return &response, nil
 }
 
 func validDaemonRuntimeState(state RuntimeState) bool {
@@ -270,17 +238,15 @@ func validDaemonRuntimeState(state RuntimeState) bool {
 }
 
 func validateDaemonHealth(response HealthResponse, expectedBuild string) error {
-	if err := validateDaemonHealthIdentity(response); err != nil {
-		return err
-	}
 	if response.RuntimeBuild != expectedBuild {
-		return fmt.Errorf("daemon runtime build is not exact: build=%q want=%q", response.RuntimeBuild, expectedBuild)
+		return fmt.Errorf(
+			"%w: build=%q want=%q", ErrDaemonBuildMismatch, response.RuntimeBuild, expectedBuild,
+		)
 	}
 	if response.State != RuntimeStateHealthy || response.Draining || response.Busy || !response.Ready {
 		return fmt.Errorf(
-			"daemon runtime is not ready: state=%q draining=%t busy=%t ready=%t process=%q",
+			"daemon runtime is not ready: state=%q draining=%t busy=%t ready=%t",
 			response.State, response.Draining, response.Busy, response.Ready,
-			response.ProcessGeneration,
 		)
 	}
 	return nil
@@ -375,8 +341,9 @@ func (c *Client) AccountMutation(
 }
 
 // AccountMutationTerminal attaches this terminal to the daemon-owned
-// interactive writer. The daemon owns the child, journal, verification, and
-// compensation; the client carries only terminal bytes.
+// interactive writer: input pumps as unary ProvideInput calls, output pages
+// through OpAccountMutationPoll. The daemon owns the child, journal,
+// verification, and compensation; the client carries only terminal bytes.
 func (c *Client) AccountMutationTerminal(
 	ctx context.Context,
 	request AccountMutationRequest,
@@ -385,8 +352,8 @@ func (c *Client) AccountMutationTerminal(
 	onURL func(context.Context, string) error,
 ) (AccountMutationResult, error) {
 	if request.Action != AccountMutationStartOrAttach ||
-		request.Fence != (AccountMutationFence{}) || request.TerminalCursor != nil {
-		return AccountMutationResult{}, errors.New("terminal mutation must start or attach without a fence or terminal cursor")
+		request.Fence != (AccountMutationFence{}) || len(request.Input) != 0 {
+		return AccountMutationResult{}, errors.New("terminal mutation must start or attach without a fence or input")
 	}
 	if stdin == nil {
 		return AccountMutationResult{}, errors.New("terminal mutation stdin is required")
@@ -407,13 +374,13 @@ func (c *Client) AccountMutationTerminal(
 	if initial.Fence.CanonicalOperationID == ([32]byte{}) {
 		return AccountMutationResult{}, errors.New("daemon returned no account mutation fence")
 	}
-	request.Action = AccountMutationProvideInput
-	request.Fence = initial.Fence
-	endpoint, err := newAccountMutationTerminalEndpoint(ctx, c, request)
-	if err != nil {
-		return AccountMutationResult{}, err
+	endpoint := &accountMutationTerminalEndpoint{
+		client: c,
+		request: AccountMutationRequest{
+			Kind: request.Kind, Action: AccountMutationProvideInput,
+			AccountID: initial.AccountID, Fence: initial.Fence,
+		},
 	}
-	defer endpoint.Close()
 	if initial.State == AccountMutationAwaitingInput {
 		const prompt = "Press enter to begin the daemon-owned login session.\r\n"
 		if count, writeErr := io.WriteString(stdout, prompt); writeErr != nil {
@@ -431,40 +398,31 @@ func (c *Client) AccountMutationTerminal(
 	}); err != nil {
 		return AccountMutationResult{}, err
 	}
-	mutation, ok := endpoint.Result()
-	if !ok {
-		return AccountMutationResult{}, errors.New("daemon terminal stream ended without a mutation result")
+	final, err := c.AccountMutation(ctx, request)
+	if err != nil {
+		return AccountMutationResult{}, err
 	}
-	return c.settleAccountMutationResult(ctx, mutation)
+	if err := validateAccountMutationTerminalResult(
+		final, request.Kind, request.AccountID, &initial.Fence,
+	); err != nil {
+		return AccountMutationResult{}, err
+	}
+	if !accountMutationTerminalState(final.State) {
+		return AccountMutationResult{}, errors.New("daemon terminal ended before the mutation settled")
+	}
+	return c.settleAccountMutationResult(ctx, final)
 }
 
+// accountMutationTerminalEndpoint pumps the TUI over the poll-unary lane:
+// Send is one ProvideInput per event, Receive pages the replay cursor.
 type accountMutationTerminalEndpoint struct {
 	client  *Client
 	request AccountMutationRequest
 
-	mu           sync.Mutex
-	session      *clientSession
-	call         *wire.ClientCall
-	nextSequence uint64
-	haveCursor   bool
-	result       AccountMutationResult
-	settled      bool
-	closed       bool
-	stateChanged chan struct{}
-}
-
-func newAccountMutationTerminalEndpoint(
-	ctx context.Context,
-	client *Client,
-	request AccountMutationRequest,
-) (*accountMutationTerminalEndpoint, error) {
-	endpoint := &accountMutationTerminalEndpoint{
-		client: client, request: request, stateChanged: make(chan struct{}),
-	}
-	if err := endpoint.connect(ctx); err != nil {
-		return nil, err
-	}
-	return endpoint, nil
+	mu       sync.Mutex
+	next     uint64
+	buffered [][]byte
+	done     bool
 }
 
 func (e *accountMutationTerminalEndpoint) Send(
@@ -475,50 +433,24 @@ func (e *accountMutationTerminalEndpoint) Send(
 	if err != nil {
 		return err
 	}
-	var call *wire.ClientCall
-	for call == nil {
-		e.mu.Lock()
-		if e.settled {
-			e.mu.Unlock()
-			return nil
-		}
-		if e.closed {
-			e.mu.Unlock()
-			return errors.New("account mutation terminal is closed")
-		}
-		call = e.call
-		changed := e.stateChanged
-		e.mu.Unlock()
-		if call == nil {
-			select {
-			case <-changed:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-	}
-	err = call.SendChunk(ctx, payload)
-	if err == nil || !errors.Is(err, wire.ErrCallDone) {
+	request := e.request
+	request.Input = payload
+	response, err := e.client.doContext(ctx, Request{
+		Op: OpAccountMutation, Mutation: &request,
+	}, 10*time.Second)
+	if err != nil {
 		return err
 	}
-	for {
+	if !response.OK {
 		e.mu.Lock()
-		if e.settled {
-			e.mu.Unlock()
+		done := e.done
+		e.mu.Unlock()
+		if done {
 			return nil
 		}
-		if e.call != call || e.closed {
-			e.mu.Unlock()
-			return err
-		}
-		changed := e.stateChanged
-		e.mu.Unlock()
-		select {
-		case <-changed:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+		return errors.New(response.Error)
 	}
+	return nil
 }
 
 func (e *accountMutationTerminalEndpoint) Receive(
@@ -526,250 +458,73 @@ func (e *accountMutationTerminalEndpoint) Receive(
 ) (accountterminal.TerminalOutput, error) {
 	for {
 		e.mu.Lock()
-		call := e.call
+		if len(e.buffered) > 0 {
+			data := e.buffered[0]
+			e.buffered = e.buffered[1:]
+			sequence := e.next
+			e.next++
+			e.mu.Unlock()
+			return accountterminal.TerminalOutput{Sequence: sequence, Data: data}, nil
+		}
+		if e.done {
+			e.mu.Unlock()
+			return accountterminal.TerminalOutput{}, io.EOF
+		}
+		cursor := e.next
 		e.mu.Unlock()
-		if call == nil {
-			return accountterminal.TerminalOutput{}, errors.New("account mutation terminal is detached")
-		}
-		select {
-		case chunk, ok := <-call.Chunks():
-			if ok {
-				return e.decodeOutput(chunk.Payload)
-			}
-		case <-ctx.Done():
-			return accountterminal.TerminalOutput{}, ctx.Err()
-		}
-		result, err := call.Response(ctx)
-		if err != nil || result.Outcome != wire.Delivered {
-			if ctx.Err() != nil {
-				return accountterminal.TerminalOutput{}, ctx.Err()
-			}
-			failure := &CallError{
-				Op: wire.Op(OpAccountMutation), Outcome: result.Outcome,
-				Reason: result.Response.Reason, Err: err,
-			}
-			if !retryableTerminalCall(result, err) {
-				e.drop(call, false)
-				return accountterminal.TerminalOutput{}, failure
-			}
-			e.drop(call, true)
-			if reconnectErr := e.reconnect(ctx); reconnectErr != nil {
-				return accountterminal.TerminalOutput{}, errors.Join(failure, reconnectErr)
-			}
-			continue
-		}
-		mutation, decodeErr := decodeAccountMutationTerminalResult(result)
-		if decodeErr != nil {
-			e.drop(call, false)
-			return accountterminal.TerminalOutput{}, decodeErr
-		}
-		if validateErr := validateAccountMutationTerminalResult(
-			mutation, e.request.Kind, e.request.AccountID, &e.request.Fence,
-		); validateErr != nil {
-			e.drop(call, false)
-			return accountterminal.TerminalOutput{}, validateErr
-		}
-		if !accountMutationTerminalState(mutation.State) {
-			e.drop(call, false)
-			return accountterminal.TerminalOutput{}, errors.New("daemon terminal stream ended before the mutation settled")
-		}
-		e.complete(call, mutation)
-		return accountterminal.TerminalOutput{}, io.EOF
-	}
-}
 
-func (e *accountMutationTerminalEndpoint) Result() (AccountMutationResult, bool) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.result, e.settled
-}
-
-func (e *accountMutationTerminalEndpoint) Close() {
-	e.mu.Lock()
-	if e.closed {
+		page, err := e.client.pollAccountMutation(ctx, AccountMutationPollRequest{
+			Fence: e.request.Fence, TerminalCursor: cursor, WaitMillis: pollWaitMillis,
+		})
+		if err != nil {
+			return accountterminal.TerminalOutput{}, err
+		}
+		e.mu.Lock()
+		e.buffered = append(e.buffered, page.Chunks...)
+		e.done = e.done || page.Done
 		e.mu.Unlock()
-		return
-	}
-	e.closed = true
-	call := e.call
-	session := e.session
-	e.call = nil
-	e.session = nil
-	e.signalStateLocked()
-	e.mu.Unlock()
-	if call != nil {
-		call.Cancel()
-	}
-	if session != nil {
-		e.client.release(session)
 	}
 }
 
-func (e *accountMutationTerminalEndpoint) connect(ctx context.Context) error {
-	e.mu.Lock()
-	request := e.request
-	if e.haveCursor {
-		cursor := e.nextSequence
-		request.TerminalCursor = &cursor
+// pollAccountMutation pages one attachment's replay cursor. The reply is the
+// bare typed page — poll failures cross as *daemonkit.ProductError, never an
+// in-band envelope.
+func (c *Client) pollAccountMutation(
+	ctx context.Context,
+	poll AccountMutationPollRequest,
+) (AccountMutationPollResponse, error) {
+	if _, stated := ctx.Deadline(); !stated {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, pollWaitMillis*time.Millisecond+5*time.Second)
+		defer cancel()
 	}
-	e.mu.Unlock()
-	payload, err := json.Marshal(Request{Op: OpAccountMutation, Mutation: &request})
+	payload, err := json.Marshal(Request{Op: OpAccountMutationPoll, MutationPoll: &poll})
 	if err != nil {
-		return err
+		return AccountMutationPollResponse{}, fmt.Errorf("encode account mutation poll: %w", err)
 	}
-	session, err := e.client.acquire(ctx)
+	reply, err := c.business.Call(ctx, string(OpAccountMutationPoll), payload)
 	if err != nil {
-		return err
-	}
-	call, err := session.wire.Open(ctx, wire.Op(OpAccountMutation), "", payload, false)
-	if err != nil {
-		e.client.retire(session)
-		e.client.release(session)
-		return err
-	}
-	e.mu.Lock()
-	if e.closed {
-		e.mu.Unlock()
-		call.Cancel()
-		e.client.release(session)
-		return errors.New("account mutation terminal is closed")
-	}
-	e.session = session
-	e.call = call
-	e.signalStateLocked()
-	e.mu.Unlock()
-	return nil
-}
-
-func (e *accountMutationTerminalEndpoint) reconnect(ctx context.Context) error {
-	delay := 25 * time.Millisecond
-	for {
-		timer := time.NewTimer(delay)
-		select {
-		case <-timer.C:
-		case <-ctx.Done():
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			return ctx.Err()
+		if errors.Is(err, daemonkit.ErrAbsent) {
+			return AccountMutationPollResponse{}, fmt.Errorf("%w: %w", ErrDaemonUnavailable, err)
 		}
-		if err := e.connect(ctx); err == nil {
-			return nil
-		} else if ctx.Err() != nil {
-			return ctx.Err()
-		} else if errors.Is(err, ErrDaemonBuildMismatch) || errors.Is(err, wire.ErrProtectedSessionRequired) {
-			return err
-		}
-		if delay < time.Second {
-			delay *= 2
-			if delay > time.Second {
-				delay = time.Second
-			}
-		}
+		return AccountMutationPollResponse{}, err
 	}
-}
-
-func (e *accountMutationTerminalEndpoint) drop(call *wire.ClientCall, retire bool) {
-	e.mu.Lock()
-	if e.call != call {
-		e.mu.Unlock()
-		return
+	var page AccountMutationPollResponse
+	if err := decodeStrict(reply.Body, &page); err != nil {
+		return AccountMutationPollResponse{}, fmt.Errorf("decode account mutation poll page: %w", err)
 	}
-	session := e.session
-	e.call = nil
-	e.session = nil
-	e.signalStateLocked()
-	e.mu.Unlock()
-	if session == nil {
-		return
-	}
-	if retire {
-		e.client.retire(session)
-	}
-	e.client.release(session)
-}
-
-func (e *accountMutationTerminalEndpoint) complete(
-	call *wire.ClientCall,
-	mutation AccountMutationResult,
-) {
-	e.mu.Lock()
-	if e.call != call {
-		e.mu.Unlock()
-		return
-	}
-	session := e.session
-	e.call = nil
-	e.session = nil
-	e.result = mutation
-	e.settled = true
-	e.signalStateLocked()
-	e.mu.Unlock()
-	if session != nil {
-		e.client.release(session)
-	}
-}
-
-func (e *accountMutationTerminalEndpoint) signalStateLocked() {
-	close(e.stateChanged)
-	e.stateChanged = make(chan struct{})
-}
-
-func (e *accountMutationTerminalEndpoint) decodeOutput(payload []byte) (accountterminal.TerminalOutput, error) {
-	if len(payload) <= 8 || len(payload) > accountterminal.TerminalChunkSize+8 {
-		return accountterminal.TerminalOutput{}, errors.New("daemon terminal output frame is empty or oversized")
-	}
-	sequence := binary.BigEndian.Uint64(payload[:8])
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.haveCursor && sequence != e.nextSequence {
-		return accountterminal.TerminalOutput{}, fmt.Errorf(
-			"daemon terminal output sequence %d, want %d", sequence, e.nextSequence,
+	if page.NextCursor != poll.TerminalCursor+uint64(len(page.Chunks)) {
+		return AccountMutationPollResponse{}, fmt.Errorf(
+			"daemon poll page cursor %d does not follow %d over %d chunks",
+			page.NextCursor, poll.TerminalCursor, len(page.Chunks),
 		)
 	}
-	if sequence == ^uint64(0) {
-		return accountterminal.TerminalOutput{}, errors.New("daemon terminal output sequence exhausted")
+	for _, chunk := range page.Chunks {
+		if len(chunk) == 0 || len(chunk) > accountterminal.TerminalChunkSize {
+			return AccountMutationPollResponse{}, errors.New("daemon poll chunk is empty or oversized")
+		}
 	}
-	e.nextSequence = sequence + 1
-	e.haveCursor = true
-	return accountterminal.TerminalOutput{
-		Sequence: sequence, Data: append([]byte(nil), payload[8:]...),
-	}, nil
-}
-
-func decodeAccountMutationTerminalResult(result wire.Result) (AccountMutationResult, error) {
-	if result.Response.Err != "" {
-		return AccountMutationResult{}, errors.New(result.Response.Err)
-	}
-	var response Response
-	if err := decodeStrict(result.Response.Payload, &response); err != nil {
-		return AccountMutationResult{}, err
-	}
-	if !response.OK {
-		return AccountMutationResult{}, errors.New(response.Error)
-	}
-	if response.AccountMutation == nil {
-		return AccountMutationResult{}, errors.New("daemon returned no account mutation result")
-	}
-	return *response.AccountMutation, nil
-}
-
-func retryableTerminalCall(result wire.Result, err error) bool {
-	if errors.Is(err, ErrDaemonBuildMismatch) || errors.Is(err, wire.ErrProtectedSessionRequired) {
-		return false
-	}
-	switch result.Outcome {
-	case wire.PreSendFailure, wire.PostSendFailure, wire.DeliveryUnknown:
-		return true
-	case wire.Rejected:
-		return result.Response.Reason == wire.ErrQueueFull.Error() ||
-			result.Response.Reason == wire.ErrDraining.Error()
-	default:
-		return false
-	}
+	return page, nil
 }
 
 func validateAccountMutationTerminalResult(
@@ -849,7 +604,7 @@ func (c *Client) ackAccountMutation(ctx context.Context, operationID [32]byte) e
 				return nil
 			}
 			err = errors.New(ack.Error)
-		} else if !retryableAccountMutationAck(err) {
+		} else if !daemonkit.Undispatched(err) {
 			return err
 		}
 		timer := time.NewTimer(delay)
@@ -873,159 +628,6 @@ func (c *Client) ackAccountMutation(ctx context.Context, operationID [32]byte) e
 	}
 }
 
-func retryableAccountMutationAck(err error) bool {
-	var callErr *CallError
-	if !errors.As(err, &callErr) || errors.Is(err, ErrDaemonBuildMismatch) {
-		return false
-	}
-	if callErr.Outcome == wire.Rejected {
-		return callErr.Reason == wire.ErrQueueFull.Error() || callErr.Reason == wire.ErrDraining.Error()
-	}
-	return callErr.Outcome == wire.PreSendFailure ||
-		callErr.Outcome == wire.PostSendFailure || callErr.Outcome == wire.DeliveryUnknown
-}
-
-func (c *Client) call(ctx context.Context, op wire.Op, payload []byte) (wire.Result, error) {
-	session, err := c.acquire(ctx)
-	if err != nil {
-		return wire.Result{Outcome: wire.PreSendFailure}, &CallError{Op: op, Outcome: wire.PreSendFailure, Err: err}
-	}
-	result, callErr := session.wire.Call(ctx, op, "", payload)
-	if callErr != nil || result.Outcome != wire.Delivered {
-		c.retire(session)
-	}
-	c.release(session)
-	if callErr != nil || result.Outcome != wire.Delivered {
-		return result, &CallError{Op: op, Outcome: result.Outcome, Reason: result.Response.Reason, Err: callErr}
-	}
-	return result, nil
-}
-
-func (c *Client) acquire(ctx context.Context) (*clientSession, error) {
-	for {
-		c.mu.Lock()
-		if c.closed {
-			c.mu.Unlock()
-			return nil, errors.New("daemon client closed")
-		}
-		if c.current != nil && !c.current.stale {
-			session := c.current
-			session.active++
-			c.mu.Unlock()
-			return session, nil
-		}
-		if c.dialing != nil {
-			dialing := c.dialing
-			c.mu.Unlock()
-			select {
-			case <-dialing:
-				continue
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		}
-		dialing := make(chan struct{})
-		c.dialing = dialing
-		c.mu.Unlock()
-
-		session, err := c.dial(ctx)
-		c.mu.Lock()
-		c.dialing = nil
-		if err == nil && !c.closed {
-			if c.sessions == nil {
-				c.sessions = make(map[*clientSession]struct{})
-			}
-			c.generation++
-			session.generation = c.generation
-			session.active = 1
-			c.current = session
-			c.sessions[session] = struct{}{}
-		}
-		closed := c.closed
-		close(dialing)
-		c.mu.Unlock()
-		if err != nil {
-			if provesNoListener(err) {
-				return nil, ErrDaemonUnavailable
-			}
-			return nil, err
-		}
-		if closed {
-			_ = session.wire.Close()
-			return nil, errors.New("daemon client closed")
-		}
-		return session, nil
-	}
-}
-
-func (c *Client) dial(ctx context.Context) (*clientSession, error) {
-	ladder, err := operationLadder()
-	if err != nil {
-		return nil, err
-	}
-	client, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(c.socket), WireBuild: c.clientBuild(), Role: trust.UnprotectedRole, Ladder: ladder,
-	})
-	if err != nil {
-		if errors.Is(err, wire.ErrBuildMismatch) {
-			return nil, fmt.Errorf("%w: %w", ErrDaemonBuildMismatch, err)
-		}
-		return nil, fmt.Errorf("connect daemon: %w", err)
-	}
-	peer := client.PeerWireIdentity()
-	if peer.WireBuild != c.clientBuild() {
-		mismatch := fmt.Errorf(
-			"%w: peer %q, client %q",
-			ErrDaemonBuildMismatch,
-			peer.WireBuild,
-			c.clientBuild(),
-		)
-		return nil, errors.Join(mismatch, client.Close())
-	}
-	return &clientSession{wire: client}, nil
-}
-
-func (c *Client) clientBuild() string {
-	if c.build != "" {
-		return c.build
-	}
-	return WireBuild
-}
-
-func (c *Client) clientRuntimeBuild() string {
-	if c.runtimeBuild != "" {
-		return c.runtimeBuild
-	}
-	return version.String()
-}
-
-func (c *Client) retire(session *clientSession) {
-	c.mu.Lock()
-	session.stale = true
-	if c.current == session && c.current.generation == session.generation {
-		c.current = nil
-	}
-	c.mu.Unlock()
-}
-
-func (c *Client) release(session *clientSession) {
-	var closeSession bool
-	c.mu.Lock()
-	session.active--
-	if session.active < 0 {
-		c.mu.Unlock()
-		panic("daemon: negative client session references")
-	}
-	if session.stale && session.active == 0 {
-		delete(c.sessions, session)
-		closeSession = true
-	}
-	c.mu.Unlock()
-	if closeSession {
-		_ = session.wire.Close()
-	}
-}
-
 func decodeStrict(payload []byte, target any) error {
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
@@ -1040,8 +642,4 @@ func decodeStrict(payload []byte, target any) error {
 		return err
 	}
 	return nil
-}
-
-func provesNoListener(err error) bool {
-	return errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED)
 }

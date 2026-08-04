@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -16,6 +17,8 @@ import (
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
+	"github.com/yasyf/cc-pool/internal/workerexec"
+	"github.com/yasyf/daemonkit"
 )
 
 type hostSyncWorkerSessions struct {
@@ -128,7 +131,7 @@ func (r *hostSyncWorkerRemover) runtime(ctx context.Context) (*tenantCoordinator
 	if r.coordinator != nil {
 		return r.coordinator, nil
 	}
-	client, err := tenantfs.NewControlClient(ctx, pool.FuseKitSocketPath())
+	client, err := tenantfs.NewControlClient(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("connect FuseKit runtime: %w", err)
 	}
@@ -150,27 +153,49 @@ func (r *hostSyncWorkerRemover) Close() error {
 	if r.client == nil {
 		return nil
 	}
-	err := r.client.Close()
+	closeCtx, cancel := context.WithTimeout(context.Background(), hostSyncWorkerScopeTimeout)
+	defer cancel()
+	err := r.client.Close(closeCtx)
 	r.client = nil
 	r.coordinator = nil
 	return err
 }
 
+// hostSyncWorkerScopeTimeout bounds opening and settling the worker's own
+// process-ownership scope, not the operations it runs.
+const hostSyncWorkerScopeTimeout = 10 * time.Second
+
 // RunHostSyncWorker reconstructs and executes one complete host-sync operation
-// inside one daemonkit-owned disposable command.
+// inside one daemonkit-owned disposable command. The worker already runs in a
+// dedicated session its spawner settles whole, so its ownership scope is
+// per-invocation: the record file carries nothing across runs and is never
+// contended by a concurrent worker.
 func RunHostSyncWorker(
 	ctx context.Context,
 	input io.Reader,
 	output io.Writer,
 ) (err error) {
-	manager, err := pool.OpenHostSyncWorker(ctx)
+	openCtx, cancelOpen := context.WithTimeout(ctx, hostSyncWorkerScopeTimeout)
+	owned, err := daemonkit.OwnProcesses(openCtx, filepath.Join(
+		workerexec.TempDir(), fmt.Sprintf("cc-pool-hostsync-scope-%d.db", os.Getpid()),
+	))
+	cancelOpen()
+	if err != nil {
+		return fmt.Errorf("open host-sync worker process scope: %w", err)
+	}
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hostSyncWorkerScopeTimeout)
+		defer cancel()
+		err = errors.Join(err, owned.Close(closeCtx))
+	}()
+	manager, err := pool.OpenHostSyncWorker(owned.Ctx(ctx))
 	if err != nil {
 		return err
 	}
 	remover := &hostSyncWorkerRemover{lifecycle: ctx, manager: manager}
-	defer func(ctx context.Context) {
-		err = errors.Join(err, remover.Close(), manager.Close(ctx))
-	}(ctx)
+	defer func() {
+		err = errors.Join(err, remover.Close(), manager.Close())
+	}()
 
 	manifestPath, err := hostsync.ManifestPath()
 	if err != nil {

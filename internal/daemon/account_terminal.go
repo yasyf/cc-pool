@@ -13,7 +13,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/daemonkit/wire"
 )
 
 const (
@@ -259,34 +258,31 @@ func encodeAccountTerminalInput(event accountterminal.TerminalInput) ([]byte, er
 	}
 }
 
-func decodeAccountTerminalInput(chunk wire.Chunk) (accountterminal.TerminalInput, error) {
-	if chunk.End && len(chunk.Payload) == 0 {
-		return accountterminal.TerminalInput{Kind: accountterminal.TerminalInputEOF}, nil
+func decodeAccountTerminalInput(payload []byte) (accountterminal.TerminalInput, error) {
+	if len(payload) == 0 {
+		return accountterminal.TerminalInput{}, errors.New("terminal input event is empty")
 	}
-	if len(chunk.Payload) == 0 {
-		return accountterminal.TerminalInput{}, nil
-	}
-	switch chunk.Payload[0] {
+	switch payload[0] {
 	case accountTerminalBytes:
-		if len(chunk.Payload) == 1 || len(chunk.Payload) > accountterminal.TerminalChunkSize {
+		if len(payload) == 1 || len(payload) > accountterminal.TerminalChunkSize {
 			return accountterminal.TerminalInput{}, errors.New("terminal byte input is empty or oversized")
 		}
 		return accountterminal.TerminalInput{
-			Kind: accountterminal.TerminalInputBytes, Data: append([]byte(nil), chunk.Payload[1:]...),
+			Kind: accountterminal.TerminalInputBytes, Data: append([]byte(nil), payload[1:]...),
 		}, nil
 	case accountTerminalResize:
-		if len(chunk.Payload) != 5 {
+		if len(payload) != 5 {
 			return accountterminal.TerminalInput{}, errors.New("terminal resize input is malformed")
 		}
 		return accountterminal.TerminalInput{
 			Kind: accountterminal.TerminalInputResize,
 			Size: accountterminal.TerminalSize{
-				Rows: binary.BigEndian.Uint16(chunk.Payload[1:3]),
-				Cols: binary.BigEndian.Uint16(chunk.Payload[3:5]),
+				Rows: binary.BigEndian.Uint16(payload[1:3]),
+				Cols: binary.BigEndian.Uint16(payload[3:5]),
 			},
 		}, nil
 	case accountTerminalEOF:
-		if len(chunk.Payload) != 1 {
+		if len(payload) != 1 {
 			return accountterminal.TerminalInput{}, errors.New("terminal EOF input is malformed")
 		}
 		return accountterminal.TerminalInput{Kind: accountterminal.TerminalInputEOF}, nil

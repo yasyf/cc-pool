@@ -96,12 +96,14 @@ const (
 // AccountMutationRequest carries workflow intent plus the exact daemon-issued
 // fence required after StartOrAttach. It cannot select an internal mutation transition.
 type AccountMutationRequest struct {
-	Kind           AccountMutationKind   `json:"kind"`
-	Action         AccountMutationAction `json:"action"`
-	AccountID      int                   `json:"account_id,omitempty"`
-	Label          string                `json:"label,omitempty"`
-	Fence          AccountMutationFence  `json:"fence,omitzero"`
-	TerminalCursor *uint64               `json:"terminal_cursor,omitempty"`
+	Kind      AccountMutationKind   `json:"kind"`
+	Action    AccountMutationAction `json:"action"`
+	AccountID int                   `json:"account_id,omitempty"`
+	Label     string                `json:"label,omitempty"`
+	Fence     AccountMutationFence  `json:"fence,omitzero"`
+	// Input carries exactly one encoded terminal input event; ProvideInput
+	// requires it and every other action refuses it.
+	Input []byte `json:"input,omitempty"`
 }
 
 // AccountMutationFence prevents publication across account/removal/credential drift.

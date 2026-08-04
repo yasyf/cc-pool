@@ -7,8 +7,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io"
-	"sync"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/accountterminal"
@@ -16,12 +14,10 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 )
 
 const (
-	accountMutationStreamQueue = 32
-	accountMutationInputWait   = 5 * time.Minute
 	accountMutationReceiptTTL  = 24 * time.Hour
 	accountMutationProbeWait   = 5 * time.Second
 	accountMutationSettleWait  = 30 * time.Second
@@ -73,30 +69,22 @@ func (s *Server) handleAccountMutationAck(ctx context.Context, request Request) 
 	return Response{OK: true}
 }
 
-func (s *Server) handleAccountMutationWire(
+func (s *Server) handleAccountMutation(
 	ctx context.Context,
-	wireRequest wire.Request,
+	session daemonkit.Session,
 	request Request,
-) (any, error) {
+) Response {
 	if request.Mutation == nil {
-		return nil, errors.New("account mutation request is required")
+		return Response{Error: "account mutation request is required"}
 	}
 	if err := validateAccountMutationCommand(*request.Mutation); err != nil {
-		return nil, err
+		return Response{Error: err.Error()}
 	}
-	output := make(chan []byte, accountMutationStreamQueue)
-	response := &Response{}
-	go func() {
-		defer close(output)
-		result, err := s.runAccountMutation(ctx, *request.Mutation, wireRequest.Chunks, output)
-		if err != nil {
-			response.Error = err.Error()
-			return
-		}
-		response.OK = true
-		response.AccountMutation = &result
-	}()
-	return wire.StreamResponse{Chunks: output, Value: response}, nil
+	result, err := s.runAccountMutation(ctx, session, *request.Mutation)
+	if err != nil {
+		return Response{Error: err.Error()}
+	}
+	return Response{OK: true, AccountMutation: &result}
 }
 
 func validateAccountMutationCommand(request AccountMutationRequest) error {
@@ -117,15 +105,18 @@ func validateAccountMutationCommand(request AccountMutationRequest) error {
 		if request.Fence != (AccountMutationFence{}) {
 			return errors.New("start-or-attach mutation cannot carry a fence")
 		}
-		if request.TerminalCursor != nil {
-			return errors.New("start-or-attach mutation cannot carry a terminal cursor")
+		if len(request.Input) != 0 {
+			return errors.New("start-or-attach mutation cannot carry terminal input")
 		}
 	case AccountMutationProvideInput, AccountMutationCancel:
 		if request.Fence == (AccountMutationFence{}) || request.Fence.CanonicalOperationID == ([32]byte{}) {
 			return errors.New("account mutation fence is required")
 		}
-		if request.Action == AccountMutationCancel && request.TerminalCursor != nil {
-			return errors.New("cancel mutation cannot carry a terminal cursor")
+		if request.Action == AccountMutationCancel && len(request.Input) != 0 {
+			return errors.New("cancel mutation cannot carry terminal input")
+		}
+		if request.Action == AccountMutationProvideInput && len(request.Input) == 0 {
+			return errors.New("provide-input mutation requires terminal input")
 		}
 	default:
 		return errors.New("unknown account mutation action")
@@ -135,9 +126,8 @@ func validateAccountMutationCommand(request AccountMutationRequest) error {
 
 func (s *Server) runAccountMutation(
 	ctx context.Context,
+	session daemonkit.Session,
 	request AccountMutationRequest,
-	input <-chan wire.Chunk,
-	output chan<- []byte,
 ) (AccountMutationResult, error) {
 	var active store.AccountMutation
 	var receipt *store.AccountMutationReceipt
@@ -154,65 +144,111 @@ func (s *Server) runAccountMutation(
 		s.accountMutationMu.Lock()
 		running := s.accountMutationRuns[receipt.OperationID]
 		s.accountMutationMu.Unlock()
-		if running != nil {
-			switch request.Action {
-			case AccountMutationStartOrAttach:
-				return accountMutationRetainedResult(*receipt), nil
-			case AccountMutationProvideInput:
-				return s.attachAccountMutationRun(
-					ctx, running, request.TerminalCursor, input, output,
-				)
-			}
+		if running != nil && request.Action == AccountMutationStartOrAttach {
+			return accountMutationRetainedResult(*receipt), nil
 		}
 		if err := s.prepareCommittedAccountMutation(ctx, *receipt); err != nil {
 			return AccountMutationResult{}, err
 		}
 		return accountMutationReceiptResult(*receipt), nil
 	}
-	if request.Action == AccountMutationStartOrAttach {
+	switch request.Action {
+	case AccountMutationStartOrAttach:
 		return accountMutationActiveResult(active), nil
-	}
-	if request.Action == AccountMutationCancel {
+	case AccountMutationCancel:
 		if active.State != store.AccountMutationAwaitingInput {
 			return AccountMutationResult{}, errors.New("account mutation already crossed the input boundary")
 		}
-		receipt, err := s.m.Store.ResolveAccountMutation(
+		resolved, err := s.m.Store.ResolveAccountMutation(
 			active.Fence(), store.AccountMutationAborted,
 			active.ExpectedCredentialDigest, nil, time.Now().Add(accountMutationReceiptTTL),
 		)
 		if err != nil {
 			return AccountMutationResult{}, err
 		}
-		return accountMutationReceiptResult(receipt), nil
+		return accountMutationReceiptResult(resolved), nil
+	default:
+		return s.provideAccountMutationInput(ctx, session, active, request)
 	}
-	return s.runAttachedAccountMutation(ctx, active, request.TerminalCursor, input, output)
 }
 
-func (s *Server) runAttachedAccountMutation(
+// provideAccountMutationInput delivers one terminal input event. The first
+// byte-carrying event starts the terminal run; a resize before it only records
+// the size the terminal will start at, exactly as the retired stream's
+// first-input scan did.
+func (s *Server) provideAccountMutationInput(
 	ctx context.Context,
+	session daemonkit.Session,
 	active store.AccountMutation,
-	cursor *uint64,
-	input <-chan wire.Chunk,
-	output chan<- []byte,
+	request AccountMutationRequest,
 ) (AccountMutationResult, error) {
+	event, err := decodeAccountTerminalInput(request.Input)
+	if err != nil {
+		return AccountMutationResult{}, err
+	}
 	operationID := active.OperationID
 	s.accountMutationMu.Lock()
 	if s.accountMutationRuns == nil {
 		s.accountMutationRuns = make(map[store.AccountMutationID]*accountMutationRun)
 	}
-	if running := s.accountMutationRuns[active.OperationID]; running != nil {
+	running := s.accountMutationRuns[operationID]
+	if running == nil {
+		switch event.Kind {
+		case accountterminal.TerminalInputResize:
+			if s.accountMutationSizes == nil {
+				s.accountMutationSizes = make(map[store.AccountMutationID]accountterminal.TerminalSize)
+			}
+			s.accountMutationSizes[operationID] = event.Size
+			s.accountMutationMu.Unlock()
+			return accountMutationActiveResult(active), nil
+		case accountterminal.TerminalInputEOF:
+			s.accountMutationMu.Unlock()
+			return accountMutationActiveResult(active), nil
+		}
+		size := s.accountMutationSizes[operationID]
+		delete(s.accountMutationSizes, operationID)
+		running = &accountMutationRun{ready: make(chan struct{}), done: make(chan struct{})}
+		s.accountMutationRuns[operationID] = running
 		s.accountMutationMu.Unlock()
-		return s.attachAccountMutationRun(ctx, running, cursor, input, output)
+		return s.startAccountMutationTerminal(ctx, session, active, running, event, size)
 	}
-	if cursor != nil {
-		s.accountMutationMu.Unlock()
-		return AccountMutationResult{}, accountterminal.ErrTerminalOutputCursor
-	}
-	running := &accountMutationRun{ready: make(chan struct{}), done: make(chan struct{})}
-	s.accountMutationRuns[active.OperationID] = running
 	s.accountMutationMu.Unlock()
+	select {
+	case <-running.ready:
+	case <-ctx.Done():
+		return AccountMutationResult{}, ctx.Err()
+	}
+	if running.terminal == nil {
+		select {
+		case <-running.done:
+			return running.result, running.err
+		case <-ctx.Done():
+			return AccountMutationResult{}, ctx.Err()
+		}
+	}
+	pa, err := s.accountMutationAttachment(session, operationID, running, nil)
+	if err != nil {
+		return AccountMutationResult{}, err
+	}
+	if err := pa.ensureControl(ctx); err != nil {
+		return AccountMutationResult{}, err
+	}
+	if err := pa.attachment.Send(ctx, event); err != nil {
+		return AccountMutationResult{}, err
+	}
+	return accountMutationActiveResult(active), nil
+}
 
-	active, terminal, attachment, result, err := s.startAccountMutationRun(ctx, active, input)
+func (s *Server) startAccountMutationTerminal(
+	ctx context.Context,
+	session daemonkit.Session,
+	active store.AccountMutation,
+	running *accountMutationRun,
+	first accountterminal.TerminalInput,
+	size accountterminal.TerminalSize,
+) (AccountMutationResult, error) {
+	operationID := active.OperationID
+	active, terminal, attachment, result, err := s.startAccountMutationRun(ctx, active, first, size)
 	if terminal == nil {
 		running.result, running.err = result, err
 		close(running.ready)
@@ -241,13 +277,15 @@ func (s *Server) runAttachedAccountMutation(
 		defer cancelLifetime(context.Canceled)
 		s.watchAccountMutationRun(ctx, active, running)
 	}(lifetime)
-	return s.relayAccountMutationRun(ctx, running, attachment, true, input, output)
+	s.adoptAccountMutationAttachment(session, operationID, attachment)
+	return accountMutationActiveResult(active), nil
 }
 
 func (s *Server) startAccountMutationRun(
 	ctx context.Context,
 	active store.AccountMutation,
-	input <-chan wire.Chunk,
+	first accountterminal.TerminalInput,
+	size accountterminal.TerminalSize,
 ) (
 	store.AccountMutation,
 	accountMutationTerminal,
@@ -268,13 +306,6 @@ func (s *Server) startAccountMutationRun(
 	}
 
 	if active.State == store.AccountMutationAwaitingInput {
-		first, size, ok, err := firstAccountMutationInput(ctx, input)
-		if err != nil {
-			return active, nil, nil, AccountMutationResult{}, err
-		}
-		if !ok {
-			return active, nil, nil, accountMutationActiveResult(active), nil
-		}
 		fence, err := s.m.Store.MarkAccountMutationInputProvided(
 			active.Fence(), accountMutationInputDigest(active.OperationID),
 		)
@@ -348,205 +379,6 @@ func (s *Server) startAccountMutationRun(
 	}
 	result, err := s.finishOrQuarantineAccountMutation(ctx, active)
 	return active, nil, nil, result, err
-}
-
-func (s *Server) attachAccountMutationRun(
-	ctx context.Context,
-	running *accountMutationRun,
-	cursor *uint64,
-	input <-chan wire.Chunk,
-	output chan<- []byte,
-) (AccountMutationResult, error) {
-	select {
-	case <-running.ready:
-	case <-ctx.Done():
-		return AccountMutationResult{}, ctx.Err()
-	}
-	if running.terminal == nil {
-		select {
-		case <-running.done:
-			return running.result, running.err
-		case <-ctx.Done():
-			return AccountMutationResult{}, ctx.Err()
-		}
-	}
-	var replay *accountterminal.TerminalOutputCursor
-	if cursor != nil {
-		replay = &accountterminal.TerminalOutputCursor{NextSequence: *cursor}
-	}
-	attachment, controller, err := claimAccountMutationAttachment(ctx, running, replay)
-	if err != nil {
-		return AccountMutationResult{}, err
-	}
-	return s.relayAccountMutationRun(ctx, running, attachment, controller, input, output)
-}
-
-func claimAccountMutationAttachment(
-	ctx context.Context,
-	running *accountMutationRun,
-	cursor *accountterminal.TerminalOutputCursor,
-) (accountMutationTerminalAttachment, bool, error) {
-	attachment, err := running.terminal.Attach(context.WithoutCancel(ctx), accountterminal.TerminalAttachmentSpec{
-		Role: accountterminal.TerminalObserver, DisconnectPolicy: accountterminal.DetachOnDisconnect, Cursor: cursor,
-	})
-	if err != nil {
-		return nil, false, err
-	}
-	_, err = attachment.ClaimControl(
-		ctx, accountterminal.DetachOnDisconnect, accountterminal.DefaultTerminalControlLease,
-	)
-	switch {
-	case err == nil:
-		return attachment, true, nil
-	case errors.Is(err, accountterminal.ErrTerminalControllerAttached),
-		errors.Is(err, accountterminal.ErrTerminalSettled):
-		return attachment, false, nil
-	default:
-		_ = attachment.Close()
-		return nil, false, err
-	}
-}
-
-func (s *Server) relayAccountMutationRun(
-	ctx context.Context,
-	running *accountMutationRun,
-	attachment accountMutationTerminalAttachment,
-	controller bool,
-	input <-chan wire.Chunk,
-	output chan<- []byte,
-) (AccountMutationResult, error) {
-	ioCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	defer func() { _ = attachment.Close() }()
-	errorsOut := make(chan error, 2)
-	controlReady := make(chan struct{})
-	if controller {
-		close(controlReady)
-	}
-	var pumps sync.WaitGroup
-	pumps.Add(1)
-	go func() {
-		defer pumps.Done()
-		select {
-		case <-controlReady:
-		case <-ioCtx.Done():
-			return
-		}
-		for {
-			select {
-			case <-ioCtx.Done():
-				return
-			case chunk, ok := <-input:
-				if !ok {
-					return
-				}
-				event, err := decodeAccountTerminalInput(chunk)
-				if err == nil && event.Kind != 0 {
-					err = attachment.Send(ioCtx, event)
-				}
-				if err != nil {
-					select {
-					case errorsOut <- err:
-					default:
-					}
-					cancel()
-					return
-				}
-				if event.Kind == accountterminal.TerminalInputEOF {
-					return
-				}
-			}
-		}
-	}()
-	pumps.Add(1)
-	go func() {
-		defer pumps.Done()
-		if !controller {
-			retry := time.NewTicker(25 * time.Millisecond)
-			defer retry.Stop()
-			for {
-				_, err := attachment.ClaimControl(
-					ioCtx, accountterminal.DetachOnDisconnect, accountterminal.DefaultTerminalControlLease,
-				)
-				switch {
-				case err == nil:
-					close(controlReady)
-					controller = true
-				case errors.Is(err, accountterminal.ErrTerminalControllerAttached):
-				case errors.Is(err, accountterminal.ErrTerminalSettled):
-					return
-				default:
-					select {
-					case errorsOut <- err:
-					default:
-					}
-					cancel()
-					return
-				}
-				if controller {
-					break
-				}
-				select {
-				case <-retry.C:
-				case <-ioCtx.Done():
-					return
-				}
-			}
-		}
-		renew := time.NewTicker(accountterminal.DefaultTerminalControlLease / 3)
-		defer renew.Stop()
-		for {
-			select {
-			case <-ioCtx.Done():
-				return
-			case <-renew.C:
-				if _, err := attachment.RenewControl(ioCtx); err != nil {
-					select {
-					case errorsOut <- err:
-					default:
-					}
-					cancel()
-					return
-				}
-			}
-		}
-	}()
-
-	var relayErr error
-	for {
-		terminalOutput, err := attachment.Receive(ioCtx)
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			relayErr = err
-			break
-		}
-		payload, err := encodeAccountTerminalOutput(terminalOutput)
-		if err == nil {
-			err = sendAccountMutationOutput(ioCtx, output, payload)
-		}
-		if err != nil {
-			relayErr = err
-			break
-		}
-	}
-	cancel()
-	pumps.Wait()
-	select {
-	case err := <-errorsOut:
-		relayErr = errors.Join(relayErr, err)
-	default:
-	}
-	if relayErr != nil {
-		return AccountMutationResult{}, relayErr
-	}
-	select {
-	case <-running.done:
-		return running.result, running.err
-	case <-ctx.Done():
-		return AccountMutationResult{}, ctx.Err()
-	}
 }
 
 func (s *Server) watchAccountMutationRun(
@@ -899,7 +731,7 @@ func (s *Server) bindAccountMutationPresentation(
 	if err != nil {
 		current, readErr := s.m.Store.AccountMutation(mutation.OperationID)
 		if readErr == nil && current.State == store.AccountMutationAwaitingPresentation &&
-			current.Owner == mutation.Owner && current.OwnerEpoch == mutation.OwnerEpoch &&
+			bytes.Equal(current.Owner, mutation.Owner) && current.OwnerEpoch == mutation.OwnerEpoch &&
 			current.AccountInstanceID == mutation.AccountInstanceID &&
 			current.AccountGeneration == mutation.AccountGeneration {
 			return store.AccountMutation{}, s.retireAndCancelUnboundAccountMutation(
@@ -1407,48 +1239,6 @@ func accountMutationIntentDigest(kind store.AccountMutationKind, accountID int, 
 
 func accountMutationInputDigest(operationID store.AccountMutationID) store.CredentialDigest {
 	return store.CredentialDigest(sha256.Sum256(append([]byte("cc-pool:terminal-input:v1\x00"), operationID[:]...)))
-}
-
-func firstAccountMutationInput(
-	ctx context.Context,
-	input <-chan wire.Chunk,
-) (accountterminal.TerminalInput, accountterminal.TerminalSize, bool, error) {
-	var size accountterminal.TerminalSize
-	timer := time.NewTimer(accountMutationInputWait)
-	defer timer.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return accountterminal.TerminalInput{}, size, false, nil
-		case <-timer.C:
-			return accountterminal.TerminalInput{}, size, false, nil
-		case chunk, ok := <-input:
-			if !ok {
-				return accountterminal.TerminalInput{}, size, false, nil
-			}
-			event, err := decodeAccountTerminalInput(chunk)
-			if err != nil {
-				return accountterminal.TerminalInput{}, size, false, err
-			}
-			switch event.Kind {
-			case accountterminal.TerminalInputResize:
-				size = event.Size
-			case accountterminal.TerminalInputBytes:
-				return event, size, true, nil
-			case accountterminal.TerminalInputEOF:
-				return accountterminal.TerminalInput{}, size, false, nil
-			}
-		}
-	}
-}
-
-func sendAccountMutationOutput(ctx context.Context, output chan<- []byte, payload []byte) error {
-	select {
-	case output <- payload:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 }
 
 func accountMutationActiveResult(mutation store.AccountMutation) AccountMutationResult {

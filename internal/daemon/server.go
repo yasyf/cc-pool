@@ -56,6 +56,7 @@ const (
 // Server is the running daemon.
 type Server struct {
 	m        *pool.Manager
+	scope    daemonkit.Ctx
 	socket   string
 	snapshot string // status mirror path; tests point it into a temp dir
 	log      *log.Logger
@@ -155,6 +156,13 @@ type Server struct {
 	accountMutationOwner    func() (store.OwnerRecord, error)
 	accountMutationMu       sync.Mutex
 	accountMutationRuns     map[store.AccountMutationID]*accountMutationRun
+	accountMutationSizes    map[store.AccountMutationID]accountterminal.TerminalSize
+
+	// pollMu guards the per-session attachment registry the poll-unary
+	// observation lane keys by (session, operation).
+	pollMu          sync.Mutex
+	pollAttachments map[pollKey]*pollAttachment
+	pollSessions    map[uint64]bool
 }
 
 var ensureHolderRuntime = EnsureHolderService
@@ -200,6 +208,7 @@ func Run(ctx context.Context) error {
 // start builds the product once Serve proved ownership; its return is
 // readiness, so business admission opens exactly when it succeeds.
 func (s *Server) start(scope daemonkit.Ctx) (daemonkit.Product, error) {
+	s.scope = scope
 	s.report = scope.Report
 	s.stopServe = scope.Stop
 	m, err := pool.OpenDaemon(scope)
@@ -248,7 +257,7 @@ func (s *Server) activate(scope daemonkit.Ctx) (err error) {
 		return err
 	}
 	s.accountTerminals = terminals
-	tenantClient, err := tenantfs.NewControlClient(ctx, pool.FuseKitSocketPath())
+	tenantClient, err := tenantfs.NewControlClient(ctx)
 	if err != nil {
 		return fmt.Errorf("connect FuseKit runtime: %w", err)
 	}

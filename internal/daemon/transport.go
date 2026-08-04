@@ -25,8 +25,10 @@ func (s *Server) Handle(ctx context.Context, req daemonkit.Request) (daemonkit.R
 	switch op {
 	case OpSelect, OpSelectCommit, OpSelectAbort, OpStatus,
 		OpAccountRemove, OpAccountIdentity, OpAccountHealth,
-		OpAccountMutation, OpAccountMutationAck:
+		OpAccountMutationAck:
 		return reply(s.dispatch(ctx, request))
+	case OpAccountMutation:
+		return reply(s.handleAccountMutation(ctx, req.Session, request))
 	case OpAccountMutationPoll:
 		return s.handleAccountMutationPoll(ctx, req, request)
 	default:

@@ -19,9 +19,6 @@ import (
 // enable needs no daemon restart — and it must run before serve admits any
 // handler: handlers read s.syncPull / s.authKind unlocked.
 func (s *Server) setupSync(ctx context.Context) error {
-	if s.syncSocket == "" {
-		return fmt.Errorf("no sync socket path configured")
-	}
 	self, err := s.resolveSyncSelf(ctx)
 	if err != nil {
 		return err
@@ -71,7 +68,7 @@ func (s *Server) setupSync(ctx context.Context) error {
 	if err := s.startSyncHelper(ctx, workerExecutable, synckitdExecutable); err != nil {
 		return err
 	}
-	client := syncservice.NewClient(syncservice.Socket(s.syncSocket))
+	client := syncservice.NewClient(syncservice.Resident(hostsync.SyncServiceID))
 	defer func() {
 		if !wired {
 			_ = client.Close()
