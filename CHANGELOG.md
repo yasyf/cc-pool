@@ -37,8 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each other by exact build identity instead of attempting to interoperate.
 - The first launch after upgrading from `0.64.x` retires the previous service
   registration and takes over the legacy socket lock before claiming any work,
-  so it replaces a running legacy daemon rather than racing it. This happens
-  once per machine.
+  so it replaces a running legacy daemon rather than racing it. It then settles
+  any interactive login terminal a crashed `0.64.x` daemon left running, so a
+  surviving login cannot write over credentials the upgraded daemon is about to
+  refresh. Both happen once per machine.
 - The sync helper runs as a resident service on its own socket, addressed by
   the service it registers rather than by a path the pool computes.
 
