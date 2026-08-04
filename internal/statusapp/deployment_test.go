@@ -21,6 +21,7 @@ import (
 const (
 	testBundleDigest       = "1111111111111111111111111111111111111111111111111111111111111111"
 	testEntitlementsDigest = "2222222222222222222222222222222222222222222222222222222222222222"
+	testServingPID         = 4242
 )
 
 type recordingDeployer struct {
@@ -119,6 +120,13 @@ func useDeploymentMetadata(t *testing.T, controller *recordingDeployer) string {
 		return controller, nil
 	}
 	t.Cleanup(func() { newDeployer = oldDeployer })
+
+	swapDeploymentVar(t, &tenantLaneReady, func(context.Context) (daemonkit.Health, error) {
+		return daemonkit.Health{Phase: daemonkit.PhaseReady, PID: testServingPID}, nil
+	})
+	swapDeploymentVar(t, &deployInventory, func(...string) (deploy.Survivors, error) {
+		return deploy.Survivors{Live: []deploy.LiveProcess{{PID: testServingPID, Start: 1, Boot: 1}}}, nil
+	})
 	return appPath
 }
 
@@ -218,6 +226,57 @@ func TestApplyPackagedAppRejectsACandidateOffTheRelease(t *testing.T) {
 	}
 	if controller.installCalls != 0 || controller.supersedeCalls != 0 {
 		t.Fatal("an off-release candidate reached the sealed deployment")
+	}
+}
+
+// TestApplyPackagedAppProvesTheTenantLaneDownstreamOfActivation pins the
+// install's proof to the lane the app serves last: the primary label publishes
+// readiness before the source fleet is published and the tenant lane is
+// started, so an activation against it alone can succeed on a startup that
+// then unwinds.
+func TestApplyPackagedAppProvesTheTenantLaneDownstreamOfActivation(t *testing.T) {
+	tests := []struct {
+		name        string
+		laneErr     error
+		wantRefusal string
+	}{
+		{"a tenant lane that answers lands the receipt", nil, ""},
+		{
+			"a tenant lane that never answers refuses the install",
+			errors.New("tenant lane never admitted"),
+			"require the live FuseKit runtime",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			controller := &recordingDeployer{}
+			appPath := useDeploymentMetadata(t, controller)
+			installed := exactTestGeneration(appPath)
+			controller.installed = installed
+			controller.activation = deploy.Activation{Generation: installed}
+			observations := 0
+			swapDeploymentVar(t, &tenantLaneReady, func(context.Context) (daemonkit.Health, error) {
+				observations++
+				if tt.laneErr != nil {
+					return daemonkit.Health{}, tt.laneErr
+				}
+				return daemonkit.Health{Phase: daemonkit.PhaseReady, PID: testServingPID}, nil
+			})
+
+			_, err := ApplyPackagedApp(t.Context(), "/tmp/packaged/CCPoolStatus.app")
+			switch {
+			case tt.wantRefusal == "" && err != nil:
+				t.Fatalf("a proved tenant lane = %v, want the install receipt", err)
+			case tt.wantRefusal != "" && (err == nil || !strings.Contains(err.Error(), tt.wantRefusal)):
+				t.Fatalf("an unproved tenant lane = %v, want a refusal carrying %q", err, tt.wantRefusal)
+			}
+			if controller.activateCalls != 1 {
+				t.Fatalf("activate calls = %d, want the tenant proof downstream of one activation", controller.activateCalls)
+			}
+			if observations == 0 {
+				t.Fatal("the install cut its receipt without ever observing the tenant lane")
+			}
+		})
 	}
 }
 
