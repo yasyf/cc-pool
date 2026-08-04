@@ -179,7 +179,7 @@ func (s *Server) runAccountMutation(
 // first-input scan did.
 func (s *Server) provideAccountMutationInput(
 	ctx context.Context,
-	session daemonkit.Session,
+	session pollSession,
 	active store.AccountMutation,
 	request AccountMutationRequest,
 ) (AccountMutationResult, error) {
@@ -242,7 +242,7 @@ func (s *Server) provideAccountMutationInput(
 
 func (s *Server) startAccountMutationTerminal(
 	ctx context.Context,
-	session daemonkit.Session,
+	session pollSession,
 	active store.AccountMutation,
 	running *accountMutationRun,
 	first accountterminal.TerminalInput,

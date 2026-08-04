@@ -19,6 +19,15 @@ import (
 // the wire inside the caller's own deadline (the fusekit broker-poll shape).
 const pollReplyMargin = 500 * time.Millisecond
 
+// pollSession is the slice of daemonkit.Session the poll lane consumes, an
+// interface so session teardown is drivable in tests; daemonkit.Session
+// satisfies it.
+type pollSession interface {
+	ID() uint64
+	Disconnected() <-chan struct{}
+	Done() <-chan struct{}
+}
+
 // pollKey identifies one client attachment: one accepted session driving one
 // operation. TerminalAttachmentLimit bounds these per terminal inside Attach.
 type pollKey struct {
@@ -209,11 +218,16 @@ func (s *Server) accountMutationPollState(
 // operation, creating it at the requested cursor; a cursor the existing
 // attachment has moved past is the poll path's to reposition, under pageMu.
 func (s *Server) accountMutationAttachment(
-	session daemonkit.Session,
+	session pollSession,
 	operationID store.AccountMutationID,
 	running *accountMutationRun,
 	cursor *uint64,
 ) (*pollAttachment, error) {
+	select {
+	case <-session.Disconnected():
+		return nil, errors.New("account mutation session is disconnected")
+	default:
+	}
 	key := pollKey{session: session.ID(), operation: operationID}
 	s.pollMu.Lock()
 	pa := s.pollAttachments[key]
@@ -249,10 +263,16 @@ func (s *Server) accountMutationAttachment(
 // adoptAccountMutationAttachment registers the controller attachment the run
 // start already claimed as the starting session's own.
 func (s *Server) adoptAccountMutationAttachment(
-	session daemonkit.Session,
+	session pollSession,
 	operationID store.AccountMutationID,
 	attachment accountMutationTerminalAttachment,
 ) {
+	select {
+	case <-session.Disconnected():
+		_ = attachment.Close()
+		return
+	default:
+	}
 	key := pollKey{session: session.ID(), operation: operationID}
 	pa := &pollAttachment{
 		server: s, key: key, attachment: attachment,
@@ -279,8 +299,12 @@ func (s *Server) registerPollAttachment(key pollKey, pa *pollAttachment) {
 // armAccountMutationSessionTeardown is the two-stage release: attachments
 // close on Session.Disconnected — the transport is gone before in-flight
 // handlers settle, so the controller frees within TerminalDisconnectPolicy —
-// and the session-keyed entry drops on Session.Done.
-func (s *Server) armAccountMutationSessionTeardown(session daemonkit.Session) {
+// and the session-keyed entry drops on Session.Done. The release sweeps
+// again at Done: Disconnected precedes in-flight handler completion, so a
+// handler admitted before the transport died can register an attachment
+// after the first sweep, and Done — which closes only once every handler on
+// the session settled — is the last point it could have.
+func (s *Server) armAccountMutationSessionTeardown(session pollSession) {
 	id := session.ID()
 	s.pollMu.Lock()
 	if s.pollSessions == nil {
@@ -304,6 +328,7 @@ func (s *Server) armAccountMutationSessionTeardown(session daemonkit.Session) {
 		}
 		select {
 		case <-session.Done():
+			s.releaseAccountMutationSession(id)
 		case <-lifetime.Done():
 		}
 		s.pollMu.Lock()
