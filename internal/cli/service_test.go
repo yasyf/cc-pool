@@ -19,22 +19,32 @@ func swapVar[T any](t *testing.T, target *T, replacement T) {
 }
 
 func TestBudgetedKeepsACallerStatedDeadline(t *testing.T) {
-	stated, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Minute))
+	stated := time.Now().Add(time.Minute)
+	caller, cancel := context.WithDeadline(context.Background(), stated)
 	defer cancel()
-	ctx, release := budgeted(stated, time.Hour)
+	ctx, release := budgeted(caller, time.Hour)
 	defer release()
 	deadline, ok := ctx.Deadline()
-	if !ok || time.Until(deadline) > 2*time.Minute {
-		t.Fatalf("budgeted deadline = %v (ok=%t), want the caller's own minute", deadline, ok)
+	if !ok {
+		t.Fatal("budgeted dropped the caller's stated deadline")
+	}
+	if !deadline.Equal(stated) {
+		t.Fatalf("budgeted deadline = %v, want the caller's own %v", deadline, stated)
 	}
 }
 
 func TestBudgetedStatesTheDefaultWhenNoneIsCarried(t *testing.T) {
-	ctx, release := budgeted(context.Background(), time.Minute)
+	const budget = 90 * time.Second
+	before := time.Now()
+	ctx, release := budgeted(context.Background(), budget)
+	after := time.Now()
 	defer release()
 	deadline, ok := ctx.Deadline()
-	if !ok || time.Until(deadline) > 2*time.Minute {
-		t.Fatalf("budgeted deadline = %v (ok=%t), want the stated default", deadline, ok)
+	if !ok {
+		t.Fatal("budgeted stated no deadline on a context carrying none")
+	}
+	if deadline.Before(before.Add(budget)) || deadline.After(after.Add(budget)) {
+		t.Fatalf("budgeted deadline = %v, want %v out from [%v, %v]", deadline, budget, before, after)
 	}
 }
 
