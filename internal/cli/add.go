@@ -40,7 +40,7 @@ attached to a daemon-supervised login process; the CLI never opens credential
 stores or owns the login child.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return withManager(cmd.Context(), func(m *pool.Manager) error {
+			return withManager(func(m *pool.Manager) error {
 				return runAdd(cmd, m, opts)
 			})
 		},

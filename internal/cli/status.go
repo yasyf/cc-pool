@@ -30,7 +30,7 @@ func newStatusCmd() *cobra.Command {
 		Short: "Show per-account usage, score, and sessions",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return withManager(cmd.Context(), func(m *pool.Manager) error {
+			return withManager(func(m *pool.Manager) error {
 				if err := requireInit(m); err != nil {
 					return err
 				}

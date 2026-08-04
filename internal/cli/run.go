@@ -38,7 +38,7 @@ instead of auto-selecting. This is the only supported pooled launch path; it
 records the exact process identity before replacing itself with Claude Code.`,
 		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return withManager(cmd.Context(), func(m *pool.Manager) error {
+			return withManager(func(m *pool.Manager) error {
 				if err := requireInit(m); err != nil {
 					return err
 				}

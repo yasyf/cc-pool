@@ -15,7 +15,7 @@ func newLoginCmd() *cobra.Command {
 		Short: "Re-authenticate an account",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return withManager(cmd.Context(), func(m *pool.Manager) error {
+			return withManager(func(m *pool.Manager) error {
 				return runRelogin(cmd, m, args[0])
 			})
 		},

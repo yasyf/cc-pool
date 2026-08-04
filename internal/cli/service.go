@@ -145,7 +145,7 @@ account directories unless --force vouches for them. ~/.claude is never touched.
 func runServiceUninstall(cmd *cobra.Command, purge, force bool) error {
 	out := cmd.OutOrStdout()
 
-	accts, err := poolAccounts(cmd.Context())
+	accts, err := poolAccounts()
 	if err != nil {
 		return err
 	}
@@ -214,9 +214,9 @@ func stopDaemonService(cmd *cobra.Command) error {
 	return nil
 }
 
-func poolAccounts(ctx context.Context) ([]store.Account, error) {
+func poolAccounts() ([]store.Account, error) {
 	var accts []store.Account
-	err := withManager(ctx, func(m *pool.Manager) error {
+	err := withManager(func(m *pool.Manager) error {
 		var e error
 		accts, e = m.Store.ListAccounts()
 		return e
@@ -227,7 +227,7 @@ func poolAccounts(ctx context.Context) ([]store.Account, error) {
 // purgeAll never touches ~/.claude or plain claude's canonical credential.
 func purgeAll(cmd *cobra.Command) error {
 	out := cmd.OutOrStdout()
-	if err := withManager(cmd.Context(), func(m *pool.Manager) error {
+	if err := withManager(func(m *pool.Manager) error {
 		accts, err := m.Store.ListAccounts()
 		if err != nil {
 			return err
@@ -247,7 +247,7 @@ func purgeAll(cmd *cobra.Command) error {
 }
 
 func deprovisionAll(cmd *cobra.Command) error {
-	accounts, err := poolAccounts(cmd.Context())
+	accounts, err := poolAccounts()
 	if err != nil {
 		return err
 	}
@@ -294,14 +294,8 @@ func installDaemonService(ctx context.Context) (err error) {
 	}
 	ensureCtx, cancel := budgeted(ctx, daemonServiceEnsureTimeout)
 	defer cancel()
-	ensured, err := ensureDaemonService(ensureCtx)
-	if err != nil {
+	if _, err := ensureDaemonService(ensureCtx); err != nil {
 		return fmt.Errorf("ensure cc-pool daemon: %w", err)
-	}
-	if ensured.After.Build != version.String() {
-		return fmt.Errorf(
-			"ensured daemon build %q is not this build %q", ensured.After.Build, version.String(),
-		)
 	}
 	holderInstall.Commit()
 	return nil

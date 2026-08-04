@@ -34,7 +34,7 @@ pool.`,
 		// Args deliberately nil: cobra's legacyArgs already rejects unknown
 		// subcommands on a root with children, so RunE only runs for bare `ccp`.
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return withManager(cmd.Context(), func(m *pool.Manager) error {
+			return withManager(func(m *pool.Manager) error {
 				initialized, err := m.Initialized()
 				if err != nil {
 					return err
@@ -100,7 +100,7 @@ func bareAction(initialized bool, accounts int, tty bool) rootAction {
 	}
 }
 
-func withManager(ctx context.Context, fn func(*pool.Manager) error) error {
+func withManager(fn func(*pool.Manager) error) error {
 	m, err := pool.OpenLocal()
 	if err != nil {
 		return err

@@ -17,7 +17,7 @@ func newListCmd() *cobra.Command {
 		Short: "List accounts with their ids, paths, and Keychain items",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return withManager(cmd.Context(), func(m *pool.Manager) error {
+			return withManager(func(m *pool.Manager) error {
 				accts, err := m.Store.ListAccounts()
 				if err != nil {
 					return err
@@ -55,7 +55,7 @@ Keychain item — the account is still tombstoned and removed everywhere.`,
 			if err != nil {
 				return err
 			}
-			if err := withManager(cmd.Context(), func(m *pool.Manager) error {
+			if err := withManager(func(m *pool.Manager) error {
 				client, err := requireDaemon(m, "account and credential removal runs inside the daemon")
 				if err != nil {
 					return err
@@ -85,7 +85,7 @@ func newEnvCmd() *cobra.Command {
 Use ` + "`ccp run`" + ` to launch. env does not create a session.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return withManager(cmd.Context(), func(m *pool.Manager) error {
+			return withManager(func(m *pool.Manager) error {
 				if err := requireInit(m); err != nil {
 					return err
 				}
