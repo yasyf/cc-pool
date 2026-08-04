@@ -298,7 +298,7 @@ func TestRepositionAfterTeardownClosesTheReplacement(t *testing.T) {
 	pa.close()
 
 	before := terminal.openAttachmentCount()
-	if err := pa.reposition(t.Context(), running, 0); err == nil ||
+	if err := pa.reposition(t.Context(), running, 1); err == nil ||
 		!strings.Contains(err.Error(), "closed") {
 		t.Fatalf("reposition on a closed wrapper = %v, want a closed refusal", err)
 	}

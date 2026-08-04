@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -28,8 +29,9 @@ type legacyTerminalRecord struct {
 }
 
 // legacyTerminalVerdict is what observation proved about one recorded child.
-// Only settled is actionable; the sweep never signals, so live and
-// undetermined both refuse the boot.
+// There is no per-record undetermined: the whole sweep reads one process-table
+// snapshot, so observation either succeeded for every record or failed for all
+// of them, and the failure refuses the boot before any record is classified.
 type legacyTerminalVerdict int
 
 const (
@@ -40,11 +42,42 @@ const (
 	// legacyTerminalLive means the recorded identity, or another process in
 	// its recorded session, is present.
 	legacyTerminalLive
-	// legacyTerminalUndetermined means observation failed. It is never read
-	// as absence: a permission-denied or transient probe would otherwise
-	// archive the ledger with a live login still holding the config dir.
-	legacyTerminalUndetermined
 )
+
+// processSnapshot is one observation of the process table: the start stamp of
+// every live process, and the session each belongs to. It is the sweep's only
+// source of truth about liveness, because a per-PID probe cannot distinguish
+// "no such process" from "the probe failed" — darwin answers a missing PID
+// with EIO, the same class a real failure would raise — while an enumeration
+// that returns at all is authoritative about every PID absent from it.
+type processSnapshot struct {
+	stamps   map[int]string
+	sessions map[int]int
+}
+
+func snapshotProcessTable() (processSnapshot, error) {
+	all, err := unix.SysctlKinfoProcSlice("kern.proc.all")
+	if err != nil {
+		return processSnapshot{}, err
+	}
+	snapshot := processSnapshot{
+		stamps:   make(map[int]string, len(all)),
+		sessions: make(map[int]int, len(all)),
+	}
+	for index := range all {
+		pid := int(all[index].Proc.P_pid)
+		if pid <= 0 {
+			continue
+		}
+		snapshot.stamps[pid] = legacyTerminalStamp(&all[index])
+		// A session this daemon's own era created is readable; one that is
+		// not belongs to another login and cannot be the recorded session.
+		if sid, err := unix.Getsid(pid); err == nil {
+			snapshot.sessions[pid] = sid
+		}
+	}
+	return snapshot, nil
+}
 
 // sweepLegacyAccountTerminals refuses the boot while any account-terminal
 // child the v0.20.9 era tracked in its own ledger may still be running.
@@ -78,12 +111,20 @@ func sweepLegacyAccountTerminals(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("resolve boot session for the legacy account-terminal sweep: %w", err)
 	}
+	table, err := snapshotProcessTable()
+	if err != nil {
+		return fmt.Errorf(
+			"cc-pool refused to start: it could not check whether an account login left over from before "+
+				"the upgrade is still running (%w). This usually clears on its own — the daemon keeps "+
+				"retrying; if it persists, restart your machine", err,
+		)
+	}
 	var unsettled []string
 	for _, record := range records {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("sweep legacy account terminals: %w", err)
 		}
-		verdict, detail := classifyLegacyTerminal(record, boot)
+		verdict, detail := classifyLegacyTerminal(record, boot, table)
 		if verdict != legacyTerminalSettled {
 			unsettled = append(unsettled, detail)
 		}
@@ -132,81 +173,49 @@ func loadLegacyTerminalRecords(path string) ([]legacyTerminalRecord, error) {
 	return records, nil
 }
 
-// classifyLegacyTerminal observes one record. Over-detection is the safe
-// direction throughout — a live verdict costs a refused boot, an absent one
-// costs the credentials this whole sweep exists to protect — so every
-// ambiguity resolves away from settled.
-func classifyLegacyTerminal(record legacyTerminalRecord, boot string) (legacyTerminalVerdict, string) {
+// classifyLegacyTerminal reads one record against the snapshot. Over-detection
+// is the safe direction throughout — a live verdict costs a refused boot, a
+// wrong settled one costs the credentials this sweep exists to protect — so
+// every ambiguity resolves away from settled.
+func classifyLegacyTerminal(
+	record legacyTerminalRecord,
+	boot string,
+	table processSnapshot,
+) (legacyTerminalVerdict, string) {
 	// A record captured in another boot session names a process that cannot
 	// have survived, and its session id belongs to that boot's numbering.
 	if record.Boot != boot {
 		return legacyTerminalSettled, ""
 	}
-	kp, err := unix.SysctlKinfoProc("kern.proc.pid", record.PID)
-	switch {
-	case errors.Is(err, unix.ESRCH):
-		// The leader is gone; the session may still hold descendants.
-	case err != nil:
-		return legacyTerminalUndetermined, fmt.Sprintf(
-			"The old login's process (pid %d) could not be checked (%v) — this usually clears on its own; "+
-				"if it persists, restart your machine", record.PID, err,
-		)
-	case legacyTerminalStamp(kp) == record.StartTime:
+	if stamp, present := table.stamps[record.PID]; present && stamp == record.StartTime {
 		return legacyTerminalLive, fmt.Sprintf(
 			"Close the `claude auth login` window if one is open, or run `kill %d`", record.PID,
 		)
 	}
-	// The PID is absent or now names another instance. Descendants of the
-	// recorded session survive it, and they hold the same config dir, so the
-	// session is swept whole rather than through its leader alone.
+	// The PID is absent from the table, or now names another instance.
+	// Descendants of the recorded session outlive their leader and hold the
+	// same config dir, so the session is read whole rather than through it.
 	if record.SessionID == 0 {
 		return legacyTerminalSettled, ""
 	}
-	members, err := legacyTerminalSessionMembers(record.SessionID)
-	if err != nil {
-		return legacyTerminalUndetermined, fmt.Sprintf(
-			"The old login's terminal session (%d) could not be checked (%v) — this usually clears on its own; "+
-				"if it persists, restart your machine", record.SessionID, err,
-		)
-	}
-	if len(members) > 0 {
-		commands := make([]string, 0, len(members))
-		for _, pid := range members {
-			commands = append(commands, fmt.Sprintf("kill %d", pid))
-		}
-		return legacyTerminalLive, fmt.Sprintf(
-			"Close the `claude auth login` window if one is open, or run `%s`",
-			strings.Join(commands, " && "),
-		)
-	}
-	return legacyTerminalSettled, ""
-}
-
-// legacyTerminalSessionMembers reports every live process still in session,
-// which is the scope a recorded process-group leader stood for: a login that
-// forked into another group outlives its leader inside the same session.
-func legacyTerminalSessionMembers(sessionID int) ([]int, error) {
-	all, err := unix.SysctlKinfoProcSlice("kern.proc.all")
-	if err != nil {
-		return nil, err
-	}
 	var members []int
-	for index := range all {
-		pid := int(all[index].Proc.P_pid)
-		if pid <= 0 {
-			continue
-		}
-		sid, err := unix.Getsid(pid)
-		if err != nil {
-			// The process left between enumeration and the probe; a live one
-			// would still be named by its own entry.
-			continue
-		}
-		if sid == sessionID {
+	for pid, sid := range table.sessions {
+		if sid == record.SessionID {
 			members = append(members, pid)
 		}
 	}
-	return members, nil
+	if len(members) == 0 {
+		return legacyTerminalSettled, ""
+	}
+	sort.Ints(members)
+	commands := make([]string, 0, len(members))
+	for _, pid := range members {
+		commands = append(commands, fmt.Sprintf("kill %d", pid))
+	}
+	return legacyTerminalLive, fmt.Sprintf(
+		"Close the `claude auth login` window if one is open, or run `%s`",
+		strings.Join(commands, " && "),
+	)
 }
 
 // legacyTerminalStamp renders the process start stamp in the v0.20.9 encoding

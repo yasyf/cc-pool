@@ -165,31 +165,70 @@ func TestSweepLegacyAccountTerminalsArchivesOnlyProvablySettledRecords(t *testin
 	}
 }
 
-func TestClassifyLegacyTerminalNeverReadsAProbeFailureAsAbsence(t *testing.T) {
-	boot := testBootSession(t)
-	// A session id nothing can be in, on the current boot, with an absent
-	// leader: the honest verdict is settled.
-	verdict, _ := classifyLegacyTerminal(legacyTerminalRecord{
-		PID: 1 << 30, StartTime: "1.000001", Boot: boot, SessionID: 1 << 30,
-	}, boot)
-	if verdict != legacyTerminalSettled {
-		t.Fatalf("absent leader with an empty session = %v, want settled", verdict)
+// TestClassifyLegacyTerminalReadsTheSnapshotNotAPerPIDProbe pins the three
+// settled proofs and the two live ones against a constructed table. An absent
+// PID is the ordinary upgrade case — the old login exited cleanly and left its
+// record behind — and reading it as anything but settled would refuse every
+// upgrade; darwin answers a per-PID probe for a missing process with EIO, so
+// only the enumeration can tell absence from failure.
+func TestClassifyLegacyTerminalReadsTheSnapshotNotAPerPIDProbe(t *testing.T) {
+	const boot = "1000.000001"
+	table := processSnapshot{
+		stamps:   map[int]string{100: "50.000001", 200: "60.000002"},
+		sessions: map[int]int{100: 100, 200: 100},
 	}
-	// The live shape must never be settled.
-	pid, sid := startLegacyTerminalSurvivor(t)
-	verdict, detail := classifyLegacyTerminal(legacyTerminalRecord{
-		PID: pid, StartTime: terminalStamp(t, pid), Boot: boot, SessionID: sid,
-	}, boot)
-	if verdict != legacyTerminalLive || detail == "" {
-		t.Fatalf("live leader = %v (%q), want live with a detail", verdict, detail)
+	tests := []struct {
+		name   string
+		record legacyTerminalRecord
+		want   legacyTerminalVerdict
+		detail string
+	}{
+		{
+			name:   "absent pid with no session is settled",
+			record: legacyTerminalRecord{PID: 999, StartTime: "1.000001", Boot: boot},
+			want:   legacyTerminalSettled,
+		},
+		{
+			name:   "absent pid whose session is empty is settled",
+			record: legacyTerminalRecord{PID: 999, StartTime: "1.000001", Boot: boot, SessionID: 777},
+			want:   legacyTerminalSettled,
+		},
+		{
+			name:   "a pid now naming another instance is settled",
+			record: legacyTerminalRecord{PID: 100, StartTime: "1.000001", Boot: boot, SessionID: 777},
+			want:   legacyTerminalSettled,
+		},
+		{
+			name:   "another boot session is settled without consulting the table",
+			record: legacyTerminalRecord{PID: 100, StartTime: "50.000001", Boot: "9.000009", SessionID: 100},
+			want:   legacyTerminalSettled,
+		},
+		{
+			name:   "the recorded leader still running is live",
+			record: legacyTerminalRecord{PID: 100, StartTime: "50.000001", Boot: boot, SessionID: 100},
+			want:   legacyTerminalLive,
+			detail: "kill 100",
+		},
+		{
+			name:   "a surviving session member outlives its settled leader",
+			record: legacyTerminalRecord{PID: 999, StartTime: "1.000001", Boot: boot, SessionID: 100},
+			want:   legacyTerminalLive,
+			detail: "kill 100 && kill 200",
+		},
 	}
-	// A surviving session member with a settled leader is still live: the
-	// leader alone is not the scope that holds the config dir.
-	verdict, detail = classifyLegacyTerminal(legacyTerminalRecord{
-		PID: 1 << 30, StartTime: "1.000001", Boot: boot, SessionID: sid,
-	}, boot)
-	if verdict != legacyTerminalLive || !strings.Contains(detail, fmt.Sprint(pid)) {
-		t.Fatalf("surviving session member = %v (%q), want live naming pid %d", verdict, detail, pid)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			verdict, detail := classifyLegacyTerminal(tt.record, boot, table)
+			if verdict != tt.want {
+				t.Fatalf("verdict = %v, want %v (detail %q)", verdict, tt.want, detail)
+			}
+			if tt.detail != "" && !strings.Contains(detail, tt.detail) {
+				t.Fatalf("detail = %q, want it to name %q", detail, tt.detail)
+			}
+			if tt.want == legacyTerminalLive && !strings.Contains(detail, "claude auth login") {
+				t.Fatalf("live detail = %q, want an actionable instruction", detail)
+			}
+		})
 	}
 }
 
