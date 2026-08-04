@@ -375,9 +375,11 @@ CREATE TABLE account_presentation_repairs (
   created_at                       INTEGER NOT NULL CHECK(created_at > 0)
 );
 CREATE UNIQUE INDEX idx_accounts_live_config_dir ON accounts(config_dir) WHERE deleted_at IS NULL;
+CREATE INDEX idx_account_mutations_owner ON account_mutations(owner_record,account_id);
 CREATE UNIQUE INDEX idx_account_mutations_single_add ON account_mutations(kind) WHERE kind='add';
 CREATE INDEX idx_account_mutation_receipts_scope ON account_mutation_receipts(kind,account_id,acknowledged_at,committed_at);
 CREATE INDEX idx_account_mutation_receipts_expiry ON account_mutation_receipts(acknowledged_at,expires_at,operation_id);
+CREATE INDEX idx_credential_operations_owner ON credential_operations(owner_record,account_id);
 CREATE INDEX idx_credential_operation_receipts_expiry ON credential_operation_receipts(acknowledged_at,expires_at,token);
 CREATE UNIQUE INDEX idx_credential_write_receipts_pending ON credential_operation_receipts(account_id)
   WHERE acknowledged_at IS NULL AND terminal_status='succeeded'
