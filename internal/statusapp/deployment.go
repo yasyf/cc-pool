@@ -36,7 +36,15 @@ var (
 	makeInstalledAgents = installedServiceAgents
 	installedAppPath    = pool.WidgetAppPath
 	deployInventory     = deploy.Inventory
-	tenantLaneReady     = func(ctx context.Context) (daemonkit.Health, error) {
+	// readinessBudget is this package's default deadline for the whole
+	// bracket-retry observation when the caller stated none: two full
+	// readiness observations under the fleet contract, so one legitimate
+	// slow start and one mid-bracket restart both converge inside it, while
+	// a copy that can never pin is refused instead of retried forever.
+	readinessBudget = func() time.Duration {
+		return 2 * holderbridge.ReadinessContract().ObservationTimeout()
+	}
+	tenantLaneReady = func(ctx context.Context) (daemonkit.Health, error) {
 		client, err := daemonkit.Open(observerTenantDaemon())
 		if err != nil {
 			return daemonkit.Health{}, fmt.Errorf("CCPoolStatus: open the cc-pool tenant lane: %w", err)
@@ -120,8 +128,12 @@ const bracketRetryCadence = 250 * time.Millisecond
 // Everything short of that retries the complete bracket within ctx — a
 // holder appearing mid-observation, disappearing and being replaced, and
 // re-pinning under a reused PID are one family of legitimate launchd restart
-// transients, refused only when ctx runs out, never admitted early.
+// transients, refused only when ctx runs out, never admitted early. A caller
+// that states no deadline gets the package's readiness budget, so a
+// persistent mismatch refuses instead of retrying forever.
 func RequireActiveService(ctx context.Context) error {
+	ctx, cancel := budgeted(ctx, readinessBudget())
+	defer cancel()
 	executable := bundle.ExePath(installedAppPath(), holderbridge.ExecutableName)
 	before, err := deployInventory(executable)
 	if err != nil {
@@ -160,6 +172,16 @@ func inventoryPin(survivors deploy.Survivors, pid int) (deploy.LiveProcess, bool
 		}
 	}
 	return deploy.LiveProcess{}, false
+}
+
+// budgeted states budget as ctx's deadline when ctx carries none. A caller
+// that stated its own keeps it: the budget is this package's default, never
+// an override of a deadline the caller chose.
+func budgeted(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	if _, stated := ctx.Deadline(); stated {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, budget)
 }
 
 // UninstallPackagedApp quiesces and removes the exact deploy-sealed installed application.

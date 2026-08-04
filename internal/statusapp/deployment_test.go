@@ -260,9 +260,31 @@ func TestRequireActiveServiceRefusesAnUnpinnableServerAtTheDeadline(t *testing.T
 	})
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
+	started := time.Now()
 	if err := RequireActiveService(ctx); err == nil ||
 		!strings.Contains(err.Error(), "does not run the installed application") {
 		t.Fatalf("unpinnable server = %v, want an installed-runtime refusal at the deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("caller-stated deadline was overridden: refusal took %v", elapsed)
+	}
+}
+
+func TestRequireActiveServiceBoundsADeadlineFreeCaller(t *testing.T) {
+	swapDeploymentVar(t, &readinessBudget, func() time.Duration { return 50 * time.Millisecond })
+	swapDeploymentVar(t, &tenantLaneReady, func(context.Context) (daemonkit.Health, error) {
+		return daemonkit.Health{Phase: daemonkit.PhaseReady, PID: 4242}, nil
+	})
+	swapDeploymentVar(t, &deployInventory, func(...string) (deploy.Survivors, error) {
+		return deploy.Survivors{}, nil
+	})
+	started := time.Now()
+	if err := RequireActiveService(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "does not run the installed application") {
+		t.Fatalf("deadline-free unpinnable server = %v, want a budget-bounded refusal", err)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("package readiness budget did not bound the retry: refusal took %v", elapsed)
 	}
 }
 
