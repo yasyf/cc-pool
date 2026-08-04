@@ -6,6 +6,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Credential ownership fencing now keys on an opaque per-generation owner
+  record across all five owner-carrying store tables (active credential
+  operations, account mutations, pending account reservations, and both
+  receipt tables) instead of a decoded process identity. A newly started
+  daemon claims every active row a prior generation left behind, daemonkit
+  `v0.20.9`-era rows included byte-for-byte as stored, and honors that
+  generation's receipts through evidence replay, pending publication
+  delivery, and acknowledgement, so interrupted credential operations,
+  account mutations, and pending account reservations resume or settle at
+  boot instead of orphaning. Downgrading after the first post-upgrade boot
+  is unsupported; a `0.64.x` daemon fails loudly on the new owner records
+  and stays broken until upgraded again.
+- The store accepts exactly one schema fingerprint per binary and refuses
+  any other database outright. Upgrading from `0.64.x` keeps the existing
+  database, whose fingerprint is unchanged; in-flight rows are adopted as
+  above.
+- Account terminals now settle their children through daemonkit `v0.21.4`
+  process scopes. A controller attach that races terminal cancellation now
+  fails with daemonkit's "closed before Release" refusal instead of
+  silently succeeding on a dying terminal.
+- Crashed terminal children are now reclaimed when the daemon's process
+  scope opens, before any work is admitted; recovery no longer runs as a
+  separate admission gate inside the terminal manager.
+- Daemon and worker lifecycle now runs on daemonkit `v0.21.4`.
+
 ## [0.64.9] - 2026-07-27
 
 ### Fixed
