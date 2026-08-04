@@ -1,11 +1,13 @@
 package daemon
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/daemonkit"
 )
 
 type fakePollSession struct {
@@ -161,4 +163,86 @@ func (t *testAccountMutationTerminal) newAttachmentForTest() accountMutationTerm
 	attachment := &testAccountMutationAttachment{terminal: t}
 	t.attachments[attachment] = struct{}{}
 	return attachment
+}
+
+// TestPreStartPollParksAndEOFResolvesTerminal is the test F6 lacked, both
+// halves: a poll before any run exists must park rather than answer
+// immediately (an immediate empty answer is a busy loop), and a pre-start EOF
+// must resolve the mutation as Aborted so the released poll turns terminal.
+func TestPreStartPollParksAndEOFResolvesTerminal(t *testing.T) {
+	s, _, account := newAccountMutationTestServer(t, true)
+	request := AccountMutationRequest{
+		Kind: AccountMutationRelogin, Action: AccountMutationStartOrAttach, AccountID: account.ID,
+	}
+	begin, err := runAccountMutationTest(t, s, request)
+	if err != nil || begin.State != AccountMutationAwaitingInput {
+		t.Fatalf("begin = %+v err=%v", begin, err)
+	}
+
+	resize := request
+	resize.Action = AccountMutationProvideInput
+	resize.Fence = begin.Fence
+	resize.Input = accountMutationResizePayload(t)
+	if _, err := runAccountMutationTest(t, s, resize); err != nil {
+		t.Fatal(err)
+	}
+
+	type pollOutcome struct {
+		page AccountMutationPollResponse
+		err  error
+	}
+	polled := make(chan pollOutcome, 1)
+	go func() {
+		reply, err := s.handleAccountMutationPoll(t.Context(), daemonkit.Request{
+			Op: string(OpAccountMutationPoll),
+		}, Request{MutationPoll: &AccountMutationPollRequest{
+			Fence: begin.Fence, WaitMillis: 10_000,
+		}})
+		if err != nil {
+			polled <- pollOutcome{err: err}
+			return
+		}
+		var page AccountMutationPollResponse
+		if err := json.Unmarshal(reply.Body, &page); err != nil {
+			polled <- pollOutcome{err: err}
+			return
+		}
+		polled <- pollOutcome{page: page}
+	}()
+
+	select {
+	case outcome := <-polled:
+		t.Fatalf("pre-start poll answered immediately instead of parking: %+v", outcome)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	eof := request
+	eof.Action = AccountMutationProvideInput
+	eof.Fence = begin.Fence
+	eof.Input = accountMutationEOFPayload(t)
+	resolved, err := runAccountMutationTest(t, s, eof)
+	if err != nil || resolved.State != AccountMutationCancelled {
+		t.Fatalf("pre-start EOF = %+v err=%v, want an Aborted receipt", resolved, err)
+	}
+	if _, err := s.m.Store.AccountMutationReceipt(store.AccountMutationID(begin.OperationID)); err != nil {
+		t.Fatalf("pre-start EOF left no receipt: %v", err)
+	}
+	s.accountMutationMu.Lock()
+	stashed := len(s.accountMutationSizes)
+	s.accountMutationMu.Unlock()
+	if stashed != 0 {
+		t.Fatalf("resize-then-EOF leaked %d stashed sizes", stashed)
+	}
+
+	select {
+	case outcome := <-polled:
+		if outcome.err != nil {
+			t.Fatal(outcome.err)
+		}
+		if !outcome.page.Done || outcome.page.State != AccountMutationCancelled || outcome.page.NextCursor != 0 {
+			t.Fatalf("released poll = %+v, want Done at the Cancelled receipt", outcome.page)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("pre-start poll was not released by the resolution")
+	}
 }

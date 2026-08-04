@@ -89,23 +89,27 @@ func (s *Server) handleAccountMutationPoll(
 	if fence != poll.Fence {
 		return daemonkit.Reply{}, &daemonkit.ProductError{Message: "account mutation fence does not match the operation"}
 	}
-	s.accountMutationMu.Lock()
-	running := s.accountMutationRuns[operationID]
-	s.accountMutationMu.Unlock()
-	if running != nil {
-		select {
-		case <-running.ready:
-		case <-ctx.Done():
-			return daemonkit.Reply{}, ctx.Err()
-		}
-		if running.terminal == nil {
-			running = nil
-		}
+	running, err := s.liveAccountMutationRun(ctx, operationID)
+	if err != nil {
+		return daemonkit.Reply{}, err
 	}
 	if running == nil {
-		return pollReply(AccountMutationPollResponse{
-			NextCursor: poll.TerminalCursor, State: state, Done: done,
-		})
+		if done {
+			return pollReply(AccountMutationPollResponse{
+				NextCursor: poll.TerminalCursor, State: state, Done: true,
+			})
+		}
+		running, state, done, err = s.awaitAccountMutationStart(
+			ctx, req.Session, operationID, *poll, state, done,
+		)
+		if err != nil {
+			return daemonkit.Reply{}, err
+		}
+		if running == nil {
+			return pollReply(AccountMutationPollResponse{
+				NextCursor: poll.TerminalCursor, State: state, Done: done,
+			})
+		}
 	}
 	pa, err := s.accountMutationAttachment(req.Session, operationID, running, &poll.TerminalCursor)
 	if err != nil {
@@ -130,6 +134,116 @@ func (s *Server) handleAccountMutationPoll(
 	return pollReply(AccountMutationPollResponse{
 		Chunks: chunks, NextCursor: next, State: state, Done: done,
 	})
+}
+
+func (s *Server) liveAccountMutationRun(
+	ctx context.Context,
+	operationID store.AccountMutationID,
+) (*accountMutationRun, error) {
+	s.accountMutationMu.Lock()
+	running := s.accountMutationRuns[operationID]
+	s.accountMutationMu.Unlock()
+	if running == nil {
+		return nil, nil
+	}
+	select {
+	case <-running.ready:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if running.terminal == nil {
+		return nil, nil
+	}
+	return running, nil
+}
+
+// wakeAccountMutationPolls releases every poll parked before a run exists: a
+// run registering, a pre-start resolution, and a settled run's retirement all
+// change the answer such a poll is waiting on.
+func (s *Server) wakeAccountMutationPolls() {
+	s.accountMutationMu.Lock()
+	if s.accountMutationWake != nil {
+		close(s.accountMutationWake)
+		s.accountMutationWake = nil
+	}
+	s.accountMutationMu.Unlock()
+}
+
+func (s *Server) accountMutationWakeWait() <-chan struct{} {
+	s.accountMutationMu.Lock()
+	defer s.accountMutationMu.Unlock()
+	if s.accountMutationWake == nil {
+		s.accountMutationWake = make(chan struct{})
+	}
+	return s.accountMutationWake
+}
+
+// awaitAccountMutationStart parks a poll that arrived before any run exists —
+// an immediate empty answer here is a busy loop, since the client re-polls
+// the instant it lands. The park holds until the run starts, the mutation
+// resolves, the wait ceiling or caller deadline ends, a superseding poll
+// takes the slot, or the session disconnects; the caller re-answers from
+// whatever state the wake revealed.
+func (s *Server) awaitAccountMutationStart(
+	ctx context.Context,
+	session pollSession,
+	operationID store.AccountMutationID,
+	poll AccountMutationPollRequest,
+	state AccountMutationState,
+	done bool,
+) (*accountMutationRun, AccountMutationState, bool, error) {
+	key := pollKey{session: session.ID(), operation: operationID}
+	token := s.parkPreStartPoll(key)
+	defer s.unparkPreStartPoll(key, token)
+	parkCtx := s.pollParkContext(ctx, poll.WaitMillis, token)
+	if parkCtx == nil {
+		return nil, state, done, nil
+	}
+	for {
+		wake := s.accountMutationWakeWait()
+		running, err := s.liveAccountMutationRun(ctx, operationID)
+		if err != nil {
+			return nil, state, done, err
+		}
+		if running != nil {
+			return running, state, done, nil
+		}
+		if _, current, terminal, err := s.accountMutationPollAnchor(operationID); err == nil {
+			state, done = current, terminal
+		}
+		if done {
+			return nil, state, done, nil
+		}
+		select {
+		case <-wake:
+		case <-session.Disconnected():
+			return nil, state, done, nil
+		case <-parkCtx.Done():
+			return nil, state, done, nil
+		}
+	}
+}
+
+func (s *Server) parkPreStartPoll(key pollKey) chan struct{} {
+	s.pollMu.Lock()
+	defer s.pollMu.Unlock()
+	if s.preStartPolls == nil {
+		s.preStartPolls = make(map[pollKey]chan struct{})
+	}
+	if previous := s.preStartPolls[key]; previous != nil {
+		close(previous)
+	}
+	token := make(chan struct{})
+	s.preStartPolls[key] = token
+	return token
+}
+
+func (s *Server) unparkPreStartPoll(key pollKey, token chan struct{}) {
+	s.pollMu.Lock()
+	if s.preStartPolls[key] == token {
+		delete(s.preStartPolls, key)
+	}
+	s.pollMu.Unlock()
 }
 
 func pollReply(response AccountMutationPollResponse) (daemonkit.Reply, error) {

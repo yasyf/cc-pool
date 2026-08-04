@@ -163,12 +163,16 @@ type Server struct {
 	accountMutationMu       sync.Mutex
 	accountMutationRuns     map[store.AccountMutationID]*accountMutationRun
 	accountMutationSizes    map[store.AccountMutationID]accountterminal.TerminalSize
+	// accountMutationWake releases polls parked before a run exists; closed
+	// and replaced on every pre-start state change.
+	accountMutationWake chan struct{}
 
 	// pollMu guards the per-session attachment registry the poll-unary
 	// observation lane keys by (session, operation).
 	pollMu          sync.Mutex
 	pollAttachments map[pollKey]*pollAttachment
 	pollSessions    map[uint64]bool
+	preStartPolls   map[pollKey]chan struct{}
 }
 
 var ensureHolderRuntime = EnsureHolderService

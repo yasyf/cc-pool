@@ -157,20 +157,31 @@ func (s *Server) runAccountMutation(
 	case AccountMutationStartOrAttach:
 		return accountMutationActiveResult(active), nil
 	case AccountMutationCancel:
-		if active.State != store.AccountMutationAwaitingInput {
-			return AccountMutationResult{}, errors.New("account mutation already crossed the input boundary")
-		}
-		resolved, err := s.m.Store.ResolveAccountMutation(
-			active.Fence(), store.AccountMutationAborted,
-			active.ExpectedCredentialDigest, nil, time.Now().Add(accountMutationReceiptTTL),
-		)
-		if err != nil {
-			return AccountMutationResult{}, err
-		}
-		return accountMutationReceiptResult(resolved), nil
+		return s.resolveAccountMutationBeforeStart(active)
 	default:
 		return s.provideAccountMutationInput(ctx, session, active, request)
 	}
+}
+
+// resolveAccountMutationBeforeStart settles a not-yet-started mutation as
+// Aborted: Cancel's own machinery, shared by the pre-start EOF — "no input is
+// coming, ever" — so polling turns terminal through the receipt instead of
+// spinning on an AwaitingInput row nothing will ever advance.
+func (s *Server) resolveAccountMutationBeforeStart(
+	active store.AccountMutation,
+) (AccountMutationResult, error) {
+	if active.State != store.AccountMutationAwaitingInput {
+		return AccountMutationResult{}, errors.New("account mutation already crossed the input boundary")
+	}
+	resolved, err := s.m.Store.ResolveAccountMutation(
+		active.Fence(), store.AccountMutationAborted,
+		active.ExpectedCredentialDigest, nil, time.Now().Add(accountMutationReceiptTTL),
+	)
+	if err != nil {
+		return AccountMutationResult{}, err
+	}
+	s.wakeAccountMutationPolls()
+	return accountMutationReceiptResult(resolved), nil
 }
 
 // provideAccountMutationInput delivers one terminal input event. The first
@@ -203,14 +214,16 @@ func (s *Server) provideAccountMutationInput(
 			s.accountMutationMu.Unlock()
 			return accountMutationActiveResult(active), nil
 		case accountterminal.TerminalInputEOF:
+			delete(s.accountMutationSizes, operationID)
 			s.accountMutationMu.Unlock()
-			return accountMutationActiveResult(active), nil
+			return s.resolveAccountMutationBeforeStart(active)
 		}
 		size := s.accountMutationSizes[operationID]
 		delete(s.accountMutationSizes, operationID)
 		running = &accountMutationRun{ready: make(chan struct{}), done: make(chan struct{})}
 		s.accountMutationRuns[operationID] = running
 		s.accountMutationMu.Unlock()
+		s.wakeAccountMutationPolls()
 		return s.startAccountMutationTerminal(ctx, session, active, running, event, size)
 	}
 	s.accountMutationMu.Unlock()
@@ -421,6 +434,7 @@ func (s *Server) forgetAccountMutationRun(
 		delete(s.accountMutationRuns, operationID)
 	}
 	s.accountMutationMu.Unlock()
+	s.wakeAccountMutationPolls()
 }
 
 func (s *Server) settleAccountMutationTerminal(

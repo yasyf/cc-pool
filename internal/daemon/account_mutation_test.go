@@ -999,6 +999,18 @@ func runAccountMutationTest(
 	return s.runAccountMutation(t.Context(), daemonkit.Session{}, request)
 }
 
+func accountMutationResizePayload(t *testing.T) []byte {
+	t.Helper()
+	encoded, err := encodeAccountTerminalInput(accountterminal.TerminalInput{
+		Kind: accountterminal.TerminalInputResize,
+		Size: accountterminal.TerminalSize{Rows: 24, Cols: 80},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
 func accountMutationEOFPayload(t *testing.T) []byte {
 	t.Helper()
 	encoded, err := encodeAccountTerminalInput(accountterminal.TerminalInput{
