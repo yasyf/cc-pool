@@ -13,6 +13,7 @@ require (
 	github.com/yasyf/daemonkit v0.21.4
 	github.com/yasyf/fusekit v1.16.0
 	github.com/yasyf/synckit v0.37.1
+	go.etcd.io/bbolt v1.5.0
 	golang.org/x/net v0.56.0
 	golang.org/x/sync v0.22.0
 	golang.org/x/sys v0.47.0
@@ -55,7 +56,6 @@ require (
 	github.com/vishvananda/netns v0.0.0-20200728191858-db3c7e526aae // indirect
 	github.com/winfsp/cgofuse v1.6.1-0.20260531120352-2fa812d1bdc7 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
-	go.etcd.io/bbolt v1.5.0 // indirect
 	golang.org/x/mod v0.37.0 // indirect
 	golang.org/x/tools v0.47.0 // indirect
 	howett.net/plist v1.0.1 // indirect
