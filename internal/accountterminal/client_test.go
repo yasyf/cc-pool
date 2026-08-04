@@ -45,6 +45,53 @@ func (s *terminalClientEndpointStub) Receive(ctx context.Context) (TerminalOutpu
 	return TerminalOutput{}, io.EOF
 }
 
+type recordingTerminalEndpoint struct {
+	mu   sync.Mutex
+	sent []TerminalInput
+	eof  chan struct{}
+}
+
+func (e *recordingTerminalEndpoint) Send(_ context.Context, input TerminalInput) error {
+	e.mu.Lock()
+	e.sent = append(e.sent, cloneTerminalInput(input))
+	e.mu.Unlock()
+	if input.Kind == TerminalInputEOF {
+		close(e.eof)
+	}
+	return nil
+}
+
+func (e *recordingTerminalEndpoint) Receive(ctx context.Context) (TerminalOutput, error) {
+	select {
+	case <-e.eof:
+		return TerminalOutput{}, io.EOF
+	case <-ctx.Done():
+		return TerminalOutput{}, ctx.Err()
+	}
+}
+
+func TestRunTerminalClientEmptyStdinSendsExactlyOneEOFAndSettles(t *testing.T) {
+	stdin, writer := terminalClientPipe(t)
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	endpoint := &recordingTerminalEndpoint{eof: make(chan struct{})}
+	var stdout bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), terminalTestTimeout)
+	defer cancel()
+	if err := RunTerminalClient(ctx, TerminalClientConfig{
+		Endpoint: endpoint, Stdin: stdin, Stdout: &stdout,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	endpoint.mu.Lock()
+	sent := append([]TerminalInput(nil), endpoint.sent...)
+	endpoint.mu.Unlock()
+	if len(sent) != 1 || sent[0].Kind != TerminalInputEOF {
+		t.Fatalf("empty stdin sent %+v, want exactly one terminal EOF", sent)
+	}
+}
+
 func terminalClientPipe(t *testing.T) (*os.File, *os.File) {
 	t.Helper()
 	reader, writer, err := os.Pipe()

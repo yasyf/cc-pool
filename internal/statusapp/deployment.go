@@ -98,19 +98,32 @@ func ApplyPackagedApp(ctx context.Context, candidateSourcePath string) (ServiceI
 // one. WaitReady alone proves live-and-ready under the tenant lane's
 // same-user floor, which any same-UID listener clears — the executable-scoped
 // inventory is what ties the answering PID to the installed application's own
-// runtime binary.
+// runtime binary. The health observation is bracketed between two
+// inventories that must both pin the answering PID to one process instance
+// ({Start, Boot}), so a PID reused or exec'd across the observation cannot
+// correlate.
 func RequireActiveService(ctx context.Context) error {
+	executable := bundle.ExePath(installedAppPath(), holderbridge.ExecutableName)
+	before, err := deployInventory(executable)
+	if err != nil {
+		return fmt.Errorf("CCPoolStatus: inventory the installed runtime: %w", err)
+	}
 	health, err := tenantLaneReady(ctx)
 	if err != nil {
 		return fmt.Errorf("CCPoolStatus: require the live FuseKit runtime: %w", err)
 	}
-	survivors, err := deployInventory(bundle.ExePath(installedAppPath(), holderbridge.ExecutableName))
+	after, err := deployInventory(executable)
 	if err != nil {
 		return fmt.Errorf("CCPoolStatus: inventory the installed runtime: %w", err)
 	}
-	for _, live := range survivors.Live {
-		if live.PID == health.PID {
-			return nil
+	for _, first := range before.Live {
+		if first.PID != health.PID {
+			continue
+		}
+		for _, second := range after.Live {
+			if second.PID == first.PID && second.Start == first.Start && second.Boot == first.Boot {
+				return nil
+			}
 		}
 	}
 	return fmt.Errorf(

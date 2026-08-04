@@ -246,6 +246,47 @@ func TestRequireActiveServiceTiesTheServingPIDToTheInstalledRuntime(t *testing.T
 	}
 }
 
+func TestRequireActiveServiceRefusesAPIDNotPinnedAcrossTheObservation(t *testing.T) {
+	swapDeploymentVar(t, &tenantLaneReady, func(context.Context) (daemonkit.Health, error) {
+		return daemonkit.Health{Phase: daemonkit.PhaseReady, PID: 4242}, nil
+	})
+	tests := []struct {
+		name   string
+		before deploy.Survivors
+		after  deploy.Survivors
+	}{
+		{
+			"the installed binary held the pid only after the answer",
+			deploy.Survivors{},
+			deploy.Survivors{Live: []deploy.LiveProcess{{PID: 4242, Start: 2, Boot: 1}}},
+		},
+		{
+			"the pid crossed the observation as two instances",
+			deploy.Survivors{Live: []deploy.LiveProcess{{PID: 4242, Start: 1, Boot: 1}}},
+			deploy.Survivors{Live: []deploy.LiveProcess{{PID: 4242, Start: 2, Boot: 1}}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := 0
+			swapDeploymentVar(t, &deployInventory, func(...string) (deploy.Survivors, error) {
+				calls++
+				if calls == 1 {
+					return tt.before, nil
+				}
+				return tt.after, nil
+			})
+			if err := RequireActiveService(t.Context()); err == nil ||
+				!strings.Contains(err.Error(), "does not run the installed application") {
+				t.Fatalf("unpinned pid = %v, want an installed-runtime refusal", err)
+			}
+			if calls != 2 {
+				t.Fatalf("inventory bracket ran %d calls, want 2", calls)
+			}
+		})
+	}
+}
+
 func swapDeploymentVar[T any](t *testing.T, target *T, replacement T) {
 	t.Helper()
 	previous := *target
