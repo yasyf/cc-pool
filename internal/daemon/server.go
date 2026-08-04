@@ -70,6 +70,11 @@ type Server struct {
 	// wg tracks product background loops canceled by the activation lifetime.
 	wg sync.WaitGroup
 
+	// workersOnce and workersDone memoize the one worker-join barrier Drain
+	// begins and Close re-checks before releasing anything a worker touches.
+	workersOnce sync.Once
+	workersDone chan struct{}
+
 	execMu     sync.Mutex
 	execCancel context.CancelFunc
 

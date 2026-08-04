@@ -46,10 +46,12 @@ func reply(response Response) (daemonkit.Reply, error) {
 	return daemonkit.Reply{Body: body}, nil
 }
 
-// Drain stops admitting work and joins every saga goroutine. The join is
-// unconditional across every cleanup error: a successor may only claim this
-// generation's owner-keyed rows once no saga of ours can still write one, and
-// Serve holds the flock until this returns.
+// Drain stops admitting work and joins every saga goroutine within the
+// budget. A join the budget cuts short is reported, never abandoned to
+// teardown: Close re-waits the same barrier before releasing anything, and
+// daemonkit parks the process over abandoned stages with the flock held, so
+// a successor still cannot claim this generation's owner-keyed rows while a
+// saga of ours could write one.
 func (s *Server) Drain(budget daemonkit.Budget) error {
 	ctx, cancel := budget.Context(context.Background())
 	defer cancel()
@@ -70,21 +72,38 @@ func (s *Server) drainProduct(ctx context.Context) error {
 	if s.accountTerminals != nil {
 		result = errors.Join(result, s.accountTerminals.Close(ctx))
 	}
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-ctx.Done():
-		result = errors.Join(result, fmt.Errorf("daemon: await product workers: %w", ctx.Err()))
-	}
-	return result
+	return errors.Join(result, s.awaitWorkers(ctx))
 }
 
-// Close releases the store and the holder session, after Drain proved no saga
-// still holds either.
+// awaitWorkers is the worker-join barrier: the budget bounds only the wait,
+// never the verdict, so a join that has completed answers settled even on a
+// spent budget.
+func (s *Server) awaitWorkers(ctx context.Context) error {
+	s.workersOnce.Do(func() {
+		done := make(chan struct{})
+		s.workersDone = done
+		go func() {
+			s.wg.Wait()
+			close(done)
+		}()
+	})
+	select {
+	case <-s.workersDone:
+		return nil
+	default:
+	}
+	select {
+	case <-s.workersDone:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("daemon: await product workers: %w", ctx.Err())
+	}
+}
+
+// Close releases the store and the holder session, but only once the worker
+// join has completed: on a budget spent first it returns with everything
+// still held, leaking the store on a pathological shutdown rather than
+// freeing it under a live saga.
 func (s *Server) Close(budget daemonkit.Budget) error {
 	ctx, cancel := budget.Context(context.Background())
 	defer cancel()
@@ -92,6 +111,9 @@ func (s *Server) Close(budget daemonkit.Budget) error {
 }
 
 func (s *Server) closeProduct(ctx context.Context) error {
+	if err := s.awaitWorkers(ctx); err != nil {
+		return fmt.Errorf("daemon: refuse teardown before workers settle: %w", err)
+	}
 	var result error
 	if s.syncClient != nil {
 		result = errors.Join(result, s.syncClient.Close())

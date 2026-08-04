@@ -271,7 +271,7 @@ func (s *Server) provideAccountMutationInput(
 			return AccountMutationResult{}, ctx.Err()
 		}
 	}
-	pa, err := s.accountMutationAttachment(session, operationID, running, nil)
+	pa, err := s.accountMutationAttachment(session, operationID, running, nil) //nolint:contextcheck // the attachment and its teardown follow the daemon lifetime, not this request.
 	if err != nil {
 		return AccountMutationResult{}, err
 	}
@@ -319,7 +319,7 @@ func (s *Server) startAccountMutationTerminal(
 		defer cancelLifetime(context.Canceled)
 		s.watchAccountMutationRun(ctx, active, running)
 	}(lifetime)
-	s.adoptAccountMutationAttachment(session, operationID, attachment)
+	s.adoptAccountMutationAttachment(session, operationID, attachment) //nolint:contextcheck // the attachment and its teardown follow the daemon lifetime, not this request.
 	return accountMutationActiveResult(active), nil
 }
 
@@ -431,9 +431,10 @@ func (s *Server) watchAccountMutationRun(
 	running.outcome, running.err = waitAccountMutationTerminal(
 		ctx, s.accountMutationTerminal, running.terminal, mutation,
 	)
-	settleCtx, cancel := context.WithTimeout(
-		context.WithoutCancel(ctx), accountMutationSettleWait,
-	)
+	// Settlement rides the daemon lifetime, not a detached window: a drain
+	// cuts it short and the next start's recovery ladder finishes the row,
+	// rather than racing Product.Close with up to settleWait of store I/O.
+	settleCtx, cancel := context.WithTimeout(ctx, accountMutationSettleWait)
 	running.result, running.err = s.settleAccountMutationTerminal(
 		settleCtx, mutation, running.err,
 	)
