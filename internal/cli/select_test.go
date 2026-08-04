@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -292,8 +293,8 @@ func TestResolveSelectionRejectsDaemonBuildSkewWithoutLocalFallback(t *testing.T
 	cmd := &cobra.Command{}
 	cmd.SetContext(t.Context())
 	_, _, _, err = resolveSelection(cmd, m, selectReq{cwd: "/project"})
-	if err == nil || !strings.Contains(err.Error(), "daemon runtime build is not exact") {
-		t.Fatalf("resolveSelection with daemon build skew = %v", err)
+	if !errors.Is(err, daemon.ErrDaemonBuildMismatch) {
+		t.Fatalf("resolveSelection with daemon build skew = %v, want ErrDaemonBuildMismatch", err)
 	}
 	if sessions, listErr := m.Store.ListActiveSessions(); listErr != nil || len(sessions) != 0 {
 		t.Fatalf("build-skewed selection fell back locally: sessions=%+v err=%v", sessions, listErr)
