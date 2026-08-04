@@ -458,6 +458,13 @@ func TestAccountMutationAttachRequiresExactFenceBeforeInput(t *testing.T) {
 	}
 }
 
+// TestAccountMutationDisconnectBeforeInputLeavesAwaitingInput pins that an
+// abandoned start is not a cancellation: a client that dies after
+// StartOrAttach sends no input at all, and the row must stay resumable. It is
+// the counterpart to the explicit pre-start EOF — "no input is coming, ever" —
+// which resolves the row terminally (TestPreStartPollParksAndEOFResolvesTerminal).
+// The streaming protocol expressed both as one closed input channel; the unary
+// protocol distinguishes them, so they are asserted separately.
 func TestAccountMutationDisconnectBeforeInputLeavesAwaitingInput(t *testing.T) {
 	s, fake, account := newAccountMutationTestServer(t, true)
 	var loginCalls atomic.Int64
@@ -471,17 +478,26 @@ func TestAccountMutationDisconnectBeforeInputLeavesAwaitingInput(t *testing.T) {
 	request := AccountMutationRequest{
 		Kind: AccountMutationRelogin, Action: AccountMutationStartOrAttach, AccountID: account.ID,
 	}
-	begin, err := runAccountMutationTest(t, s, request)
+	session := newFakePollSession(11)
+	begin, err := s.runAccountMutation(t.Context(), session, request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	touched := len(fake.TouchedServices())
-	request.Action = AccountMutationProvideInput
-	request.Fence = begin.Fence
-	request.Input = accountMutationEOFPayload(t)
-	result, err := runAccountMutationTest(t, s, request)
-	if err != nil || result.State != AccountMutationAwaitingInput {
-		t.Fatalf("pre-input disconnect = %+v err=%v", result, err)
+
+	// The client goes away without ever providing input.
+	close(session.disconnected)
+	close(session.done)
+
+	active, err := s.m.Store.AccountMutation(store.AccountMutationID(begin.OperationID))
+	if err != nil {
+		t.Fatalf("abandoned start did not leave a resumable row: %v", err)
+	}
+	if active.State != store.AccountMutationAwaitingInput {
+		t.Fatalf("abandoned start = %s, want the row still awaiting input", active.State)
+	}
+	if _, err := s.m.Store.AccountMutationReceipt(active.OperationID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("abandoned start resolved the mutation: %v", err)
 	}
 	if loginCalls.Load() != 0 {
 		t.Fatalf("pre-input disconnect started %d terminal workers", loginCalls.Load())
@@ -489,8 +505,14 @@ func TestAccountMutationDisconnectBeforeInputLeavesAwaitingInput(t *testing.T) {
 	if got := len(fake.TouchedServices()); got != touched {
 		t.Fatalf("pre-input disconnect performed credential I/O: touched %d -> %d", touched, got)
 	}
-}
 
+	// The row is still attachable: a fresh client resumes the same operation.
+	resumed, err := runAccountMutationTest(t, s, request)
+	if err != nil || resumed.OperationID != begin.OperationID ||
+		resumed.State != AccountMutationAwaitingInput {
+		t.Fatalf("resume after disconnect = %+v err=%v", resumed, err)
+	}
+}
 func TestAccountMutationDuplicateTerminalAttachRunsOneSemanticOperation(t *testing.T) {
 	s, _, account := newAccountMutationTestServer(t, true)
 	started := make(chan struct{})

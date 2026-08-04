@@ -14,7 +14,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
-	"github.com/yasyf/daemonkit"
 )
 
 const (
@@ -72,7 +71,7 @@ func (s *Server) handleAccountMutationAck(ctx context.Context, request Request) 
 
 func (s *Server) handleAccountMutation(
 	ctx context.Context,
-	session daemonkit.Session,
+	session pollSession,
 	request Request,
 ) Response {
 	if request.Mutation == nil {
@@ -127,7 +126,7 @@ func validateAccountMutationCommand(request AccountMutationRequest) error {
 
 func (s *Server) runAccountMutation(
 	ctx context.Context,
-	session daemonkit.Session,
+	session pollSession,
 	request AccountMutationRequest,
 ) (AccountMutationResult, error) {
 	var active store.AccountMutation

@@ -72,11 +72,21 @@ func TestSweepLegacyAccountTerminalsKillsSurvivorsSkipsReuseAndArchives(t *testi
 	if err := survivor.Start(); err != nil {
 		t.Fatal(err)
 	}
-	reaped := make(chan error, 1)
-	go func() { reaped <- survivor.Wait() }()
+	// settled closes rather than carrying a value: the assertion below and
+	// the cleanup both wait on it, and a one-value channel would park the
+	// second receiver forever.
+	settled := make(chan struct{})
+	go func() {
+		_ = survivor.Wait()
+		close(settled)
+	}()
 	t.Cleanup(func() {
 		_ = survivor.Process.Kill()
-		<-reaped
+		select {
+		case <-settled:
+		case <-time.After(5 * time.Second):
+			t.Error("recorded survivor never settled")
+		}
 	})
 	pid := survivor.Process.Pid
 	sid, err := unix.Getsid(pid)
@@ -95,7 +105,7 @@ func TestSweepLegacyAccountTerminalsKillsSurvivorsSkipsReuseAndArchives(t *testi
 	}
 
 	select {
-	case <-reaped:
+	case <-settled:
 	case <-time.After(5 * time.Second):
 		t.Fatal("recorded survivor was not settled")
 	}
