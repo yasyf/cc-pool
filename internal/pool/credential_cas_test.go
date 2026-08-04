@@ -559,6 +559,7 @@ func credentialCASTestRequest(
 		t.Fatal(err)
 	}
 	return CredentialCASRequest{
+		Owner:     mintCredentialLockOwner(t),
 		AccountID: account.ID, AccountInstanceID: account.InstanceID,
 		AccountGeneration: account.Generation, ConfigDir: account.ConfigDir,
 		ExpectedPublicPath: credentialCASTestPublicPath(t, account),
@@ -570,6 +571,7 @@ func credentialCASTestRequest(
 func credentialCASTestBaseRequest(t *testing.T, account store.Account) CredentialCASRequest {
 	t.Helper()
 	return CredentialCASRequest{
+		Owner:     mintCredentialLockOwner(t),
 		AccountID: account.ID, AccountInstanceID: account.InstanceID,
 		AccountGeneration: account.Generation, ConfigDir: account.ConfigDir,
 		ExpectedPublicPath: credentialCASTestPublicPath(t, account),

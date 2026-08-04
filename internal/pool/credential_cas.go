@@ -17,7 +17,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/workerexec"
-	"github.com/yasyf/daemonkit/worker"
 )
 
 const (
@@ -31,6 +30,7 @@ var errCredentialCASConflict = errors.New("credential changed before compare-and
 // CredentialCASRequest is the exact v1 request accepted by the disposable
 // credential compare-and-swap worker.
 type CredentialCASRequest struct {
+	Owner              store.OwnerRecord             `json:"owner"`
 	AccountID          int                           `json:"account_id"`
 	AccountInstanceID  string                        `json:"account_instance_id"`
 	AccountGeneration  uint64                        `json:"account_generation"`
@@ -104,7 +104,12 @@ func (m *Manager) runCredentialCAS(
 	if err != nil {
 		return credentialCASProof{}, err
 	}
+	owner, err := m.MutationOwner()
+	if err != nil {
+		return credentialCASProof{}, err
+	}
 	request := CredentialCASRequest{
+		Owner:     owner,
 		AccountID: account.ID, AccountInstanceID: account.InstanceID,
 		AccountGeneration: account.Generation, ConfigDir: account.ConfigDir,
 		ExpectedPublicPath: publicPath,
@@ -128,7 +133,7 @@ func (m *Manager) runCredentialCAS(
 	if err != nil {
 		return credentialCASProof{}, fmt.Errorf("resolve credential CAS worker home: %w", err)
 	}
-	result, runErr := m.taskRunner.Run(ctx, worker.CommandRequest{
+	result, runErr := m.taskRunner.Run(ctx, workerexec.CommandRequest{
 		Path: m.workerExecutable, Dir: workerexec.TempDir(), Args: []string{casWorkerArgument},
 		Env: []string{"HOME=" + home}, Stdin: input.Bytes(), TotalTimeout: credentialCASWorkerTimeout,
 	})
@@ -194,7 +199,7 @@ func RunCredentialCASWorker(
 			return fmt.Errorf("credential CAS payload is invalid: %w", err)
 		}
 	}
-	lease, err := acquireCredentialRefreshLocks(ctx, request.AccountID, request.ConfigDir)
+	lease, err := acquireCredentialRefreshLocks(ctx, request.Owner, request.AccountID, request.ConfigDir)
 	if err != nil {
 		return err
 	}
@@ -418,6 +423,9 @@ func observeCredentialCASSlot(
 }
 
 func validateCredentialCASRequest(request CredentialCASRequest) error {
+	if err := request.Owner.Validate(); err != nil {
+		return fmt.Errorf("credential CAS owner: %w", err)
+	}
 	if request.AccountID < 1 || !filepath.IsAbs(request.ConfigDir) ||
 		filepath.Clean(request.ConfigDir) != request.ConfigDir || strings.ContainsRune(request.ConfigDir, 0) {
 		return errors.New("credential CAS account path is not one exact absolute execution path")
@@ -498,12 +506,12 @@ func decodeCredentialCASJSON(input io.Reader, value any) error {
 
 type credentialCASDirectRunner struct{}
 
-func (credentialCASDirectRunner) Run(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
+func (credentialCASDirectRunner) Run(ctx context.Context, task workerexec.CommandRequest) (workerexec.CommandResult, error) {
 	if task.Path == "" {
-		return worker.CommandResult{}, errors.New("credential CAS nested task has no executable")
+		return workerexec.CommandResult{}, errors.New("credential CAS nested task has no executable")
 	}
 	if !filepath.IsAbs(task.Path) || filepath.Clean(task.Path) != task.Path {
-		return worker.CommandResult{}, errors.New("credential CAS nested task requires a clean absolute executable")
+		return workerexec.CommandResult{}, errors.New("credential CAS nested task requires a clean absolute executable")
 	}
 	// #nosec G204 -- task.Path is a validated absolute security(1) or test-fixture path.
 	command := exec.CommandContext(ctx, task.Path, task.Args...)
@@ -514,5 +522,5 @@ func (credentialCASDirectRunner) Run(ctx context.Context, task worker.CommandReq
 	command.Stdout = &stdout
 	command.Stderr = &stderr
 	err := command.Run()
-	return worker.CommandResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, err
+	return workerexec.CommandResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, err
 }

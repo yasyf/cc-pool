@@ -90,7 +90,11 @@ func (m *Manager) admitSyncedCredential(
 	accessHashDigest store.CredentialDigest,
 	expectedAccessHash string,
 ) (admitted bool, resultErr error) {
-	lease, err := acquireCredentialRefreshLocks(ctx, account.ID, account.ConfigDir)
+	owner, err := m.MutationOwner()
+	if err != nil {
+		return false, err
+	}
+	lease, err := acquireCredentialRefreshLocks(ctx, owner, account.ID, account.ConfigDir)
 	if err != nil {
 		return false, err
 	}
