@@ -14,7 +14,12 @@ import (
 // bytes every owner_record column stores and every fenced CAS compares. Bytes
 // are minted once per generation and never decoded once stored; a foreign
 // generation's bytes — any prior era's included — are claimed by echoing them
-// into the epoch CAS, never by interpreting them.
+// into the epoch CAS, never by interpreting them. The []byte underlying type
+// is load-bearing beyond equality: it marshals as a JSON string, which is what
+// keeps a v2 identity byte-distinct from every v0.20 proc.Record object in
+// raw-carried JSON fields like the credential-lock journal's worker — an
+// OwnerRecord that marshaled as an object would silently erase that era
+// separation.
 type OwnerRecord []byte
 
 const ownerRecordMaxBytes = 1 << 10
