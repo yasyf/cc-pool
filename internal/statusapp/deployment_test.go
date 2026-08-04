@@ -5,10 +5,12 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/yasyf/cc-pool/internal/holderbridge"
+	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/daemonkit/deploy"
@@ -286,6 +288,20 @@ func TestRequireActiveServiceRefusesAPIDNotPinnedAcrossTheObservation(t *testing
 				t.Fatalf("inventory bracket ran %d calls, want %d", calls, len(tt.inventories))
 			}
 		})
+	}
+}
+
+func TestObserverTenantDaemonRequiresTheInstalledSigningIdentity(t *testing.T) {
+	observer := observerTenantDaemon()
+	if !reflect.DeepEqual(observer.Trust.Serving, daemonkit.ServingSigned(statusAppRequirement())) {
+		t.Fatalf("observer serving trust = %+v, want the installed application's signing requirement", observer.Trust.Serving)
+	}
+	shared := tenantfs.Daemon()
+	if observer.Label != shared.Label {
+		t.Fatalf("observer label = %q diverged from the shared lane %q", observer.Label, shared.Label)
+	}
+	if !reflect.DeepEqual(shared.Trust.Serving, daemonkit.ServingSameUser()) {
+		t.Fatalf("shared serving trust = %+v; the observer requirement must not leak into the shared identity", shared.Trust.Serving)
 	}
 }
 

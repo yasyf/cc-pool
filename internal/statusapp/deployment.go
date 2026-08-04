@@ -36,7 +36,7 @@ var (
 	installedAppPath    = pool.WidgetAppPath
 	deployInventory     = deploy.Inventory
 	tenantLaneReady     = func(ctx context.Context) (daemonkit.Health, error) {
-		client, err := daemonkit.Open(tenantfs.Daemon())
+		client, err := daemonkit.Open(observerTenantDaemon())
 		if err != nil {
 			return daemonkit.Health{}, fmt.Errorf("CCPoolStatus: open the cc-pool tenant lane: %w", err)
 		}
@@ -45,6 +45,19 @@ var (
 		return client.WaitReady(readyCtx)
 	}
 )
+
+// observerTenantDaemon is the tenant lane as CCPoolStatus attaches to it:
+// the shared identity, with the serving process additionally required to
+// prove the installed application's own signing identity on the very
+// connection the health observation rides. The same-user floor admits any
+// same-UID listener and a process-table snapshot cannot bind an answer to
+// the answerer; the authenticated session does. Trust.Serving is read only
+// by the attaching client, so the shared serving side is untouched.
+func observerTenantDaemon() daemonkit.Daemon {
+	d := tenantfs.Daemon()
+	d.Trust.Serving = daemonkit.ServingSigned(statusAppRequirement())
+	return d
+}
 
 // ServiceInstallReceipt binds one landed generation to the activation that
 // proved its runtime live.
