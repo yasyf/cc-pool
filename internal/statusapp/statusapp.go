@@ -14,7 +14,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/holderbridge"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/version"
-	"github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/durable"
 )
 
 const (
@@ -153,12 +153,12 @@ func ensureInstallDirectory(path string) error {
 		if err := os.Chmod(path, 0o700); err != nil {
 			return fmt.Errorf("CCPoolStatus: protect install directory %q: %w", path, err)
 		}
-		if err := daemon.SyncDir(path); err != nil {
+		if err := durable.SyncDir(path); err != nil {
 			return fmt.Errorf("CCPoolStatus: persist install directory permissions: %w", err)
 		}
 	}
 	if created {
-		if err := daemon.SyncDir(parent); err != nil {
+		if err := durable.SyncDir(parent); err != nil {
 			return fmt.Errorf("CCPoolStatus: persist install directory: %w", err)
 		}
 	}

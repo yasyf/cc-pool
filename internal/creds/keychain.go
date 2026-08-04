@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/workerexec"
-	"github.com/yasyf/daemonkit/worker"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -197,7 +196,7 @@ func runKeychainTask(
 	if err != nil {
 		return fmt.Errorf("resolve credential keychain home: %w", err)
 	}
-	result, err := runner.Run(ctx, worker.CommandRequest{
+	result, err := runner.Run(ctx, workerexec.CommandRequest{
 		Path: securityExecutable(), Dir: workerexec.TempDir(), Args: args,
 		Env: []string{"HOME=" + home}, TotalTimeout: keychainTaskTimeout,
 	})

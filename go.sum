@@ -114,8 +114,12 @@ github.com/yasyf/daemonkit v0.20.9 h1:onr3LY9Davf1mSZGKTzyNadkhqu9UYxz5w1JZui0G3
 github.com/yasyf/daemonkit v0.20.9/go.mod h1:5tYeENawEKN1GpM12YXTqIZ1fbWv7bj9P4TyIcSZ24Q=
 github.com/yasyf/daemonkit v0.21.3 h1:v93uW5dFWQeq0HJKc/9+IL/LWVkecvDExuuAhZXWCYM=
 github.com/yasyf/daemonkit v0.21.3/go.mod h1:wn6ImONXaBW3uf7GJO68nGd/KR2PjxXy4r/m9W3gDOM=
+github.com/yasyf/daemonkit v0.21.4 h1:95xJR6bv0Ih2fhbkesrvQFUd3QnAvzYgEBUJaZNYnjM=
+github.com/yasyf/daemonkit v0.21.4/go.mod h1:wn6ImONXaBW3uf7GJO68nGd/KR2PjxXy4r/m9W3gDOM=
 github.com/yasyf/fusekit v1.15.5 h1:R33iD6XBj4Ww6i7aUEMKFPSwTcfySWweWpcRAOqN3+Q=
 github.com/yasyf/fusekit v1.15.5/go.mod h1:ksYerHXMX2oWNB+U1KnhTPma1qM8HHMuLVj2FvrSRAI=
+github.com/yasyf/fusekit v1.16.0 h1:XMlzzQ5glHR0AAKbJYIbOB61S4XxDvKhp1vnHVj5rmU=
+github.com/yasyf/fusekit v1.16.0/go.mod h1:eXq8O0NH1Q+A7dB/6Pfz16SLTxc4yfyuS8nl1YuXLQg=
 github.com/yasyf/synckit v0.35.2 h1:a1ND3ea+j3aADlJjCUetTeMO8LuJCggkGVWc2EU37g8=
 github.com/yasyf/synckit v0.35.2/go.mod h1:0EJTaW9Ldz/0kkqykXWgZvAYXdOAZEth/gFACME3Ixs=
 github.com/yasyf/synckit v0.37.1 h1:uGR9WLO/j2hqBoO3xYe5uX7Sk3xofg9G5nkE2+zUqXE=

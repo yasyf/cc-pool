@@ -9,318 +9,276 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/holderbridge"
 	"github.com/yasyf/cc-pool/internal/version"
-	"github.com/yasyf/daemonkit/deployment"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/service"
-	"github.com/yasyf/fusekit/holder"
+	"github.com/yasyf/daemonkit"
+	"github.com/yasyf/daemonkit/deploy"
+	"github.com/yasyf/daemonkit/launchd"
+)
+
+const (
+	testBundleDigest       = "1111111111111111111111111111111111111111111111111111111111111111"
+	testEntitlementsDigest = "2222222222222222222222222222222222222222222222222222222222222222"
 )
 
 type recordingDeployer struct {
-	attestation installedGeneration
-	attestSpec  deployment.InstalledSpec
-	attestErr   error
+	config deploy.Config
 
-	apply      candidateRequest
-	applied    candidateReceipt
-	applyErr   error
-	applyCalls int
+	installed      deploy.Generation
+	installCalls   int
+	superseded     deploy.Generation
+	supersedeCalls int
 
-	statuses    []installedStatus
-	statusCalls int
-
-	uninstall      uninstallRequest
-	uninstalled    uninstallReceipt
+	activation     deploy.Activation
+	activateErr    error
+	activateCalls  int
 	uninstallErr   error
 	uninstallCalls int
 }
 
-func (d *recordingDeployer) Attest(
-	_ context.Context,
-	spec deployment.InstalledSpec,
-) (installedGeneration, error) {
-	d.attestSpec = spec
-	return d.attestation, d.attestErr
+func (d *recordingDeployer) Install(_ context.Context, _ deploy.Candidate) (deploy.Generation, error) {
+	d.installCalls++
+	return d.installed, nil
 }
 
-func (d *recordingDeployer) Apply(
-	_ context.Context,
-	request candidateRequest,
-) (candidateReceipt, error) {
-	d.applyCalls++
-	d.apply = request
-	return d.applied, d.applyErr
+func (d *recordingDeployer) Supersede(_ context.Context, _ deploy.Candidate) (deploy.Generation, error) {
+	d.supersedeCalls++
+	return d.superseded, nil
 }
 
-func (d *recordingDeployer) Status(
-	context.Context,
-	deployment.InstalledSpec,
-) (installedStatus, error) {
-	index := d.statusCalls
-	d.statusCalls++
-	if len(d.statuses) == 0 {
-		return installedStatus{}, errors.New("unexpected status")
-	}
-	if index >= len(d.statuses) {
-		index = len(d.statuses) - 1
-	}
-	return d.statuses[index], nil
+func (d *recordingDeployer) Activate(context.Context) (deploy.Activation, error) {
+	d.activateCalls++
+	return d.activation, d.activateErr
 }
 
-func (d *recordingDeployer) Uninstall(
-	_ context.Context,
-	request uninstallRequest,
-) (uninstallReceipt, error) {
+func (d *recordingDeployer) Uninstall(context.Context) (deploy.Removal, error) {
 	d.uninstallCalls++
-	d.uninstall = request
-	return d.uninstalled, d.uninstallErr
+	return deploy.Removal{}, d.uninstallErr
 }
 
-func exactTestGeneration(t *testing.T) installedGeneration {
-	t.Helper()
-	directory, err := os.MkdirTemp("/private/tmp", "cc-pool-status-test-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(directory) })
-	appPath := filepath.Join(directory, "CCPoolStatus.app")
-	executable := holderExecutablePath(appPath)
-	if err := os.MkdirAll(filepath.Dir(executable), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	// #nosec G306 -- the fixture must be executable to model the signed app binary.
-	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	return installedGeneration{
-		path: appPath, version: "0.63.0",
-		teamID: holderbridge.TeamID, signingIdentifier: holderbridge.BundleID,
-		designatedRequirement: "designated => anchor apple generic",
-		cdHash:                "0123456789abcdef0123456789abcdef01234567",
-		bundleDigest:          deployment.SHA256{1},
-		entitlementsDigest:    deployment.SHA256{2},
-		device:                "1",
-		inode:                 "2",
+func exactTestGeneration(appPath string) deploy.Generation {
+	return deploy.Generation{
+		Path: appPath, Version: "0.63.0",
+		TeamID: holderbridge.TeamID, SigningIdentifier: holderbridge.BundleID,
+		DesignatedRequirement: "designated => anchor apple generic",
+		CDHash:                "0123456789abcdef0123456789abcdef01234567",
+		EntitlementsDigest:    testEntitlementsDigest,
+		BundleDigest:          testBundleDigest,
+		FileID:                deploy.FileID{Device: "1", Inode: "2"},
 	}
 }
 
-func installedTestGeneration(source installedGeneration) installedGeneration {
-	result := source
-	result.path = installedAppPath()
-	result.device = "3"
-	result.inode = "4"
-	return result
-}
-
-func exactTestActivation(t *testing.T, generation installedGeneration) activationReceipt {
-	t.Helper()
-	plan, err := testServicePlan(generation, "runtime-v1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	return activationReceipt{
-		id: "activation-1", active: true, generation: generation, plan: plan,
-		readiness: runtimeReadiness{
-			runtimeBuild: "runtime-v1", processGeneration: proc.OwnerGeneration{1},
-			digest: deployment.SHA256{4},
-		},
-	}
-}
-
-func useDeploymentMetadata(t *testing.T, configure ...func(*productHooks)) {
+func useDeploymentMetadata(t *testing.T, controller *recordingDeployer) string {
 	t.Helper()
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	appPath := filepath.Join(root, "Applications", "CCPoolStatus.app")
-	executable := holderExecutablePath(appPath)
-	if err := os.MkdirAll(filepath.Dir(executable), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	// #nosec G306 -- the fixture must be executable to model the signed app binary.
-	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
 	oldInstalledAppPath := installedAppPath
 	installedAppPath = func() string { return appPath }
 	t.Cleanup(func() { installedAppPath = oldInstalledAppPath })
+
 	oldVersion, oldAppVersion := version.Version, version.StatusAppVersion
 	version.Version, version.StatusAppVersion = "v0.63.0", "0.63.0"
 	t.Cleanup(func() { version.Version, version.StatusAppVersion = oldVersion, oldAppVersion })
-	oldHooks := makeProductHooks
-	makeProductHooks = func(_ string, digest deployment.SHA256) productHooks {
-		hooks := newProductHooks("runtime-v1", digest)
-		installTestBuilders(&hooks)
-		for _, apply := range configure {
-			apply(&hooks)
-		}
-		return hooks
-	}
-	t.Cleanup(func() { makeProductHooks = oldHooks })
-}
 
-func testServicePlan(generation installedGeneration, buildID string) (service.Plan, error) {
-	return service.NewPlan([]service.Agent{{
-		Label: holderbridge.BundleID + ".fusekit", Program: holderExecutablePath(generation.path),
-		LogPath: "/tmp/cc-pool-holder-test.log", Env: map[string]string{"FUSEKIT_BUILD_ID": buildID},
+	agent := launchd.Agent{
+		Label:                       holderbridge.DeploymentServiceLabel,
+		Program:                     filepath.Join(appPath, "Contents", "MacOS", holderbridge.ExecutableName),
+		LogPath:                     filepath.Join(root, "holder.log"),
+		Env:                         map[string]string{"FUSEKIT_BUILD_ID": version.String()},
 		AssociatedBundleIdentifiers: []string{holderbridge.BundleID},
-		RestartPolicy:               service.RestartAlways,
-		LimitLoadToSessionType:      service.SessionTypeAqua,
-	}})
-}
-
-func installTestBuilders(hooks *productHooks) {
-	hooks.servicePlan = testServicePlan
-	hooks.candidatePlan = func(
-		targetAppPath string,
-		buildID, sourcePath string,
-	) (deployment.CandidatePlan, error) {
-		plan, err := testServicePlan(installedGeneration{path: targetAppPath}, buildID)
-		if err != nil {
-			return deployment.CandidatePlan{}, err
-		}
-		agents := plan.Agents()
-		agents[0].Program = holderExecutablePath(sourcePath)
-		return deployment.NewCandidatePlan(sourcePath, agents)
+		RestartPolicy:               launchd.RestartAlways,
 	}
-	hooks.target = func(installedGeneration, string) (runtimeTarget, error) {
-		return runtimeTarget{
-			executable: "/tmp/CCPoolStatus", socket: "/tmp/fusekit-test.sock", buildID: "runtime-v1",
+	oldCandidatePlan, oldInstalledAgents := makeCandidatePlan, makeInstalledAgents
+	makeCandidatePlan = func(target, buildID, source string) (candidatePlan, error) {
+		if target != appPath || buildID != version.String() {
+			return candidatePlan{}, errors.New("candidate plan was not bound to the exact installed generation")
+		}
+		return candidatePlan{
+			candidate: deploy.Candidate{
+				Source: source, Version: version.StatusAppVersion, Digest: deploy.SHA256{7},
+			},
+			agents: []launchd.Agent{agent},
 		}, nil
 	}
-	hooks.proveApp = func(context.Context, string) error { return nil }
-	hooks.observe = func(context.Context, string) (holder.LocalRuntimeReadiness, error) {
-		return exactHealth(runtimeTarget{buildID: "runtime-v1"}), nil
+	makeInstalledAgents = func(target, buildID string) ([]launchd.Agent, error) {
+		if target != appPath || buildID != version.String() {
+			return nil, errors.New("service plan was not bound to the exact installed generation")
+		}
+		return []launchd.Agent{agent}, nil
 	}
+	t.Cleanup(func() { makeCandidatePlan, makeInstalledAgents = oldCandidatePlan, oldInstalledAgents })
+
+	oldDeployer := newDeployer
+	newDeployer = func(config deploy.Config) (deploymentController, error) {
+		controller.config = config
+		return controller, nil
+	}
+	t.Cleanup(func() { newDeployer = oldDeployer })
+	return appPath
 }
 
-func TestApplyPackagedAppDelegatesExactCandidateAndReturnsTerminalApply(t *testing.T) {
-	useDeploymentMetadata(t)
-	candidate := exactTestGeneration(t)
-	installed := installedTestGeneration(candidate)
-	active := exactTestActivation(t, installed)
-	controller := &recordingDeployer{
-		attestation: candidate,
-		applied: candidateReceipt{
-			id: "apply-operation-1", activation: active,
-		},
-	}
-	receipt, err := applyPackagedApp(t.Context(), candidate.path, controller)
+func TestApplyPackagedAppInstallsAndActivatesTheExactCandidate(t *testing.T) {
+	controller := &recordingDeployer{}
+	appPath := useDeploymentMetadata(t, controller)
+	installed := exactTestGeneration(appPath)
+	controller.installed = installed
+	controller.activation = deploy.Activation{Generation: installed}
+
+	receipt, err := ApplyPackagedApp(t.Context(), "/tmp/packaged/CCPoolStatus.app")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if controller.applyCalls != 1 || controller.attestSpec.AppPath != candidate.path ||
-		controller.apply.sourcePath != candidate.path ||
-		controller.apply.target.AppPath != installedAppPath() ||
-		controller.apply.candidate.bundleDigest != candidate.bundleDigest ||
-		controller.apply.consumerBuild == "" || controller.apply.policyDigest == (deployment.SHA256{}) {
-		t.Fatalf("candidate apply = %#v", controller.apply)
+	if controller.installCalls != 1 || controller.supersedeCalls != 0 || controller.activateCalls != 1 {
+		t.Fatalf(
+			"calls = install %d, supersede %d, activate %d",
+			controller.installCalls, controller.supersedeCalls, controller.activateCalls,
+		)
 	}
-	if receipt.OperationID != "apply-operation-1" ||
-		receipt.Activation.OperationID != active.id ||
-		receipt.Activation.Holder.Path != installedAppPath() ||
-		receipt.Activation.State != ServiceDeploymentActive {
+	if receipt.ConsumerBuild == "" || receipt.Generation != installed ||
+		receipt.Activation.Generation != installed {
 		t.Fatalf("receipt = %#v", receipt)
 	}
 	if err := receipt.Rollback(t.Context()); err != nil {
-		t.Fatalf("terminal daemonkit rollback = %v", err)
+		t.Fatalf("sealed deploy rollback = %v", err)
 	}
 }
 
-func TestApplyPackagedAppRejectsIncompleteTerminalReceipt(t *testing.T) {
-	useDeploymentMetadata(t)
-	candidate := exactTestGeneration(t)
-	installed := installedTestGeneration(candidate)
-	controller := &recordingDeployer{
-		attestation: candidate,
-		applied: candidateReceipt{
-			id: "apply-operation-1",
-			activation: activationReceipt{
-				id: "activation-1", active: true, generation: installed,
-			},
-		},
-	}
-	if _, err := applyPackagedApp(t.Context(), candidate.path, controller); err == nil {
-		t.Fatal("incomplete terminal apply receipt was accepted")
-	}
-	controller.applied.id = ""
-	controller.applied.activation = exactTestActivation(t, installed)
-	if _, err := applyPackagedApp(t.Context(), candidate.path, controller); err == nil {
-		t.Fatal("apply without terminal operation ID was accepted")
-	}
-}
-
-func TestRequireActiveServiceProvesDurableReceiptAndFreshReadiness(t *testing.T) {
-	useDeploymentMetadata(t)
-	installed := installedTestGeneration(exactTestGeneration(t))
-	active := exactTestActivation(t, installed)
-	controller := &recordingDeployer{statuses: []installedStatus{{
-		state: deployment.InstalledActive, generation: installed, activation: active, hasReceipt: true,
-	}}}
-	if err := requireActiveService(t.Context(), controller); err != nil {
+func TestApplyPackagedAppSupersedesAnOccupiedCanonicalPath(t *testing.T) {
+	controller := &recordingDeployer{}
+	appPath := useDeploymentMetadata(t, controller)
+	if err := os.MkdirAll(appPath, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if controller.statusCalls != 1 {
-		t.Fatalf("status calls = %d, want 1", controller.statusCalls)
-	}
+	installed := exactTestGeneration(appPath)
+	controller.superseded = installed
+	controller.activation = deploy.Activation{Generation: installed}
 
-	controller.statusCalls = 0
-	controller.statuses[0].state = deployment.InstalledPrepared
-	if err := requireActiveService(t.Context(), controller); err == nil {
-		t.Fatal("prepared service was accepted as active")
+	if _, err := ApplyPackagedApp(t.Context(), "/tmp/packaged/CCPoolStatus.app"); err != nil {
+		t.Fatal(err)
+	}
+	if controller.supersedeCalls != 1 || controller.installCalls != 0 {
+		t.Fatalf("calls = install %d, supersede %d", controller.installCalls, controller.supersedeCalls)
 	}
 }
 
-func TestRequireActiveServiceRejectsStaleRuntimeReadiness(t *testing.T) {
-	useDeploymentMetadata(t, func(hooks *productHooks) {
-		hooks.observe = func(context.Context, string) (holder.LocalRuntimeReadiness, error) {
-			health := exactHealth(runtimeTarget{buildID: "other-runtime"})
-			return health, nil
+func TestApplyPackagedAppBindsTheExactSealedDeploymentConfig(t *testing.T) {
+	controller := &recordingDeployer{}
+	appPath := useDeploymentMetadata(t, controller)
+	installed := exactTestGeneration(appPath)
+	controller.installed = installed
+	controller.activation = deploy.Activation{Generation: installed}
+
+	if _, err := ApplyPackagedApp(t.Context(), "/tmp/packaged/CCPoolStatus.app"); err != nil {
+		t.Fatal(err)
+	}
+	config := controller.config
+	if config.App != appPath || config.Requirement.TeamID != holderbridge.TeamID ||
+		config.Requirement.SigningIdentifier != holderbridge.BundleID ||
+		config.Daemon.Label != daemonkit.Label(holderbridge.DeploymentServiceLabel) ||
+		len(config.Agents) != 1 || config.Agents[0].Label != holderbridge.DeploymentServiceLabel {
+		t.Fatalf("deploy config = %#v", config)
+	}
+	if err := config.Daemon.ValidateForClient(); err != nil {
+		t.Fatalf("daemon identity is not client-valid: %v", err)
+	}
+}
+
+func TestApplyPackagedAppRejectsAnActivationOffTheLandedGeneration(t *testing.T) {
+	controller := &recordingDeployer{}
+	appPath := useDeploymentMetadata(t, controller)
+	installed := exactTestGeneration(appPath)
+	replaced := installed
+	replaced.BundleDigest = "3333333333333333333333333333333333333333333333333333333333333333"
+	controller.installed = installed
+	controller.activation = deploy.Activation{Generation: replaced}
+
+	if _, err := ApplyPackagedApp(t.Context(), "/tmp/packaged/CCPoolStatus.app"); err == nil {
+		t.Fatal("an activation of other bytes was accepted")
+	}
+}
+
+func TestApplyPackagedAppRejectsACandidateOffTheRelease(t *testing.T) {
+	controller := &recordingDeployer{}
+	useDeploymentMetadata(t, controller)
+	bound := makeCandidatePlan
+	makeCandidatePlan = func(target, buildID, source string) (candidatePlan, error) {
+		plan, err := bound(target, buildID, source)
+		if err != nil {
+			return candidatePlan{}, err
 		}
-	})
-	installed := installedTestGeneration(exactTestGeneration(t))
-	active := exactTestActivation(t, installed)
-	controller := &recordingDeployer{statuses: []installedStatus{{
-		state: deployment.InstalledActive, generation: installed, activation: active, hasReceipt: true,
-	}}}
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	if err := requireActiveService(ctx, controller); err == nil {
-		t.Fatal("stale runtime generation was accepted")
+		plan.candidate.Version = "0.62.0"
+		return plan, nil
+	}
+	if _, err := ApplyPackagedApp(t.Context(), "/tmp/packaged/CCPoolStatus.app"); err == nil {
+		t.Fatal("a candidate off the exact release was accepted")
+	}
+	if controller.installCalls != 0 || controller.supersedeCalls != 0 {
+		t.Fatal("an off-release candidate reached the sealed deployment")
 	}
 }
 
-func TestUninstallPackagedAppDelegatesSealedRemoval(t *testing.T) {
-	useDeploymentMetadata(t)
-	installed := installedTestGeneration(exactTestGeneration(t))
-	controller := &recordingDeployer{uninstalled: uninstallReceipt{
-		id: "uninstall-operation-1", generation: installed,
-		runtime: runtimeProof{absent: true, digest: deployment.SHA256{8}},
-	}}
-	if err := uninstallPackagedApp(t.Context(), controller); err != nil {
+func TestRequireActiveServiceActivatesAndSurfacesRefusals(t *testing.T) {
+	controller := &recordingDeployer{}
+	appPath := useDeploymentMetadata(t, controller)
+	controller.activation = deploy.Activation{Generation: exactTestGeneration(appPath)}
+
+	if err := RequireActiveService(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if controller.uninstallCalls != 1 || controller.uninstall.current.AppPath != installedAppPath() ||
-		controller.uninstall.readiness == nil || controller.uninstall.runtimeQuiesce == nil {
-		t.Fatalf("uninstall request = %#v", controller.uninstall)
+	if controller.activateCalls != 1 {
+		t.Fatalf("activate calls = %d, want 1", controller.activateCalls)
 	}
 
-	controller.uninstalled.runtime = runtimeProof{}
-	if err := uninstallPackagedApp(t.Context(), controller); err == nil {
-		t.Fatal("uninstall without absence proof was accepted")
+	want := errors.New("daemon never published readiness")
+	controller.activateErr = want
+	if err := RequireActiveService(t.Context()); !errors.Is(err, want) {
+		t.Fatalf("activate error = %v, want %v", err, want)
 	}
 }
 
-func TestCandidateApplyAndUninstallSurfaceControllerFailures(t *testing.T) {
-	useDeploymentMetadata(t)
-	candidate := exactTestGeneration(t)
-	want := errors.New("sealed transaction failed")
-	controller := &recordingDeployer{attestation: candidate, applyErr: want}
-	if _, err := applyPackagedApp(t.Context(), candidate.path, controller); !errors.Is(err, want) {
-		t.Fatalf("apply error = %v, want %v", err, want)
+func TestUninstallPackagedAppDelegatesTheSealedRemoval(t *testing.T) {
+	controller := &recordingDeployer{}
+	useDeploymentMetadata(t, controller)
+
+	if err := UninstallPackagedApp(t.Context()); err != nil {
+		t.Fatal(err)
 	}
+	if controller.uninstallCalls != 1 {
+		t.Fatalf("uninstall calls = %d, want 1", controller.uninstallCalls)
+	}
+
+	want := errors.New("live processes remain")
 	controller.uninstallErr = want
-	if err := uninstallPackagedApp(t.Context(), controller); !errors.Is(err, want) {
+	if err := UninstallPackagedApp(t.Context()); !errors.Is(err, want) {
 		t.Fatalf("uninstall error = %v, want %v", err, want)
+	}
+}
+
+func TestSameApplicationBytesIgnoresOnlyLocation(t *testing.T) {
+	base := exactTestGeneration("/Applications/CCPoolStatus.app")
+	moved := base
+	moved.Path = "/tmp/staged/CCPoolStatus.app"
+	moved.FileID = deploy.FileID{Device: "9", Inode: "9"}
+	rebuilt := base
+	rebuilt.CDHash = "89abcdef0123456789abcdef0123456789abcdef"
+	other := base
+	other.BundleDigest = "3333333333333333333333333333333333333333333333333333333333333333"
+
+	tests := []struct {
+		name  string
+		right deploy.Generation
+		want  bool
+	}{
+		{"same bytes at another path and inode", moved, true},
+		{"another code directory", rebuilt, false},
+		{"another bundle tree", other, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sameApplicationBytes(base, tt.right); got != tt.want {
+				t.Fatalf("sameApplicationBytes = %t, want %t", got, tt.want)
+			}
+		})
 	}
 }

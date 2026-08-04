@@ -6,9 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/daemonkit/worker"
 )
 
 func poolTestGeneration(label string) proc.OwnerGeneration {
@@ -18,33 +17,24 @@ func poolTestGeneration(label string) proc.OwnerGeneration {
 	return generation
 }
 
-func activatedPoolTestWorkers(t *testing.T, path string, capacity int) *worker.Pool {
+func poolTestRunner(t *testing.T, recordPath string) *workerRuntime {
 	t.Helper()
-	workers, err := worker.NewPool(worker.Config{
-		Capacity: capacity, QueueCapacity: capacity, MaxTotalRun: time.Minute,
-		MaxStdinBytes: 1 << 20, MaxStdoutBytes: 1 << 20, MaxStderrBytes: 1 << 20,
-	}, &proc.Reaper{
-		Store: &proc.FileStore{Path: path}, Generation: poolTestGeneration(t.Name()),
-	})
+	scopeCtx, cancelScope := context.WithTimeout(t.Context(), time.Minute)
+	t.Cleanup(cancelScope)
+	owned, err := daemonkit.OwnProcesses(scopeCtx, recordPath)
 	if err != nil {
-		t.Fatal(err)
-	}
-	claim, err := workers.ClaimRuntime(trust.VerifierWorkerBudgets())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := claim.Recover(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	if err := claim.Activate(); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
 		defer cancel()
-		if err := claim.Close(ctx); err != nil {
-			t.Errorf("close test worker claim: %v", err)
+		if err := owned.Close(closeCtx); err != nil {
+			t.Errorf("close test process scope: %v", err)
 		}
 	})
-	return workers
+	runtime, err := newWorkerRuntime(owned.Ctx(scopeCtx))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return runtime
 }

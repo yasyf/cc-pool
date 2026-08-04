@@ -9,21 +9,21 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/cc-pool/internal/workerexec"
 )
 
 type testTaskRunner struct{}
 
-func (testTaskRunner) Run(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
+func (testTaskRunner) Run(ctx context.Context, task workerexec.CommandRequest) (workerexec.CommandResult, error) {
 	if !filepath.IsAbs(task.Path) || filepath.Clean(task.Path) != task.Path {
-		return worker.CommandResult{}, errors.New("test task executable must be a clean absolute path")
+		return workerexec.CommandResult{}, errors.New("test task executable must be a clean absolute path")
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return worker.CommandResult{}, err
+		return workerexec.CommandResult{}, err
 	}
 	if len(task.Env) != 1 || task.Env[0] != "HOME="+home {
-		return worker.CommandResult{}, fmt.Errorf("test task environment is not exact: %v", task.Env)
+		return workerexec.CommandResult{}, fmt.Errorf("test task environment is not exact: %v", task.Env)
 	}
 	// #nosec G204 -- task.Path is a clean absolute test fixture executable or /usr/bin/security.
 	command := exec.CommandContext(ctx, task.Path, task.Args...)
@@ -34,5 +34,5 @@ func (testTaskRunner) Run(ctx context.Context, task worker.CommandRequest) (work
 	command.Stdout = &stdout
 	command.Stderr = &stderr
 	err = command.Run()
-	return worker.CommandResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, err
+	return workerexec.CommandResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, err
 }

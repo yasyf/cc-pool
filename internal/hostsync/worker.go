@@ -15,7 +15,6 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/workerexec"
-	"github.com/yasyf/daemonkit/worker"
 	"github.com/yasyf/synckit/syncservice"
 )
 
@@ -176,7 +175,7 @@ func (c *WorkerClient) do(ctx context.Context, operation workerOperation, params
 	if err != nil {
 		return err
 	}
-	command, runErr := c.runner.Run(ctx, worker.CommandRequest{
+	command, runErr := c.runner.Run(ctx, workerexec.CommandRequest{
 		Path: c.executable, Dir: workerexec.TempDir(), Args: []string{hostSyncWorkerArgument},
 		Env: environment, Stdin: framed.Bytes(), TotalTimeout: c.timeout,
 	})

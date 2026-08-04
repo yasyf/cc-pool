@@ -8,23 +8,23 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/testhome"
-	daemonproc "github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/cc-pool/internal/workerexec"
 )
 
 type inlineBackingTaskRunner struct{}
 
-func (inlineBackingTaskRunner) Run(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
+func (inlineBackingTaskRunner) Run(ctx context.Context, task workerexec.CommandRequest) (workerexec.CommandResult, error) {
 	if !IsBackingWorkerInvocation(task.Args) {
-		return worker.CommandResult{}, errors.New("unexpected pool test worker task")
+		return workerexec.CommandResult{}, errors.New("unexpected pool test worker task")
 	}
 	var output bytes.Buffer
 	err := RunBackingWorker(ctx, bytes.NewReader(task.Stdin), &output)
-	return worker.CommandResult{Stdout: output.Bytes()}, err
+	return workerexec.CommandResult{Stdout: output.Bytes()}, err
 }
 
 func installTestBackingRunner(manager *Manager) {
@@ -79,7 +79,7 @@ func TestBackingWorkerRemovesOnlyDirectAccountDirectory(t *testing.T) {
 	}
 }
 
-func TestPrepareAccountBackingDeadlineKillsReapsAndUntracks(t *testing.T) {
+func TestPrepareAccountBackingDeadlineKillsTheWedgedWorker(t *testing.T) {
 	home := t.TempDir()
 	testhome.Sandbox(t, home)
 	script := filepath.Join(home, "wedged-account-worker")
@@ -89,8 +89,7 @@ func TestPrepareAccountBackingDeadlineKillsReapsAndUntracks(t *testing.T) {
 		script,
 		"#!/bin/sh\necho $$ > "+strconv.Quote(pidPath)+"\ntrap '' TERM\nwhile :; do sleep 1; done\n",
 	)
-	recordStore := &daemonproc.FileStore{Path: filepath.Join(home, "workers.json")}
-	workers := activatedPoolTestWorkers(t, recordStore.Path, 1)
+	workers := poolTestRunner(t, filepath.Join(home, "workers.db"))
 	manager := &Manager{taskRunner: workers, workerExecutable: script}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -99,8 +98,8 @@ func TestPrepareAccountBackingDeadlineKillsReapsAndUntracks(t *testing.T) {
 		_, prepareErr := manager.prepareAccountBacking(ctx, 18, ClaudeJSONPath())
 		result <- prepareErr
 	}()
-	var identity daemonproc.Identity
-	for identity.PID == 0 {
+	var wedged int
+	for wedged == 0 {
 		// #nosec G304 -- pidPath is test-owned beneath t.TempDir().
 		payload, readErr := os.ReadFile(pidPath)
 		if readErr == nil {
@@ -108,10 +107,7 @@ func TestPrepareAccountBackingDeadlineKillsReapsAndUntracks(t *testing.T) {
 			if parseErr != nil {
 				t.Fatal(parseErr)
 			}
-			identity, readErr = daemonproc.Probe(pid)
-			if readErr != nil {
-				t.Fatal(readErr)
-			}
+			wedged = pid
 			break
 		}
 		if !errors.Is(readErr, os.ErrNotExist) {
@@ -127,26 +123,18 @@ func TestPrepareAccountBackingDeadlineKillsReapsAndUntracks(t *testing.T) {
 	if !errors.Is(prepareErr, context.DeadlineExceeded) {
 		t.Fatalf("prepare account backing error = %v, want deadline exceeded", prepareErr)
 	}
-	assertRecordsUntracked(t, recordStore)
-	if current, probeErr := daemonproc.Probe(identity.PID); probeErr == nil &&
-		current.Boot == identity.Boot && current.StartTime == identity.StartTime {
-		t.Fatalf("exact wedged account worker survived cancellation: %+v", current)
-	}
+	assertProcessGone(t, wedged)
 }
 
-func assertRecordsUntracked(t *testing.T, store daemonproc.Store) {
+func assertProcessGone(t *testing.T, pid int) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		records, err := store.Load(context.Background())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(records) == 0 {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("durable worker records after cancellation = %+v", records)
+			t.Fatalf("wedged worker %d survived cancellation", pid)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

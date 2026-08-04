@@ -3,16 +3,40 @@ package workerexec
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
-
-	"github.com/yasyf/daemonkit/worker"
+	"time"
 )
 
 // TempDir returns the exact cleaned process temporary directory.
 func TempDir() string { return filepath.Clean(os.TempDir()) }
 
-// Runner executes one bounded daemonkit command and returns its immutable result.
+var (
+	// ErrCapacity means every execution and queue slot is occupied.
+	ErrCapacity = errors.New("workerexec: capacity exhausted")
+	// ErrTimedOut means the queue and execution deadline elapsed.
+	ErrTimedOut = errors.New("workerexec: timed out")
+)
+
+// CommandRequest is copied and validated before it can enter the queue.
+type CommandRequest struct {
+	Path         string
+	Dir          string
+	Args         []string
+	Env          []string
+	Stdin        []byte
+	TotalTimeout time.Duration
+}
+
+// CommandResult is an immutable command observation.
+type CommandResult struct {
+	Stdout   []byte
+	Stderr   []byte
+	ExitCode int
+}
+
+// Runner executes one bounded disposable command and returns its immutable result.
 type Runner interface {
-	Run(context.Context, worker.CommandRequest) (worker.CommandResult, error)
+	Run(context.Context, CommandRequest) (CommandResult, error)
 }

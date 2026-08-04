@@ -22,8 +22,8 @@ import (
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/testhome"
+	"github.com/yasyf/cc-pool/internal/workerexec"
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/worker"
 )
 
 const materializeManifest = "/cfg/synckit/manifests/cc-pool.json"
@@ -53,16 +53,16 @@ type inlineMaterializeTaskRunner struct {
 	credentials backingCredentials
 }
 
-func (runner inlineMaterializeTaskRunner) Run(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
+func (runner inlineMaterializeTaskRunner) Run(ctx context.Context, task workerexec.CommandRequest) (workerexec.CommandResult, error) {
 	var output bytes.Buffer
 	switch {
 	case pool.IsBackingWorkerInvocation(task.Args):
 		err := pool.RunBackingWorker(ctx, bytes.NewReader(task.Stdin), &output)
-		return worker.CommandResult{Stdout: output.Bytes()}, err
+		return workerexec.CommandResult{Stdout: output.Bytes()}, err
 	case pool.IsCredentialCASWorkerInvocation(task.Args):
 		request, err := pool.DecodeCredentialCASRequest(bytes.NewReader(task.Stdin))
 		if err != nil {
-			return worker.CommandResult{}, err
+			return workerexec.CommandResult{}, err
 		}
 		account := store.Account{
 			ID: request.AccountID, ConfigDir: request.ConfigDir,
@@ -72,10 +72,10 @@ func (runner inlineMaterializeTaskRunner) Run(ctx context.Context, task worker.C
 		if len(request.Credential) != 0 {
 			var credential creds.Credential
 			if err := json.Unmarshal(request.Credential, &credential); err != nil {
-				return worker.CommandResult{}, err
+				return workerexec.CommandResult{}, err
 			}
 			if err := runner.credentials.Store(account, creds.SourceKeychain).Write(ctx, &credential); err != nil {
-				return worker.CommandResult{}, err
+				return workerexec.CommandResult{}, err
 			}
 			digest := store.CredentialDigest(sha256.Sum256(request.Credential))
 			after.Keychain = store.CredentialSlotObservation{
@@ -83,18 +83,18 @@ func (runner inlineMaterializeTaskRunner) Run(ctx context.Context, task worker.C
 			}
 		} else if request.Delete {
 			if err := runner.credentials.Store(account, creds.SourceKeychain).Delete(ctx); err != nil {
-				return worker.CommandResult{}, err
+				return workerexec.CommandResult{}, err
 			}
 			after.Keychain = store.CredentialSlotObservation{State: store.CredentialSlotEmpty}
 		} else {
-			return worker.CommandResult{}, errors.New("unsupported materialize test credential CAS mutation")
+			return workerexec.CommandResult{}, errors.New("unsupported materialize test credential CAS mutation")
 		}
 		err = pool.WriteCredentialCASResponse(&output, pool.CredentialCASResponse{
 			Before: request.Expected, After: after,
 		})
-		return worker.CommandResult{Stdout: output.Bytes()}, err
+		return workerexec.CommandResult{Stdout: output.Bytes()}, err
 	default:
-		return worker.CommandResult{}, errors.New("unexpected materialize test worker")
+		return workerexec.CommandResult{}, errors.New("unexpected materialize test worker")
 	}
 }
 

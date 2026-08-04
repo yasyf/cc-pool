@@ -9,7 +9,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/workerexec"
-	"github.com/yasyf/daemonkit/worker"
 )
 
 const hostSyncCommandTimeout = 10 * time.Minute
@@ -58,7 +57,7 @@ func (m *Manager) RunHostSyncCommand(
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return errors.New("host-sync command requires a clean absolute executable")
 	}
-	_, err := m.taskRunner.Run(ctx, worker.CommandRequest{
+	_, err := m.taskRunner.Run(ctx, workerexec.CommandRequest{
 		Path: path, Dir: workerexec.TempDir(), Args: args,
 		TotalTimeout: hostSyncCommandTimeout,
 	})

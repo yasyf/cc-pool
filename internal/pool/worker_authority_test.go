@@ -10,14 +10,14 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/workerexec"
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/worker"
 )
 
 type rejectingTestTaskRunner struct{}
 
-func (rejectingTestTaskRunner) Run(context.Context, worker.CommandRequest) (worker.CommandResult, error) {
-	return worker.CommandResult{}, errors.New("unexpected test worker task")
+func (rejectingTestTaskRunner) Run(context.Context, workerexec.CommandRequest) (workerexec.CommandResult, error) {
+	return workerexec.CommandResult{}, errors.New("unexpected test worker task")
 }
 
 func bindTestWorkerAuthority(t *testing.T, manager *Manager, generation string) proc.Record {

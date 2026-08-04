@@ -10,8 +10,8 @@ require (
 	github.com/descope/go-free-email-providers v0.0.0-20260427134210-d71f4c2c7632
 	github.com/muesli/cancelreader v0.2.2
 	github.com/spf13/cobra v1.10.2
-	github.com/yasyf/daemonkit v0.21.3
-	github.com/yasyf/fusekit v1.15.5
+	github.com/yasyf/daemonkit v0.21.4
+	github.com/yasyf/fusekit v1.16.0
 	github.com/yasyf/synckit v0.37.1
 	golang.org/x/net v0.56.0
 	golang.org/x/sync v0.22.0

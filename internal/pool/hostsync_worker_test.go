@@ -6,14 +6,13 @@ import (
 	"testing"
 
 	"github.com/yasyf/cc-pool/internal/workerexec"
-	"github.com/yasyf/daemonkit/worker"
 )
 
-type hostSyncCommandRunner struct{ request worker.CommandRequest }
+type hostSyncCommandRunner struct{ request workerexec.CommandRequest }
 
-func (r *hostSyncCommandRunner) Run(_ context.Context, request worker.CommandRequest) (worker.CommandResult, error) {
+func (r *hostSyncCommandRunner) Run(_ context.Context, request workerexec.CommandRequest) (workerexec.CommandResult, error) {
 	r.request = request
-	return worker.CommandResult{}, nil
+	return workerexec.CommandResult{}, nil
 }
 
 func TestHostSyncWorkersUseDistinctV1ProcessLedger(t *testing.T) {

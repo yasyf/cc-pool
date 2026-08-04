@@ -13,16 +13,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/daemonkit"
 )
 
 type result struct {
 	LeaderPID     int   `json:"leader_pid"`
 	DescendantPID int   `json:"descendant_pid"`
 	ElapsedMS     int64 `json:"elapsed_ms"`
-	RecordsAfter  int   `json:"records_after"`
 	TermObserved  bool  `json:"term_observed"`
 	GroupGone     bool  `json:"group_gone"`
 	LaneReused    bool  `json:"lane_reused"`
@@ -47,36 +44,19 @@ func run() (resultErr error) {
 	}
 	defer func() { resultErr = errors.Join(resultErr, rootFS.Close()) }()
 
-	store := &proc.FileStore{Path: filepath.Join(root, "processes.db")}
-	generation, err := proc.ProcessGeneration()
+	scopeCtx, cancelScope := context.WithTimeout(context.Background(), time.Minute)
+	defer cancelScope()
+	owned, err := daemonkit.OwnProcesses(scopeCtx, filepath.Join(root, "processes.db"))
 	if err != nil {
-		return fmt.Errorf("create worker generation: %w", err)
-	}
-	reaper := &proc.Reaper{Store: store, Generation: generation}
-	pool, err := worker.NewPool(worker.Config{
-		Capacity: 1, QueueCapacity: 0, MaxTotalRun: 5 * time.Second,
-		MaxStdinBytes: 0, MaxStdoutBytes: 1024, MaxStderrBytes: 1024,
-	}, reaper)
-	if err != nil {
-		return err
-	}
-	claim, err := pool.ClaimRuntime(trust.VerifierWorkerBudgets())
-	if err != nil {
-		return fmt.Errorf("claim worker runtime: %w", err)
-	}
-	if err := claim.Recover(context.Background()); err != nil {
-		_ = claim.Release(context.Background())
-		return fmt.Errorf("recover worker runtime: %w", err)
-	}
-	if err := claim.Activate(); err != nil {
-		_ = claim.Release(context.Background())
-		return fmt.Errorf("activate worker runtime: %w", err)
+		return fmt.Errorf("own worker processes: %w", err)
 	}
 	defer func() {
 		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		resultErr = errors.Join(resultErr, claim.Close(closeCtx))
+		resultErr = errors.Join(resultErr, owned.Close(closeCtx))
 	}()
+	scope := owned.Ctx(scopeCtx)
+
 	const leaderName = "leader.pid"
 	const descendantName = "descendant.pid"
 	const termName = "term-observed"
@@ -92,17 +72,20 @@ while :; do sleep 10; done
 `
 	const requestTimeout = 2 * time.Second
 	started := time.Now()
-	commandResult, err := pool.Run(context.Background(), worker.CommandRequest{
+	runCtx, cancelRun := context.WithTimeout(scopeCtx, requestTimeout)
+	_, err = scope.Run(runCtx, daemonkit.Cmd{
 		Path: "/bin/sh", Dir: root,
-		Args:         []string{"-c", script, "worker", leaderPath, descendantPath, termPath},
-		TotalTimeout: requestTimeout,
+		Args:      []string{"-c", script, "worker", leaderPath, descendantPath, termPath},
+		MaxOutput: 1024,
+		Exec:      daemonkit.ServingSameUser(),
 	})
+	cancelRun()
 	elapsed := time.Since(started)
 	if err == nil {
 		return errors.New("worker completed without deadline error")
 	}
-	if !errors.Is(err, worker.ErrTimedOut) || !errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Errorf("worker error, want typed timeout and deadline exceeded: %w", err)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("worker error, want deadline exceeded: %w", err)
 	}
 	if elapsed < 500*time.Millisecond {
 		return fmt.Errorf("worker settled after %s without an observable TERM grace", elapsed)
@@ -118,9 +101,6 @@ while :; do sleep 10; done
 	if err != nil {
 		return err
 	}
-	if receiptPID := commandResult.Receipt.ProcessIdentity().PID; receiptPID != leader {
-		return fmt.Errorf("worker receipt pid = %d, want leader %d", receiptPID, leader)
-	}
 	descendant, err := readPID(rootFS, descendantName)
 	if err != nil {
 		return err
@@ -134,17 +114,16 @@ while :; do sleep 10; done
 	if err := awaitGone(-leader); err != nil {
 		return fmt.Errorf("process group: %w", err)
 	}
-	if err := awaitUntracked(store); err != nil {
-		return err
-	}
-	if _, err := pool.Run(context.Background(), worker.CommandRequest{
-		Path: "/usr/bin/true", Dir: root, TotalTimeout: requestTimeout,
+	reuseCtx, cancelReuse := context.WithTimeout(scopeCtx, requestTimeout)
+	defer cancelReuse()
+	if _, err := scope.Run(reuseCtx, daemonkit.Cmd{
+		Path: "/usr/bin/true", Dir: root, MaxOutput: 1024, Exec: daemonkit.ServingSameUser(),
 	}); err != nil {
 		return fmt.Errorf("reuse worker lane: %w", err)
 	}
 	return json.NewEncoder(os.Stdout).Encode(result{
 		LeaderPID: leader, DescendantPID: descendant, ElapsedMS: elapsed.Milliseconds(),
-		RecordsAfter: 0, TermObserved: true, GroupGone: true, LaneReused: true,
+		TermObserved: true, GroupGone: true, LaneReused: true,
 	})
 }
 
@@ -161,23 +140,6 @@ func readPID(root *os.Root, name string) (int, error) {
 		return 0, fmt.Errorf("invalid pid in %s: %q", name, content)
 	}
 	return pid, nil
-}
-
-func awaitUntracked(store proc.Store) error {
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		records, err := store.Load(context.Background())
-		if err != nil {
-			return fmt.Errorf("load durable records: %w", err)
-		}
-		if len(records) == 0 {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("durable records after settlement = %d, want 0", len(records))
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
 }
 
 func awaitGone(pid int) error {

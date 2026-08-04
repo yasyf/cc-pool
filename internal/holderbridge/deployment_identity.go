@@ -3,25 +3,16 @@ package holderbridge
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"time"
-
-	"github.com/yasyf/daemonkit/deployment"
-	"github.com/yasyf/daemonkit/service"
-	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/fusekit/mountproto"
-	"github.com/yasyf/fusekit/transportproto"
-	"github.com/yasyf/fusekit/trustroles"
 )
 
 const (
-	consumerBuildDomain      = "cc-pool.deployment-callbacks.v1@sha256:"
-	deploymentPolicyIdentity = "cc-pool.deployment-callbacks.v1"
+	consumerBuildDomain = "cc-pool.deployment-callbacks.v1@sha256:"
 	// DeploymentEvidenceIdentity is the v1 product-evidence digest domain.
 	DeploymentEvidenceIdentity = "cc-pool.deployment-evidence.v1"
 	// DeploymentServiceLabel is the exact status app launch-agent label.
@@ -32,173 +23,26 @@ const (
 	DeploymentPollInterval = 100 * time.Millisecond
 )
 
-var (
-	startupConsumerBuild, startupConsumerBuildErr = currentConsumerBuild()
-	startupPolicyDigest, startupPolicyDigestErr   = makeDeploymentPolicyDigest()
-)
+var startupConsumerBuild, startupConsumerBuildErr = currentConsumerBuild()
 
-type deploymentPolicy struct {
-	Identity     string                       `json:"identity"`
-	Schema       uint16                       `json:"schema"`
-	Application  deploymentApplicationPolicy  `json:"application"`
-	FileProvider deploymentFileProviderPolicy `json:"file_provider"`
-	Protocols    deploymentProtocolPolicy     `json:"protocols"`
-	Activation   deploymentActivationPolicy   `json:"activation"`
-	Runtime      deploymentRuntimePolicy      `json:"runtime"`
-	Service      deploymentServicePolicy      `json:"service"`
-}
-
-type deploymentApplicationPolicy struct {
-	BundleID                    string         `json:"bundle_id"`
-	TeamID                      string         `json:"team_id"`
-	InstallRootHomeRelative     string         `json:"install_root_home_relative"`
-	BundleLeaf                  string         `json:"bundle_leaf"`
-	ExecutableName              string         `json:"executable_name"`
-	ExecutableRelativePath      string         `json:"executable_relative_path"`
-	RequireCanonicalAccountHome bool           `json:"require_canonical_account_home"`
-	StopControllerRole          trust.PeerRole `json:"stop_controller_role"`
-	ReceiptControllerRole       trust.PeerRole `json:"receipt_controller_role"`
-	ReadinessControllerRole     trust.PeerRole `json:"readiness_controller_role"`
-}
-
-type deploymentFileProviderPolicy struct {
-	BundleID              string        `json:"bundle_id"`
-	ExtensionRelativePath string        `json:"extension_relative_path"`
-	RequireRegistration   bool          `json:"require_registration"`
-	RequireEnabled        bool          `json:"require_enabled"`
-	RequireExactElection  bool          `json:"require_exact_election"`
-	ElectionTimeout       time.Duration `json:"election_timeout_ns"`
-	ElectionPoll          time.Duration `json:"election_poll_ns"`
-}
-
-type deploymentProtocolPolicy struct {
-	MountProtocol   uint16 `json:"mount_protocol"`
-	RuntimeProtocol uint16 `json:"runtime_protocol"`
-	WireProtocol    uint16 `json:"wire_protocol"`
-	WireBuild       string `json:"wire_build"`
-}
-
-type deploymentRuntimePolicy struct {
-	State     deploymentRuntimeStatePolicy `json:"state"`
-	Native    deploymentNativePolicy       `json:"native"`
-	Source    deploymentSourcePolicy       `json:"source"`
-	Broker    deploymentBrokerPolicy       `json:"broker"`
-	Readiness deploymentReadinessPolicy    `json:"readiness"`
-}
-
-type deploymentRuntimeStatePolicy struct {
-	HomeRelativeDirectory    string `json:"home_relative_directory"`
-	SocketName               string `json:"socket_name"`
-	CatalogName              string `json:"catalog_name"`
-	ProcessStoreName         string `json:"process_store_name"`
-	LogName                  string `json:"log_name"`
-	SourceObserverDirectory  string `json:"source_observer_directory_pattern"`
-	SourceObserverSocketName string `json:"source_observer_socket_name"`
-	RuntimePolicyDigest      string `json:"runtime_policy_digest"`
-}
-
-type deploymentNativePolicy struct {
-	Enabled        bool                   `json:"enabled"`
-	RequiredPhase  mountproto.NativePhase `json:"required_phase"`
-	RequireNoProof bool                   `json:"require_no_proof"`
-}
-
-type deploymentSourcePolicy struct {
-	Capable bool `json:"capable"`
-}
-
-type deploymentBrokerPolicy struct {
-	Enabled                     bool `json:"enabled"`
-	RequireReconciledFixedPoint bool `json:"require_reconciled_fixed_point"`
-}
-
-type deploymentReadinessPolicy struct {
-	StartupTimeout              time.Duration             `json:"startup_timeout_ns"`
-	SettlementTimeout           time.Duration             `json:"settlement_timeout_ns"`
-	ObservationTimeout          time.Duration             `json:"observation_timeout_ns"`
-	NativeReadinessTimeout      time.Duration             `json:"native_readiness_timeout_ns"`
-	CatalogReadinessTimeout     time.Duration             `json:"catalog_readiness_timeout_ns"`
-	CatalogOperationTimeout     time.Duration             `json:"catalog_operation_timeout_ns"`
-	RuntimeShutdownTimeout      time.Duration             `json:"runtime_shutdown_timeout_ns"`
-	PollInterval                time.Duration             `json:"poll_interval_ns"`
-	RequiredState               mountproto.RuntimeState   `json:"required_state"`
-	RequiredPhase               mountproto.ReadinessPhase `json:"required_phase"`
-	RequiredStep                mountproto.ReadinessStep  `json:"required_step"`
-	RequiredBrokerPhase         mountproto.BrokerPhase    `json:"required_broker_phase"`
-	RequireReady                bool                      `json:"require_ready"`
-	RequireNotDraining          bool                      `json:"require_not_draining"`
-	RequireNotBusy              bool                      `json:"require_not_busy"`
-	RequireRuntimeBuildMatch    bool                      `json:"require_runtime_build_match"`
-	RequirePositiveRuntimePID   bool                      `json:"require_positive_runtime_pid"`
-	RequireProcessGeneration    bool                      `json:"require_process_generation"`
-	RequireActivationGeneration bool                      `json:"require_activation_generation"`
-	RequireEmptyMessage         bool                      `json:"require_empty_message"`
-	RequiredErrorCode           mountproto.ErrorCode      `json:"required_error_code"`
-}
-
-type deploymentServicePolicy struct {
-	AgentLabel                     string                  `json:"agent_label"`
-	ExactSingleAgentPlan           bool                    `json:"exact_single_agent_plan"`
-	AssociatedBundleID             string                  `json:"associated_bundle_id"`
-	RequireExactAssociatedBundleID bool                    `json:"require_exact_associated_bundle_id"`
-	RestartPolicy                  service.RestartPolicy   `json:"restart_policy"`
-	StartInterval                  time.Duration           `json:"start_interval"`
-	ProcessType                    service.ProcessType     `json:"process_type"`
-	SessionType                    service.SessionType     `json:"session_type"`
-	ProgramIsFixedBundleExecutable bool                    `json:"program_is_fixed_bundle_executable"`
-	RequireNoArguments             bool                    `json:"require_no_arguments"`
-	LogPathIsRuntimeStateLog       bool                    `json:"log_path_is_runtime_state_log"`
-	RequireNoWatchPaths            bool                    `json:"require_no_watch_paths"`
-	RequireNoCalendarIntervals     bool                    `json:"require_no_calendar_intervals"`
-	BuildEnvironmentKey            string                  `json:"build_environment_key"`
-	RequireExactBuildEnvironment   bool                    `json:"require_exact_build_environment"`
-	ReplacementOwnsRestartFence    bool                    `json:"replacement_owns_restart_fence"`
-	Quiesce                        deploymentQuiescePolicy `json:"quiesce"`
-}
-
-type deploymentActivationPolicy struct {
-	Identity                          string `json:"identity"`
-	RequireInstalledAttestation       bool   `json:"require_installed_attestation"`
-	RequireExactServicePlan           bool   `json:"require_exact_service_plan"`
-	RequireReadinessRuntimeBuild      bool   `json:"require_readiness_runtime_build"`
-	RequireReadinessProcessGeneration bool   `json:"require_readiness_process_generation"`
-	BindGenerationCDHash              bool   `json:"bind_generation_cdhash"`
-	BindGenerationBundleDigest        bool   `json:"bind_generation_bundle_digest"`
-	BindGenerationEntitlementsDigest  bool   `json:"bind_generation_entitlements_digest"`
-}
-
-type deploymentQuiescePolicy struct {
-	DirectPersistentControl         bool           `json:"direct_persistent_control"`
-	ControlRole                     trust.PeerRole `json:"control_role"`
-	OperationIDIsDaemonkitScoped    bool           `json:"operation_id_is_daemonkit_scoped"`
-	ExpectedBuildIsObservedRuntime  bool           `json:"expected_build_is_observed_runtime"`
-	RuntimeProofBindsObservedBuild  bool           `json:"runtime_proof_binds_observed_build"`
-	RuntimeProofBindsReceipt        bool           `json:"runtime_proof_binds_receipt"`
-	RuntimeProofBindsProcessRecord  bool           `json:"runtime_proof_binds_process_record"`
-	RequireTargetProcessGeneration  bool           `json:"require_target_process_generation"`
-	RequireExactExecutableInventory bool           `json:"require_exact_executable_inventory"`
-	AbsentRequiresEmptyInventory    bool           `json:"absent_requires_empty_inventory"`
-	RequireExactHealthTarget        bool           `json:"require_exact_health_target"`
-	RequireGoneSettlement           bool           `json:"require_gone_settlement"`
-}
-
-// DeploymentIdentity returns the startup-frozen updater build and callback policy identities.
-func DeploymentIdentity() (string, deployment.SHA256, error) {
+// DeploymentIdentity returns the startup-frozen updater build identity.
+func DeploymentIdentity() (string, error) {
 	if startupConsumerBuildErr != nil {
-		return "", deployment.SHA256{}, fmt.Errorf("CCPoolStatus: cache deployment consumer build: %w", startupConsumerBuildErr)
+		return "", fmt.Errorf("CCPoolStatus: cache deployment consumer build: %w", startupConsumerBuildErr)
 	}
-	if startupPolicyDigestErr != nil {
-		return "", deployment.SHA256{}, fmt.Errorf("CCPoolStatus: cache deployment policy digest: %w", startupPolicyDigestErr)
-	}
-	return startupConsumerBuild, startupPolicyDigest, nil
+	return startupConsumerBuild, nil
 }
 
 func currentConsumerBuild() (string, error) {
-	path, err := service.CanonicalExecutable()
+	executable, err := os.Executable()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("CCPoolStatus: resolve updater executable: %w", err)
 	}
-	return consumerBuildForExecutable(path)
+	resolved, err := filepath.EvalSymlinks(executable)
+	if err != nil {
+		return "", fmt.Errorf("CCPoolStatus: resolve updater executable links: %w", err)
+	}
+	return consumerBuildForExecutable(resolved)
 }
 
 func consumerBuildForExecutable(path string) (_ string, resultErr error) {
@@ -226,92 +70,4 @@ func consumerBuildForExecutable(path string) (_ string, resultErr error) {
 		return "", fmt.Errorf("CCPoolStatus: hash updater executable: %w", err)
 	}
 	return consumerBuildDomain + hex.EncodeToString(digest.Sum(nil)), nil
-}
-
-func makeDeploymentPolicyDigest() (deployment.SHA256, error) {
-	payload, err := deploymentPolicyJSON()
-	if err != nil {
-		return deployment.SHA256{}, err
-	}
-	return deployment.SHA256(sha256.Sum256(payload)), nil
-}
-
-func deploymentPolicyJSON() ([]byte, error) {
-	readiness := ReadinessContract()
-	return json.Marshal(deploymentPolicy{
-		Identity: deploymentPolicyIdentity,
-		Schema:   1,
-		Application: deploymentApplicationPolicy{
-			BundleID: BundleID, TeamID: TeamID, InstallRootHomeRelative: "Applications",
-			BundleLeaf: ExecutableName + ".app", ExecutableName: ExecutableName,
-			ExecutableRelativePath:      "Contents/MacOS/" + ExecutableName,
-			RequireCanonicalAccountHome: true,
-			StopControllerRole:          trustroles.StopController,
-			ReceiptControllerRole:       trustroles.ReceiptController,
-			ReadinessControllerRole:     trustroles.ReadinessController,
-		},
-		FileProvider: deploymentFileProviderPolicy{
-			BundleID:              fileProviderBundleID,
-			ExtensionRelativePath: "Contents/PlugIns/CCPoolFileProvider.appex",
-			RequireRegistration:   true, RequireEnabled: true, RequireExactElection: true,
-			ElectionTimeout: DeploymentElectionTimeout, ElectionPoll: DeploymentPollInterval,
-		},
-		Protocols: deploymentProtocolPolicy{
-			MountProtocol: mountproto.Version, RuntimeProtocol: mountproto.RuntimeProtocolVersion,
-			WireProtocol: transportproto.Version, WireBuild: transportproto.WireBuild,
-		},
-		Activation: deploymentActivationPolicy{
-			Identity: DeploymentEvidenceIdentity, RequireInstalledAttestation: true,
-			RequireExactServicePlan: true, RequireReadinessRuntimeBuild: true,
-			RequireReadinessProcessGeneration: true, BindGenerationCDHash: true,
-			BindGenerationBundleDigest: true, BindGenerationEntitlementsDigest: true,
-		},
-		Runtime: deploymentRuntimePolicy{
-			State: deploymentRuntimeStatePolicy{
-				HomeRelativeDirectory: ".cc-pool/fusekit", SocketName: "fusekit.sock",
-				CatalogName: "catalog.sqlite", ProcessStoreName: "processes.db", LogName: "holder.log",
-				SourceObserverDirectory: "source-observer-0000000000", SourceObserverSocketName: "observer.sock",
-				RuntimePolicyDigest: hex.EncodeToString(runtimePolicyDigest[:]),
-			},
-			Native: deploymentNativePolicy{
-				Enabled: false, RequiredPhase: mountproto.NativePhaseDisabled, RequireNoProof: true,
-			},
-			Source: deploymentSourcePolicy{Capable: true},
-			Broker: deploymentBrokerPolicy{
-				Enabled: true, RequireReconciledFixedPoint: true,
-			},
-			Readiness: deploymentReadinessPolicy{
-				StartupTimeout: readiness.StartupTimeout(), SettlementTimeout: readiness.SettlementTimeout(),
-				ObservationTimeout:      readiness.ObservationTimeout(),
-				NativeReadinessTimeout:  NativeReadinessTimeout,
-				CatalogReadinessTimeout: CatalogReadinessTimeout, CatalogOperationTimeout: CatalogOperationTimeout,
-				RuntimeShutdownTimeout: RuntimeShutdownTimeout, PollInterval: DeploymentPollInterval,
-				RequiredState: mountproto.RuntimeStateHealthy,
-				RequiredPhase: mountproto.ReadinessPhaseReady, RequiredStep: mountproto.ReadinessStepPublished,
-				RequiredBrokerPhase: mountproto.BrokerPhaseLive, RequireReady: true, RequireNotDraining: true,
-				RequireNotBusy: true, RequireRuntimeBuildMatch: true, RequirePositiveRuntimePID: true,
-				RequireProcessGeneration: true, RequireActivationGeneration: true,
-				RequireEmptyMessage: true, RequiredErrorCode: mountproto.ErrorCodeOk,
-			},
-		},
-		Service: deploymentServicePolicy{
-			AgentLabel: DeploymentServiceLabel, ExactSingleAgentPlan: true, AssociatedBundleID: BundleID,
-			RequireExactAssociatedBundleID: true,
-			RestartPolicy:                  service.RestartAlways, StartInterval: 0, ProcessType: 0,
-			SessionType:                    service.SessionTypeAqua,
-			ProgramIsFixedBundleExecutable: true, RequireNoArguments: true,
-			LogPathIsRuntimeStateLog: true, RequireNoWatchPaths: true, RequireNoCalendarIntervals: true,
-			BuildEnvironmentKey: "FUSEKIT_BUILD_ID", RequireExactBuildEnvironment: true,
-			ReplacementOwnsRestartFence: true,
-			Quiesce: deploymentQuiescePolicy{
-				DirectPersistentControl: true, ControlRole: trustroles.StopController,
-				OperationIDIsDaemonkitScoped: true, ExpectedBuildIsObservedRuntime: true,
-				RuntimeProofBindsObservedBuild: true, RuntimeProofBindsReceipt: true,
-				RuntimeProofBindsProcessRecord:  true,
-				RequireTargetProcessGeneration:  true,
-				RequireExactExecutableInventory: true, AbsentRequiresEmptyInventory: true,
-				RequireExactHealthTarget: true, RequireGoneSettlement: true,
-			},
-		},
-	})
 }

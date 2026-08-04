@@ -1,19 +1,12 @@
 package holderbridge
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
-	"reflect"
 	"testing"
-
-	"github.com/yasyf/daemonkit/deployment"
-	"github.com/yasyf/fusekit/mountproto"
-	"github.com/yasyf/fusekit/trustroles"
 )
 
 func TestConsumerBuildForExecutableHashesExactBytes(t *testing.T) {
@@ -53,119 +46,42 @@ func TestConsumerBuildForExecutableRejectsNonExecutableInput(t *testing.T) {
 	}
 }
 
+func TestCurrentConsumerBuildHashesTheResolvedTestExecutable(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := filepath.EvalSymlinks(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := consumerBuildForExecutable(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := currentConsumerBuild()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("current consumer build = %q, want %q", got, want)
+	}
+}
+
 func TestDeploymentIdentityUsesStartupCacheAndFailsClosed(t *testing.T) {
-	originalBuild, originalBuildErr := startupConsumerBuild, startupConsumerBuildErr
-	originalPolicy, originalPolicyErr := startupPolicyDigest, startupPolicyDigestErr
-	t.Cleanup(func() {
-		startupConsumerBuild, startupConsumerBuildErr = originalBuild, originalBuildErr
-		startupPolicyDigest, startupPolicyDigestErr = originalPolicy, originalPolicyErr
-	})
-	wantDigest := deployment.SHA256(sha256.Sum256([]byte("policy")))
+	originalBuild, originalErr := startupConsumerBuild, startupConsumerBuildErr
+	t.Cleanup(func() { startupConsumerBuild, startupConsumerBuildErr = originalBuild, originalErr })
+
 	startupConsumerBuild, startupConsumerBuildErr = "cached-build", nil
-	startupPolicyDigest, startupPolicyDigestErr = wantDigest, nil
-	build, digest, err := DeploymentIdentity()
-	if err != nil || build != "cached-build" || digest != wantDigest {
-		t.Fatalf("identity = (%q, %x, %v)", build, digest, err)
+	build, err := DeploymentIdentity()
+	if err != nil || build != "cached-build" {
+		t.Fatalf("identity = (%q, %v)", build, err)
 	}
 
 	unavailable := errors.New("updater unavailable")
 	startupConsumerBuild, startupConsumerBuildErr = "", unavailable
-	build, digest, err = DeploymentIdentity()
-	if !errors.Is(err, unavailable) || build != "" || digest != (deployment.SHA256{}) {
-		t.Fatalf("failed identity = (%q, %x, %v)", build, digest, err)
-	}
-}
-
-func TestDeploymentPolicyJSONAndDigestAreDeterministicAndComplete(t *testing.T) {
-	payload, err := deploymentPolicyJSON()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bytes.Contains(payload, []byte(`"app_group"`)) {
-		t.Fatal("daemon-facing deployment policy owns the signed App Group identifier")
-	}
-	var policy deploymentPolicy
-	if err := json.Unmarshal(payload, &policy); err != nil {
-		t.Fatal(err)
-	}
-	if policy.Identity != deploymentPolicyIdentity || policy.Schema != 1 ||
-		policy.Application.BundleID != BundleID || policy.Application.TeamID != TeamID ||
-		policy.Application.InstallRootHomeRelative != "Applications" ||
-		policy.Application.BundleLeaf != "CCPoolStatus.app" ||
-		policy.Application.ExecutableName != ExecutableName ||
-		policy.Application.ExecutableRelativePath != "Contents/MacOS/CCPoolStatus" ||
-		!policy.Application.RequireCanonicalAccountHome ||
-		policy.Application.StopControllerRole != trustroles.StopController ||
-		policy.Application.ReceiptControllerRole != trustroles.ReceiptController ||
-		policy.Application.ReadinessControllerRole != trustroles.ReadinessController ||
-		policy.FileProvider.BundleID != fileProviderBundleID ||
-		policy.FileProvider.ExtensionRelativePath != "Contents/PlugIns/CCPoolFileProvider.appex" ||
-		!policy.FileProvider.RequireRegistration || !policy.FileProvider.RequireEnabled ||
-		!policy.FileProvider.RequireExactElection ||
-		policy.FileProvider.ElectionTimeout != DeploymentElectionTimeout ||
-		policy.FileProvider.ElectionPoll != DeploymentPollInterval ||
-		policy.Runtime.State.HomeRelativeDirectory != ".cc-pool/fusekit" ||
-		policy.Runtime.State.SocketName != "fusekit.sock" || policy.Runtime.State.CatalogName != "catalog.sqlite" ||
-		policy.Runtime.State.ProcessStoreName != "processes.db" || policy.Runtime.State.LogName != "holder.log" ||
-		policy.Runtime.State.SourceObserverDirectory != "source-observer-0000000000" ||
-		policy.Runtime.State.SourceObserverSocketName != "observer.sock" ||
-		policy.Runtime.State.RuntimePolicyDigest != hex.EncodeToString(runtimePolicyDigest[:]) ||
-		policy.Runtime.Native.Enabled || policy.Runtime.Native.RequiredPhase != mountproto.NativePhaseDisabled ||
-		!policy.Runtime.Native.RequireNoProof || !policy.Runtime.Source.Capable || !policy.Runtime.Broker.Enabled ||
-		!policy.Runtime.Broker.RequireReconciledFixedPoint ||
-		policy.Runtime.Readiness.StartupTimeout != ReadinessContract().StartupTimeout() ||
-		policy.Runtime.Readiness.SettlementTimeout != ReadinessContract().SettlementTimeout() ||
-		policy.Runtime.Readiness.ObservationTimeout != ReadinessContract().ObservationTimeout() ||
-		policy.Runtime.Readiness.NativeReadinessTimeout != NativeReadinessTimeout ||
-		policy.Runtime.Readiness.CatalogReadinessTimeout != CatalogReadinessTimeout ||
-		policy.Runtime.Readiness.CatalogOperationTimeout != CatalogOperationTimeout ||
-		policy.Runtime.Readiness.RuntimeShutdownTimeout != RuntimeShutdownTimeout ||
-		policy.Runtime.Readiness.PollInterval != DeploymentPollInterval ||
-		!policy.Runtime.Readiness.RequireReady || !policy.Runtime.Readiness.RequireNotDraining ||
-		!policy.Runtime.Readiness.RequireNotBusy || !policy.Runtime.Readiness.RequireRuntimeBuildMatch ||
-		!policy.Runtime.Readiness.RequirePositiveRuntimePID ||
-		!policy.Runtime.Readiness.RequireProcessGeneration ||
-		!policy.Runtime.Readiness.RequireActivationGeneration ||
-		!policy.Runtime.Readiness.RequireEmptyMessage ||
-		policy.Runtime.Readiness.RequiredErrorCode != mountproto.ErrorCodeOk ||
-		policy.Runtime.Readiness.RequiredBrokerPhase != mountproto.BrokerPhaseLive ||
-		!policy.Service.ExactSingleAgentPlan || !policy.Service.ReplacementOwnsRestartFence ||
-		!policy.Service.RequireExactAssociatedBundleID || policy.Service.StartInterval != 0 ||
-		policy.Service.ProcessType != 0 || !policy.Service.LogPathIsRuntimeStateLog ||
-		!policy.Service.RequireNoWatchPaths || !policy.Service.RequireNoCalendarIntervals ||
-		!policy.Service.ProgramIsFixedBundleExecutable || !policy.Service.RequireNoArguments ||
-		policy.Service.BuildEnvironmentKey != "FUSEKIT_BUILD_ID" || !policy.Service.RequireExactBuildEnvironment ||
-		policy.Activation.Identity != DeploymentEvidenceIdentity ||
-		!policy.Activation.RequireInstalledAttestation ||
-		!policy.Activation.RequireExactServicePlan ||
-		!policy.Activation.RequireReadinessRuntimeBuild ||
-		!policy.Activation.RequireReadinessProcessGeneration ||
-		!policy.Activation.BindGenerationCDHash ||
-		!policy.Activation.BindGenerationBundleDigest ||
-		!policy.Activation.BindGenerationEntitlementsDigest ||
-		!policy.Service.Quiesce.DirectPersistentControl ||
-		policy.Service.Quiesce.ControlRole != trustroles.StopController ||
-		!policy.Service.Quiesce.OperationIDIsDaemonkitScoped ||
-		!policy.Service.Quiesce.ExpectedBuildIsObservedRuntime ||
-		!policy.Service.Quiesce.RuntimeProofBindsObservedBuild ||
-		!policy.Service.Quiesce.RuntimeProofBindsReceipt ||
-		!policy.Service.Quiesce.RuntimeProofBindsProcessRecord ||
-		!policy.Service.Quiesce.RequireTargetProcessGeneration ||
-		!policy.Service.Quiesce.RequireExactExecutableInventory ||
-		!policy.Service.Quiesce.AbsentRequiresEmptyInventory ||
-		!policy.Service.Quiesce.RequireExactHealthTarget || !policy.Service.Quiesce.RequireGoneSettlement {
-		t.Fatalf("deployment policy = %#v", policy)
-	}
-	second, err := deploymentPolicyJSON()
-	if err != nil || !reflect.DeepEqual(payload, second) {
-		t.Fatalf("policy encoding is not deterministic: %v", err)
-	}
-	digest, err := makeDeploymentPolicyDigest()
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := deployment.SHA256(sha256.Sum256(payload))
-	if digest != want {
-		t.Fatalf("policy digest = %x, want %x", digest, want)
+	build, err = DeploymentIdentity()
+	if !errors.Is(err, unavailable) || build != "" {
+		t.Fatalf("failed identity = (%q, %v)", build, err)
 	}
 }

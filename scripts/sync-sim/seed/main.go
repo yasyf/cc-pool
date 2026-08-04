@@ -33,13 +33,13 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/workerexec"
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/worker"
 )
 
 type directTaskRunner struct{}
 
-func (directTaskRunner) Run(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
+func (directTaskRunner) Run(ctx context.Context, task workerexec.CommandRequest) (workerexec.CommandResult, error) {
 	command := exec.CommandContext(ctx, task.Path, task.Args...) //nolint:gosec // sim controls the exact security shim path
 	command.Dir = task.Dir
 	command.Env = task.Env
@@ -48,7 +48,7 @@ func (directTaskRunner) Run(ctx context.Context, task worker.CommandRequest) (wo
 	command.Stdout = &stdout
 	command.Stderr = &stderr
 	err := command.Run()
-	return worker.CommandResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, err
+	return workerexec.CommandResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, err
 }
 
 func simCredentialStore(configDir string) creds.KeychainItem {

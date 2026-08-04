@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/workerexec"
-	"github.com/yasyf/daemonkit/worker"
 )
 
 const (
@@ -65,7 +64,7 @@ func (m *Manager) runBackingWorker(
 	if err != nil {
 		return backingWorkerResponse{}, fmt.Errorf("resolve backing worker home: %w", err)
 	}
-	result, runErr := m.taskRunner.Run(ctx, worker.CommandRequest{
+	result, runErr := m.taskRunner.Run(ctx, workerexec.CommandRequest{
 		Path: m.workerExecutable, Dir: workerexec.TempDir(), Args: []string{backingWorkerArgument},
 		Env: []string{"HOME=" + home}, Stdin: input.Bytes(), TotalTimeout: backingWorkerTimeout,
 	})

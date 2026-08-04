@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/workerexec"
-	"github.com/yasyf/daemonkit/worker"
 )
 
 const workerArgument = "__procscan-worker"
@@ -67,7 +66,7 @@ func (s *WorkerScanner) run(ctx context.Context, request workerRequest) (workerR
 	if err != nil {
 		return workerResponse{}, err
 	}
-	result, runErr := s.runner.Run(ctx, worker.CommandRequest{
+	result, runErr := s.runner.Run(ctx, workerexec.CommandRequest{
 		Path: s.executable, Dir: workerexec.TempDir(), Args: []string{workerArgument},
 		Stdin: input, TotalTimeout: procscanWorkerTimeout,
 	})

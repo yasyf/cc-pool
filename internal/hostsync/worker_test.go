@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/cc-pool/internal/workerexec"
 	"github.com/yasyf/synckit/syncservice"
 )
 
@@ -59,11 +59,11 @@ func (c *workerConsumerFixture) Apply(_ context.Context, change syncservice.Chan
 type inlineHostSyncRunner struct {
 	t           *testing.T
 	runtime     WorkerRuntime
-	tasks       []worker.CommandRequest
+	tasks       []workerexec.CommandRequest
 	runtimeCall int
 }
 
-func (r *inlineHostSyncRunner) Run(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
+func (r *inlineHostSyncRunner) Run(ctx context.Context, task workerexec.CommandRequest) (workerexec.CommandResult, error) {
 	r.t.Helper()
 	r.tasks = append(r.tasks, task)
 	if !IsWorkerInvocation(task.Args) {
@@ -92,7 +92,7 @@ func (r *inlineHostSyncRunner) Run(ctx context.Context, task worker.CommandReque
 		}
 		return run(r.runtime)
 	})
-	return worker.CommandResult{Stdout: output.Bytes()}, err
+	return workerexec.CommandResult{Stdout: output.Bytes()}, err
 }
 
 func TestWorkerClientCarriesOnlyExactConfigIdentity(t *testing.T) {
@@ -274,7 +274,7 @@ func TestWorkerAuthKindPreservesTypedFailure(t *testing.T) {
 }
 
 type canceledHostSyncRunner struct {
-	task worker.CommandRequest
+	task workerexec.CommandRequest
 }
 
 type gatedHostSyncRunner struct {
@@ -285,14 +285,14 @@ type gatedHostSyncRunner struct {
 	calls   atomic.Int32
 }
 
-func (r *gatedHostSyncRunner) Run(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
+func (r *gatedHostSyncRunner) Run(ctx context.Context, task workerexec.CommandRequest) (workerexec.CommandResult, error) {
 	r.calls.Add(1)
 	r.once.Do(func() { close(r.started) })
 	select {
 	case <-r.release:
 		return r.inner.Run(ctx, task)
 	case <-ctx.Done():
-		return worker.CommandResult{}, ctx.Err()
+		return workerexec.CommandResult{}, ctx.Err()
 	}
 }
 
@@ -361,10 +361,10 @@ func TestWorkerClientDefaultDeadlineIncludesLaneWait(t *testing.T) {
 	}
 }
 
-func (r *canceledHostSyncRunner) Run(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
+func (r *canceledHostSyncRunner) Run(ctx context.Context, task workerexec.CommandRequest) (workerexec.CommandResult, error) {
 	r.task = task
 	<-ctx.Done()
-	return worker.CommandResult{}, ctx.Err()
+	return workerexec.CommandResult{}, ctx.Err()
 }
 
 func TestWorkerDeadlineReturnsOnlyAfterRunnerSettlement(t *testing.T) {
