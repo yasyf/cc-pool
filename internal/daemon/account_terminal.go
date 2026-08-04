@@ -228,7 +228,8 @@ func accountMutationTerminalEnv(base []string, configDir, pluginDir string) []st
 		}
 		env = append(env, value)
 	}
-	return append(env,
+	return append(
+		env,
 		"CLAUDE_CONFIG_DIR="+configDir,
 		"CLAUDE_CODE_PLUGIN_CACHE_DIR="+pluginDir,
 	)
@@ -289,14 +290,4 @@ func decodeAccountTerminalInput(payload []byte) (accountterminal.TerminalInput, 
 	default:
 		return accountterminal.TerminalInput{}, errors.New("terminal input kind is unknown")
 	}
-}
-
-func encodeAccountTerminalOutput(output accountterminal.TerminalOutput) ([]byte, error) {
-	if len(output.Data) == 0 || len(output.Data) > accountterminal.TerminalChunkSize {
-		return nil, errors.New("terminal output is empty or oversized")
-	}
-	payload := make([]byte, 8+len(output.Data))
-	binary.BigEndian.PutUint64(payload[:8], output.Sequence)
-	copy(payload[8:], output.Data)
-	return payload, nil
 }
