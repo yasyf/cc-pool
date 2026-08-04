@@ -92,9 +92,11 @@ type Manager struct {
 	credentialMu      sync.Mutex
 	credentialFlights map[int]*credentialFlight
 	strandedRecovery  map[int]strandedCredentialRecovery
-	// strandedRetryGate parks a retry winner before settlement; tests inject it
-	// to make caller overlap deterministic. Nil in production.
-	strandedRetryGate func()
+	// strandedRetryGate announces one caller's role in a stranded retry flight
+	// — the winner before it settles, a joiner once it holds the winner's
+	// flight; tests inject it to make caller overlap deterministic. Nil in
+	// production.
+	strandedRetryGate func(winner bool)
 
 	owner            store.OwnerRecord
 	workers          *workerRuntime

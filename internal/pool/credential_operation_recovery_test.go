@@ -1951,24 +1951,33 @@ func TestStrandedRetrySettlementIsSingleFlight(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	var entered atomic.Int64
-	gateReleased := make(chan struct{})
-	recovery.strandedRetryGate = func() { <-gateReleased }
-	start := make(chan struct{})
 	results := make([]error, 8)
 	clears := make([]bool, 8)
+	// Settlement runs only once every joiner holds the winner's flight.
+	// Entering the function is not holding it: a caller preempted before it
+	// reads the strand — a legal GOMAXPROCS=1 schedule — would find the strand
+	// already deleted and report no work instead of the winner's result.
+	joined := make(chan struct{}, len(results))
+	gateReleased := make(chan struct{})
+	recovery.strandedRetryGate = func(winner bool) {
+		if !winner {
+			joined <- struct{}{}
+			return
+		}
+		<-gateReleased
+	}
+	start := make(chan struct{})
 	for i := range results {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			<-start
-			entered.Add(1)
 			clears[i], results[i] = recovery.retryStrandedCredentialRecovery(t.Context(), account.ID)
 		}()
 	}
 	close(start)
-	for entered.Load() < int64(len(results)) {
-		time.Sleep(time.Millisecond)
+	for range len(results) - 1 {
+		<-joined
 	}
 	close(gateReleased)
 	wg.Wait()

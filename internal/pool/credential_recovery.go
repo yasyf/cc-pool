@@ -159,6 +159,9 @@ func (m *Manager) retryStrandedCredentialRecovery(ctx context.Context, accountID
 	if strand.retry != nil {
 		flight := strand.retry
 		m.credentialMu.Unlock()
+		if gate := m.strandedRetryGate; gate != nil {
+			gate(false)
+		}
 		select {
 		case <-flight.done:
 			return flight.cleared, flight.err
@@ -173,7 +176,7 @@ func (m *Manager) retryStrandedCredentialRecovery(ctx context.Context, accountID
 	m.strandedRecovery[accountID] = strand
 	m.credentialMu.Unlock()
 	if gate := m.strandedRetryGate; gate != nil {
-		gate()
+		gate(true)
 	}
 	flight.cleared, flight.err = m.settleStrandedCredentialRecovery(ctx, accountID, strand.token)
 	m.credentialMu.Lock()
