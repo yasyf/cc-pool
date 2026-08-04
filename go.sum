@@ -114,6 +114,8 @@ github.com/yasyf/daemonkit v0.21.4 h1:95xJR6bv0Ih2fhbkesrvQFUd3QnAvzYgEBUJaZNYnj
 github.com/yasyf/daemonkit v0.21.4/go.mod h1:wn6ImONXaBW3uf7GJO68nGd/KR2PjxXy4r/m9W3gDOM=
 github.com/yasyf/fusekit v1.16.0 h1:XMlzzQ5glHR0AAKbJYIbOB61S4XxDvKhp1vnHVj5rmU=
 github.com/yasyf/fusekit v1.16.0/go.mod h1:eXq8O0NH1Q+A7dB/6Pfz16SLTxc4yfyuS8nl1YuXLQg=
+github.com/yasyf/fusekit v1.16.1 h1:pqnlGIyQZw7WK7C0mfUUFsjPJNxZUKYK4K59gHTJneE=
+github.com/yasyf/fusekit v1.16.1/go.mod h1:qKuj4ifHdsXFHzw9wMSCOdgbo4ewWS1uyO0TCrHmeJA=
 github.com/yasyf/synckit v0.37.1 h1:uGR9WLO/j2hqBoO3xYe5uX7Sk3xofg9G5nkE2+zUqXE=
 github.com/yasyf/synckit v0.37.1/go.mod h1:BC+m0fQlMX95tz223JGTn6Ds2naCjl4e9/vUFwONBkU=
 go.etcd.io/bbolt v1.5.0 h1:S7GAl7Fxv12yohbwFfIbQCGDWbQbtDGPET4P/bD4lxU=
