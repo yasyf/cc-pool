@@ -29,10 +29,20 @@ const (
 	operationFailed C.int32_t = 1
 )
 
+// embeddedLane is one half of the app's publication as supervision and
+// settlement read it: FuseKit's own runtime process, or the tenant lane serving
+// beside it.
+type embeddedLane interface {
+	Wait(context.Context) error
+	Close(context.Context) error
+}
+
 var (
-	embeddedHolder         holderbridge.Process
-	embeddedTenants        tenantfs.Lane
+	embeddedHolder         = &holderbridge.Process{}
+	embeddedTenants        = &tenantfs.Lane{}
 	embeddedHolderStopping atomic.Bool
+	embeddedSettled        = make(chan struct{})
+	embeddedLanes          = func() []embeddedLane { return []embeddedLane{embeddedTenants, embeddedHolder} }
 )
 
 //export CCPoolFuseKitDispatchChild
@@ -81,6 +91,7 @@ func startHolder(ctx context.Context, requiredAppGroup string) error {
 		err = embeddedTenants.Start(ctx, runtime.LocalTenantController())
 	}
 	if err == nil {
+		go superviseEmbedded(context.WithoutCancel(ctx))
 		return nil
 	}
 	cleanupCtx, cancel := context.WithTimeout(
@@ -99,12 +110,12 @@ func CCPoolFuseKitReady() C.int32_t {
 		context.Background(), holderbridge.ReadinessContract().StartupTimeout(),
 	)
 	defer cancel()
-	return operationStatus("runtime readiness", embeddedHolder.Ready(ctx))
+	return operationStatus("runtime readiness", readyEmbedded(ctx))
 }
 
 //export CCPoolFuseKitWait
 func CCPoolFuseKitWait() C.int32_t {
-	err := embeddedHolder.Wait(context.Background())
+	err := settleEmbedded(context.Background())
 	if err == nil && !embeddedHolderStopping.Load() {
 		err = errors.New("runtime exited before shutdown")
 	}
@@ -118,9 +129,65 @@ func CCPoolFuseKitStop() C.int32_t {
 		context.Background(), holderbridge.RuntimeShutdownTimeout,
 	)
 	defer cancel()
-	return operationStatus("runtime shutdown", errors.Join(
-		embeddedTenants.Close(ctx), embeddedHolder.Close(ctx),
-	))
+	return operationStatus("runtime shutdown", closeEmbedded(ctx))
+}
+
+// superviseEmbedded closes embeddedSettled the moment either half of the
+// publication ends. The FuseKit runtime and the tenant lane serving beside it
+// are halves of one thing: a runtime no tenant can reach, or a tenant lane over
+// a runtime that is gone, is a husk that still answers the socket, so launchd
+// sees nothing to restart.
+func superviseEmbedded(ctx context.Context) {
+	lanes := embeddedLanes()
+	ended := make(chan struct{}, len(lanes))
+	for _, lane := range lanes {
+		go func() {
+			_ = lane.Wait(ctx)
+			ended <- struct{}{}
+		}()
+	}
+	<-ended
+	close(embeddedSettled)
+}
+
+// readyEmbedded proves both halves of the publication: FuseKit's own committed
+// readiness, and a tenant lane still serving the source fleet startHolder
+// published through it.
+func readyEmbedded(ctx context.Context) error {
+	if err := embeddedHolder.Ready(ctx); err != nil {
+		return err
+	}
+	select {
+	case <-embeddedSettled:
+		return errors.New("an embedded lane ended before readiness")
+	default:
+		return nil
+	}
+}
+
+// settleEmbedded returns once either half of the publication ends and drains
+// the other, so a lane that exited on its own terminates the app instead of
+// leaving it serving half a runtime. Close replays each half's own terminal
+// result, so the wait reports what actually ended.
+func settleEmbedded(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-embeddedSettled:
+	}
+	shutdown, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx), holderbridge.RuntimeShutdownTimeout,
+	)
+	defer cancel()
+	return closeEmbedded(shutdown)
+}
+
+func closeEmbedded(ctx context.Context) error {
+	var settlement error
+	for _, lane := range embeddedLanes() {
+		settlement = errors.Join(settlement, lane.Close(ctx))
+	}
+	return settlement
 }
 
 func newHolderRuntime(ctx context.Context, requiredAppGroup string) (*holder.Runtime, error) {

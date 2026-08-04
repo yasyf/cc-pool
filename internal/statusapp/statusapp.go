@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -27,23 +26,6 @@ const (
 type runner interface {
 	Run(context.Context, string, ...string) error
 	Output(context.Context, string, ...string) ([]byte, error)
-}
-
-type commandRunner struct{}
-
-func (commandRunner) Run(ctx context.Context, name string, arguments ...string) error {
-	_, err := (commandRunner{}).Output(ctx, name, arguments...)
-	return err
-}
-
-func (commandRunner) Output(ctx context.Context, name string, arguments ...string) ([]byte, error) {
-	//nolint:gosec // The caller supplies only the fixed /usr/bin/pluginkit command and fixed-shape arguments.
-	command := exec.CommandContext(ctx, name, arguments...)
-	output, err := command.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("%s %s: %w: %s", name, strings.Join(arguments, " "), err, strings.TrimSpace(string(output)))
-	}
-	return output, nil
 }
 
 func statusAppVersion() (string, error) {

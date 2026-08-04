@@ -81,7 +81,12 @@ type ServiceInstallReceipt struct {
 // ApplyPackagedApp returns.
 func (ServiceInstallReceipt) Rollback(context.Context) error { return nil }
 
-// ApplyPackagedApp installs or upgrades one exact packaged signed application candidate.
+// ApplyPackagedApp installs or upgrades one exact packaged signed application
+// candidate. Activation observes the primary label, which the app publishes
+// before it publishes the source fleet and starts the tenant lane beside it, so
+// an activation that succeeds says nothing about a startup that then unwinds.
+// The receipt is therefore cut only once the tenant lane — downstream of both —
+// answers from the installed runtime.
 func ApplyPackagedApp(ctx context.Context, candidateSourcePath string) (ServiceInstallReceipt, error) {
 	appVersion, err := statusAppVersion()
 	if err != nil {
@@ -112,6 +117,9 @@ func ApplyPackagedApp(ctx context.Context, candidateSourcePath string) (ServiceI
 	}
 	if !sameApplicationBytes(activation.Generation, generation) {
 		return ServiceInstallReceipt{}, errors.New("CCPoolStatus: activation does not prove the landed generation")
+	}
+	if err := RequireActiveService(ctx); err != nil {
+		return ServiceInstallReceipt{}, err
 	}
 	return ServiceInstallReceipt{Generation: generation, Activation: activation}, nil
 }
