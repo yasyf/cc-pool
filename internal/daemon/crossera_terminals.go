@@ -90,9 +90,10 @@ func sweepLegacyAccountTerminals(ctx context.Context) error {
 	}
 	if len(unsettled) > 0 {
 		return fmt.Errorf(
-			"a pre-upgrade account login may still be running and would overwrite the credentials this daemon refreshes; "+
-				"close it (or end the process) and start the daemon again: %s",
-			strings.Join(unsettled, "; "),
+			"cc-pool refused to start: an account login left over from before the upgrade may still be running, "+
+				"and letting it finish would overwrite credentials this daemon manages. %s. "+
+				"The daemon will keep retrying and start on its own once that process is gone",
+			strings.Join(unsettled, ". "),
 		)
 	}
 	if err := os.Rename(path, path+".archived"); err != nil {
@@ -147,10 +148,13 @@ func classifyLegacyTerminal(record legacyTerminalRecord, boot string) (legacyTer
 		// The leader is gone; the session may still hold descendants.
 	case err != nil:
 		return legacyTerminalUndetermined, fmt.Sprintf(
-			"pid %d could not be observed (%v)", record.PID, err,
+			"The old login's process (pid %d) could not be checked (%v) — this usually clears on its own; "+
+				"if it persists, restart your machine", record.PID, err,
 		)
 	case legacyTerminalStamp(kp) == record.StartTime:
-		return legacyTerminalLive, fmt.Sprintf("pid %d is still running", record.PID)
+		return legacyTerminalLive, fmt.Sprintf(
+			"Close the `claude auth login` window if one is open, or run `kill %d`", record.PID,
+		)
 	}
 	// The PID is absent or now names another instance. Descendants of the
 	// recorded session survive it, and they hold the same config dir, so the
@@ -161,12 +165,18 @@ func classifyLegacyTerminal(record legacyTerminalRecord, boot string) (legacyTer
 	members, err := legacyTerminalSessionMembers(record.SessionID)
 	if err != nil {
 		return legacyTerminalUndetermined, fmt.Sprintf(
-			"session %d could not be observed (%v)", record.SessionID, err,
+			"The old login's terminal session (%d) could not be checked (%v) — this usually clears on its own; "+
+				"if it persists, restart your machine", record.SessionID, err,
 		)
 	}
 	if len(members) > 0 {
+		commands := make([]string, 0, len(members))
+		for _, pid := range members {
+			commands = append(commands, fmt.Sprintf("kill %d", pid))
+		}
 		return legacyTerminalLive, fmt.Sprintf(
-			"login session %d still has running processes %v", record.SessionID, members,
+			"Close the `claude auth login` window if one is open, or run `%s`",
+			strings.Join(commands, " && "),
 		)
 	}
 	return legacyTerminalSettled, ""
