@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1904,6 +1905,77 @@ func TestStrandedRetryFencesObservedOperationsAndWaits(t *testing.T) {
 	}
 	if remaining := recovery.StrandedCredentialRecoveries(); len(remaining) != 0 {
 		t.Fatalf("synced admission did not heal the fence = %+v", remaining)
+	}
+}
+
+func TestStrandedRetrySettlementIsSingleFlight(t *testing.T) {
+	st := openTestStore(t)
+	account := persistTestAccount(t, st, store.Account{
+		ID: 1, ConfigDir: t.TempDir(),
+		KeychainService: "service-single-flight", KeychainAccount: "account-single-flight",
+	})
+	credentials := credstest.NewFake()
+	old := credentialRecoveryManager(t, st, credentials, "single-flight-old")
+	recovery := credentialRecoveryManager(t, st, credentials, "single-flight-new")
+	before, err := old.credentialObservation(t.Context(), account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := beginCredentialOperation(
+		t, old, account, store.CredentialOperationEnsureFresh, store.CredentialTargetKeychain,
+		credentialIntentDigest(store.CredentialOperationEnsureFresh, "single-flight"), before,
+	)
+	operation, err = st.MarkCredentialOperationApplying(operation.Fence(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, err = st.MarkCredentialOperationApplied(
+		operation.Fence(), before, store.CredentialTerminalSucceeded,
+		store.CredentialResultUnchanged, store.CredentialFailureNone, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	linkTarget, err := os.Readlink(account.ConfigDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(account.ConfigDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := recovery.ClaimForeignLanes(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(linkTarget, account.ConfigDir); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	results := make([]error, 8)
+	clears := make([]bool, 8)
+	for i := range results {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			clears[i], results[i] = recovery.retryStrandedCredentialRecovery(t.Context(), account.ID)
+		}()
+	}
+	wg.Wait()
+	for i, retryErr := range results {
+		if retryErr != nil || !clears[i] {
+			t.Fatalf("concurrent retry %d = cleared=%v err=%v", i, clears[i], retryErr)
+		}
+	}
+	receipt, err := st.CredentialOperationReceipt(operation.Token)
+	if err != nil || receipt.TerminalStatus != store.CredentialTerminalSucceeded ||
+		receipt.Result != store.CredentialResultUnchanged {
+		t.Fatalf("racing settlements corrupted the receipt = %+v err=%v", receipt, err)
+	}
+	if _, err := st.CredentialQuarantine(account.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("spurious quarantine after concurrent retries = %v", err)
+	}
+	if remaining := recovery.StrandedCredentialRecoveries(); len(remaining) != 0 {
+		t.Fatalf("strand survived = %+v", remaining)
 	}
 }
 

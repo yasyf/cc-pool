@@ -79,6 +79,7 @@ func (m *Manager) claimForeignCredentialOperations(
 type strandedCredentialRecovery struct {
 	token string
 	cause error
+	retry chan struct{}
 }
 
 type strandedRecoveryError struct {
@@ -97,12 +98,6 @@ func (m *Manager) strandCredentialRecovery(accountID int, token string, cause er
 		m.strandedRecovery = make(map[int]strandedCredentialRecovery)
 	}
 	m.strandedRecovery[accountID] = strandedCredentialRecovery{token: token, cause: cause}
-}
-
-func (m *Manager) unstrandCredentialRecovery(accountID int) {
-	m.credentialMu.Lock()
-	defer m.credentialMu.Unlock()
-	delete(m.strandedRecovery, accountID)
 }
 
 // StrandedCredentialRecoveryStatus names one fenced account: a claimed lane
@@ -143,20 +138,65 @@ func (m *Manager) strandedTokenAccount(token string) (int, bool) {
 
 // retryStrandedCredentialRecovery re-attempts a fenced account's failed
 // settlement; cleared reports that a strand existed and is now resolved, so
-// callers holding pre-retry evidence re-derive it.
+// callers holding pre-retry evidence re-derive it. The settlement is
+// single-flight per account: the fence's many doors mean callers arrive here
+// concurrently from paths sharing no lock, and two settlements racing the same
+// token can write a spurious durable quarantine. Joiners park on the winner's
+// retry channel and report its outcome.
 func (m *Manager) retryStrandedCredentialRecovery(ctx context.Context, accountID int) (cleared bool, err error) {
-	m.credentialMu.Lock()
-	strand, stranded := m.strandedRecovery[accountID]
-	m.credentialMu.Unlock()
-	if !stranded {
-		return false, nil
+	joined := false
+	for {
+		m.credentialMu.Lock()
+		strand, stranded := m.strandedRecovery[accountID]
+		if !stranded {
+			m.credentialMu.Unlock()
+			return joined, nil
+		}
+		if strand.retry == nil {
+			if joined {
+				m.credentialMu.Unlock()
+				return false, fmt.Errorf(
+					"%w: account %d: %w", ErrCredentialRecoveryPending, accountID, strand.cause,
+				)
+			}
+			retry := make(chan struct{})
+			strand.retry = retry
+			m.strandedRecovery[accountID] = strand
+			m.credentialMu.Unlock()
+			cleared, err := m.settleStrandedCredentialRecovery(ctx, accountID, strand.token)
+			m.credentialMu.Lock()
+			if current, ok := m.strandedRecovery[accountID]; ok && current.token == strand.token {
+				current.retry = nil
+				m.strandedRecovery[accountID] = current
+			}
+			m.credentialMu.Unlock()
+			close(retry)
+			return cleared, err
+		}
+		retry := strand.retry
+		m.credentialMu.Unlock()
+		joined = true
+		select {
+		case <-retry:
+		case <-ctx.Done():
+			return false, fmt.Errorf(
+				"%w: account %d: %w", ErrCredentialRecoveryPending, accountID, ctx.Err(),
+			)
+		}
 	}
+}
+
+func (m *Manager) settleStrandedCredentialRecovery(
+	ctx context.Context,
+	accountID int,
+	token string,
+) (cleared bool, err error) {
 	pending := func(err error) error {
 		return fmt.Errorf("%w: account %d: %w", ErrCredentialRecoveryPending, accountID, err)
 	}
-	operation, err := m.Store.CredentialOperationByToken(strand.token)
+	operation, err := m.Store.CredentialOperationByToken(token)
 	if errors.Is(err, sql.ErrNoRows) {
-		m.unstrandCredentialRecovery(accountID)
+		m.unstrandCredentialRecoveryToken(accountID, token)
 		return true, nil
 	}
 	if err != nil {
@@ -172,12 +212,31 @@ func (m *Manager) retryStrandedCredentialRecovery(ctx context.Context, accountID
 	if err := m.settleClaimedCredentialOperation(ctx, account, operation); err != nil {
 		var stranded strandedRecoveryError
 		if errors.As(err, &stranded) {
-			m.strandCredentialRecovery(accountID, stranded.token, stranded.cause)
+			m.restrandCredentialRecoveryToken(accountID, stranded.token, stranded.cause)
 		}
 		return false, pending(err)
 	}
-	m.unstrandCredentialRecovery(accountID)
+	m.unstrandCredentialRecoveryToken(accountID, token)
 	return true, nil
+}
+
+func (m *Manager) unstrandCredentialRecoveryToken(accountID int, token string) {
+	m.credentialMu.Lock()
+	defer m.credentialMu.Unlock()
+	if current, ok := m.strandedRecovery[accountID]; ok && current.token == token {
+		delete(m.strandedRecovery, accountID)
+	}
+}
+
+func (m *Manager) restrandCredentialRecoveryToken(accountID int, token string, cause error) {
+	m.credentialMu.Lock()
+	defer m.credentialMu.Unlock()
+	current, ok := m.strandedRecovery[accountID]
+	if !ok || current.token != token {
+		return
+	}
+	current.cause = cause
+	m.strandedRecovery[accountID] = current
 }
 
 func (m *Manager) claimForeignPendingAdds(
