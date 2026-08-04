@@ -162,6 +162,30 @@ func (s *Server) runAccountMutation(
 	}
 }
 
+// settleStashedTerminalSize post-validates a size recorded against a row this
+// caller read before stashing it. A concurrent pre-start EOF can resolve the
+// operation in that window and drop the stash before this one writes it,
+// leaving an entry no input can reach — and one a later mutation would
+// inherit, since the operation ID is derived deterministically and repeats.
+// Reading the durable state after the write is what closes it: a resolved
+// operation drops the stash and answers from its receipt.
+func (s *Server) settleStashedTerminalSize(
+	operationID store.AccountMutationID,
+	active store.AccountMutation,
+) (AccountMutationResult, error) {
+	receipt, err := s.m.Store.AccountMutationReceipt(operationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return accountMutationActiveResult(active), nil
+	}
+	if err != nil {
+		return AccountMutationResult{}, err
+	}
+	s.accountMutationMu.Lock()
+	delete(s.accountMutationSizes, operationID)
+	s.accountMutationMu.Unlock()
+	return accountMutationReceiptResult(receipt), nil
+}
+
 // resolveAccountMutationBeforeStart settles a not-yet-started mutation as
 // Aborted: Cancel's own machinery, shared by the pre-start EOF — "no input is
 // coming, ever" — so polling turns terminal through the receipt instead of
@@ -220,7 +244,7 @@ func (s *Server) provideAccountMutationInput(
 			}
 			s.accountMutationSizes[operationID] = event.Size
 			s.accountMutationMu.Unlock()
-			return accountMutationActiveResult(active), nil
+			return s.settleStashedTerminalSize(operationID, active)
 		case accountterminal.TerminalInputEOF:
 			s.accountMutationMu.Unlock()
 			return s.resolveAccountMutationBeforeStart(active)

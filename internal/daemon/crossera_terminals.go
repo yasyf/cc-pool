@@ -55,8 +55,64 @@ type processSnapshot struct {
 	sessions map[int]int
 }
 
+// errUnstableProcessScan means a process enumerated at the start of a scan
+// had vanished by the time its session was read. The scan is then worthless
+// for proving absence: that process may have forked a replacement into the
+// same session after the enumeration, so the replacement is in neither the
+// enumeration nor the session map, and an empty session would be a lie.
+var errUnstableProcessScan = errors.New("process table changed during the scan")
+
+// processScanAttempts bounds the retry. A vanish is rare — a scan is a few
+// milliseconds over a table that changes a few times a second — so a stable
+// scan normally lands on the first attempt, and exhausting the retries is
+// itself a signal that the machine is too busy to prove anything on.
+const processScanAttempts = 12
+
+// snapshotProcessTable returns a scan that provably held still. Session
+// emptiness is monotonic — setsid always creates a new session and nothing
+// can join an existing one, so a session with no members can never gain one —
+// which is what makes a single stable scan permanent proof rather than an
+// instantaneous one.
 func snapshotProcessTable() (processSnapshot, error) {
-	all, err := unix.SysctlKinfoProcSlice("kern.proc.all")
+	return stableProcessSnapshot(func() (processSnapshot, error) {
+		return scanProcessTable(liveProcessProbe())
+	})
+}
+
+// processProbe is the pair of kernel reads a scan composes. It is a seam
+// because the defect this scan exists to catch — a process vanishing between
+// the two — cannot be staged against the real kernel on demand.
+type processProbe struct {
+	enumerate func() ([]unix.KinfoProc, error)
+	sessionOf func(pid int) (int, error)
+}
+
+func liveProcessProbe() processProbe {
+	return processProbe{
+		enumerate: func() ([]unix.KinfoProc, error) {
+			return unix.SysctlKinfoProcSlice("kern.proc.all")
+		},
+		sessionOf: unix.Getsid,
+	}
+}
+
+func stableProcessSnapshot(scan func() (processSnapshot, error)) (processSnapshot, error) {
+	var err error
+	for attempt := 0; attempt < processScanAttempts; attempt++ {
+		var snapshot processSnapshot
+		snapshot, err = scan()
+		if err == nil {
+			return snapshot, nil
+		}
+		if !errors.Is(err, errUnstableProcessScan) {
+			return processSnapshot{}, err
+		}
+	}
+	return processSnapshot{}, fmt.Errorf("%w after %d attempts", err, processScanAttempts)
+}
+
+func scanProcessTable(probe processProbe) (processSnapshot, error) {
+	all, err := probe.enumerate()
 	if err != nil {
 		return processSnapshot{}, err
 	}
@@ -74,13 +130,15 @@ func snapshotProcessTable() (processSnapshot, error) {
 			continue
 		}
 		snapshot.stamps[pid] = legacyTerminalStamp(&all[index])
-		// Getsid succeeds across sessions and users on darwin (verified;
-		// POSIX permits an EPERM restriction it does not impose), so an
-		// error here only means the process exited after the enumeration —
-		// and an exited process holds nothing.
-		if sid, err := unix.Getsid(pid); err == nil {
-			snapshot.sessions[pid] = sid
+		// Getsid succeeds across sessions and users on darwin (verified: zero
+		// failures over a 1039-process table), so an error here means this
+		// process vanished between the enumeration and now — the one event
+		// that can hide a forked replacement from both halves of the scan.
+		sid, err := probe.sessionOf(pid)
+		if err != nil {
+			return processSnapshot{}, fmt.Errorf("%w: pid %d left mid-scan", errUnstableProcessScan, pid)
 		}
+		snapshot.sessions[pid] = sid
 	}
 	if err := snapshot.authoritative(); err != nil {
 		return processSnapshot{}, err
@@ -211,29 +269,30 @@ func classifyLegacyTerminal(
 	if record.Boot != boot {
 		return legacyTerminalSettled, ""
 	}
+	surviving := make(map[int]struct{})
 	if stamp, present := table.stamps[record.PID]; present && stamp == record.StartTime {
-		return legacyTerminalLive, fmt.Sprintf(
-			"Close the `claude auth login` window if one is open, or run `kill %d`", record.PID,
-		)
+		surviving[record.PID] = struct{}{}
 	}
-	// The PID is absent from the table, or now names another instance.
-	// Descendants of the recorded session outlive their leader and hold the
-	// same config dir, so the session is read whole rather than through it.
-	if record.SessionID == 0 {
-		return legacyTerminalSettled, ""
-	}
-	var members []int
-	for pid, sid := range table.sessions {
-		if sid == record.SessionID {
-			members = append(members, pid)
+	// The session is collected whether or not the leader survived. Ending the
+	// leader alone can leave its login child running, so a refusal that named
+	// only the leader would print a command the user runs to no effect.
+	if record.SessionID != 0 {
+		for pid, sid := range table.sessions {
+			if sid == record.SessionID {
+				surviving[pid] = struct{}{}
+			}
 		}
 	}
-	if len(members) == 0 {
+	if len(surviving) == 0 {
 		return legacyTerminalSettled, ""
 	}
-	sort.Ints(members)
-	commands := make([]string, 0, len(members))
-	for _, pid := range members {
+	pids := make([]int, 0, len(surviving))
+	for pid := range surviving {
+		pids = append(pids, pid)
+	}
+	sort.Ints(pids)
+	commands := make([]string, 0, len(pids))
+	for _, pid := range pids {
 		commands = append(commands, fmt.Sprintf("kill %d", pid))
 	}
 	return legacyTerminalLive, fmt.Sprintf(

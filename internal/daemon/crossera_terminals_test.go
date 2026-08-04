@@ -204,8 +204,14 @@ func TestClassifyLegacyTerminalReadsTheSnapshotNotAPerPIDProbe(t *testing.T) {
 			want:   legacyTerminalSettled,
 		},
 		{
-			name:   "the recorded leader still running is live",
+			name:   "a live leader names its whole session, not just itself",
 			record: legacyTerminalRecord{PID: 100, StartTime: "50.000001", Boot: boot, SessionID: 100},
+			want:   legacyTerminalLive,
+			detail: "kill 100 && kill 200",
+		},
+		{
+			name:   "a live leader with no session names only itself",
+			record: legacyTerminalRecord{PID: 100, StartTime: "50.000001", Boot: boot},
 			want:   legacyTerminalLive,
 			detail: "kill 100",
 		},
@@ -265,4 +271,122 @@ func TestSnapshotAuthorityRequiresOurOwnPID(t *testing.T) {
 	if _, present := real.stamps[os.Getpid()]; !present {
 		t.Fatal("real snapshot passed authority without containing this process")
 	}
+}
+
+// TestStableProcessSnapshotRetriesAnUnstableScan is the test the fork race
+// lacked: a process that vanishes between the enumeration and its session read
+// may have forked a replacement into the same session, which would then appear
+// in neither half of that scan — so the scan proves nothing and must be redone.
+func TestStableProcessSnapshotRetriesAnUnstableScan(t *testing.T) {
+	t.Run("retries until a scan holds still", func(t *testing.T) {
+		attempts := 0
+		snapshot, err := stableProcessSnapshot(func() (processSnapshot, error) {
+			attempts++
+			if attempts < 3 {
+				return processSnapshot{}, fmt.Errorf("%w: pid 42 left mid-scan", errUnstableProcessScan)
+			}
+			return processSnapshot{
+				stamps:   map[int]string{os.Getpid(): "1.000001"},
+				sessions: map[int]int{},
+			}, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if attempts != 3 {
+			t.Fatalf("attempts = %d, want the scan retried until stable", attempts)
+		}
+		if _, present := snapshot.stamps[os.Getpid()]; !present {
+			t.Fatal("stable snapshot lost its contents")
+		}
+	})
+	t.Run("refuses when no scan ever holds still", func(t *testing.T) {
+		attempts := 0
+		_, err := stableProcessSnapshot(func() (processSnapshot, error) {
+			attempts++
+			return processSnapshot{}, fmt.Errorf("%w: pid 42 left mid-scan", errUnstableProcessScan)
+		})
+		if !errors.Is(err, errUnstableProcessScan) {
+			t.Fatalf("exhausted retries = %v, want the instability surfaced", err)
+		}
+		if attempts != processScanAttempts {
+			t.Fatalf("attempts = %d, want %d", attempts, processScanAttempts)
+		}
+	})
+	t.Run("a non-instability error is not retried", func(t *testing.T) {
+		attempts := 0
+		fatal := errors.New("enumeration failed")
+		_, err := stableProcessSnapshot(func() (processSnapshot, error) {
+			attempts++
+			return processSnapshot{}, fatal
+		})
+		if !errors.Is(err, fatal) || attempts != 1 {
+			t.Fatalf("hard failure = %v after %d attempts, want it surfaced at once", err, attempts)
+		}
+	})
+	t.Run("the real scan holds still and is authoritative", func(t *testing.T) {
+		snapshot, err := snapshotProcessTable()
+		if err != nil {
+			t.Fatalf("real process scan = %v, want a stable authoritative snapshot", err)
+		}
+		if _, present := snapshot.sessions[os.Getpid()]; !present {
+			t.Fatal("real snapshot did not read this process's session")
+		}
+	})
+}
+
+func fakeKinfoProc(pid int, sec int64, usec int32) unix.KinfoProc {
+	var kp unix.KinfoProc
+	kp.Proc.P_pid = int32(pid)
+	kp.Proc.P_starttime.Sec = sec
+	kp.Proc.P_starttime.Usec = usec
+	return kp
+}
+
+// TestScanProcessTableRejectsAVanishedProcess is the fork-race detection
+// itself: a process present in the enumeration but gone by its session read
+// may have forked a replacement into the same session, and that replacement
+// appears in neither half of the scan. The scan must refuse rather than
+// report a session it cannot see whole.
+func TestScanProcessTableRejectsAVanishedProcess(t *testing.T) {
+	self := os.Getpid()
+	table := []unix.KinfoProc{
+		fakeKinfoProc(self, 10, 1),
+		fakeKinfoProc(4242, 20, 2),
+	}
+	t.Run("a vanished process invalidates the scan", func(t *testing.T) {
+		_, err := scanProcessTable(processProbe{
+			enumerate: func() ([]unix.KinfoProc, error) { return table, nil },
+			sessionOf: func(pid int) (int, error) {
+				if pid == 4242 {
+					return 0, unix.ESRCH
+				}
+				return pid, nil
+			},
+		})
+		if !errors.Is(err, errUnstableProcessScan) {
+			t.Fatalf("scan with a vanished pid = %v, want it refused as unstable", err)
+		}
+	})
+	t.Run("a scan that holds still is kept whole", func(t *testing.T) {
+		snapshot, err := scanProcessTable(processProbe{
+			enumerate: func() ([]unix.KinfoProc, error) { return table, nil },
+			sessionOf: func(pid int) (int, error) { return 7, nil },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if snapshot.sessions[4242] != 7 || snapshot.stamps[4242] != "20.000002" {
+			t.Fatalf("snapshot dropped or mangled a member: %+v", snapshot)
+		}
+	})
+	t.Run("an enumeration omitting this process is refused", func(t *testing.T) {
+		_, err := scanProcessTable(processProbe{
+			enumerate: func() ([]unix.KinfoProc, error) { return []unix.KinfoProc{fakeKinfoProc(4242, 20, 2)}, nil },
+			sessionOf: func(pid int) (int, error) { return pid, nil },
+		})
+		if err == nil || errors.Is(err, errUnstableProcessScan) {
+			t.Fatalf("scan omitting this process = %v, want an authority refusal", err)
+		}
+	})
 }
