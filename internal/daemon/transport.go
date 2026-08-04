@@ -51,6 +51,10 @@ func reply(response Response) (daemonkit.Reply, error) {
 func (s *Server) Drain(budget daemonkit.Budget) error {
 	ctx, cancel := budget.Context(context.Background())
 	defer cancel()
+	return s.drainProduct(ctx)
+}
+
+func (s *Server) drainProduct(ctx context.Context) error {
 	s.markClosing()
 	s.runtimePublished.Store(false)
 	s.cancelHolderMonitor()
@@ -82,6 +86,10 @@ func (s *Server) Drain(budget daemonkit.Budget) error {
 func (s *Server) Close(budget daemonkit.Budget) error {
 	ctx, cancel := budget.Context(context.Background())
 	defer cancel()
+	return s.closeProduct(ctx)
+}
+
+func (s *Server) closeProduct(ctx context.Context) error {
 	var result error
 	if s.syncClient != nil {
 		result = errors.Join(result, s.syncClient.Close())
@@ -154,6 +162,14 @@ func (s *Server) startProductRuntime(ctx context.Context) error {
 	if err := s.m.ClaimForeignLanes(execCtx); err != nil {
 		cancel()
 		return fmt.Errorf("claim foreign credential lanes: %w", err)
+	}
+	if err := s.recoverRetiredAccountMutations(execCtx); err != nil {
+		cancel()
+		return fmt.Errorf("recover account mutations: %w", err)
+	}
+	if err := s.recoverPendingAccountMutationPublications(execCtx); err != nil {
+		cancel()
+		return fmt.Errorf("recover account mutation publications: %w", err)
 	}
 	s.log.Printf("daemon %s started; socket=%s", version.String(), s.socket)
 	s.wg.Add(1)

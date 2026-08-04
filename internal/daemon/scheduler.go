@@ -8,7 +8,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/daemonkit/proc"
 )
 
 const (
@@ -56,7 +55,7 @@ var (
 const poolResource = "pool"
 
 func rlBackoff(streak int) time.Duration {
-	return proc.Backoff{Base: rateLimitBackoffBase, Cap: rateLimitBackoffCap}.After(streak)
+	return backoff{Base: rateLimitBackoffBase, Cap: rateLimitBackoffCap}.After(streak)
 }
 
 // sampleOutcome classifies one account's poll for network-outage detection.

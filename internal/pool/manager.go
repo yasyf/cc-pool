@@ -170,6 +170,15 @@ func OpenLocal() (*Manager, error) {
 	return &Manager{Store: st}, nil
 }
 
+// Workers is the daemon's disposable-command runner, bound to the process
+// scope Serve handed Start; nil outside OpenDaemon.
+func (m *Manager) Workers() workerexec.Runner {
+	if m.workers == nil {
+		return nil
+	}
+	return m.workers
+}
+
 func (m *Manager) scanSessions(ctx context.Context) ([]procscan.Session, error) {
 	if m.ScanSessions == nil {
 		return nil, errors.New("session scan requires worker authority")

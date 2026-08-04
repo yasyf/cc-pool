@@ -15,22 +15,14 @@ import (
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/trust"
+	"github.com/yasyf/daemonkit"
 )
 
 func main() {
-	if handled, err := trust.RunVerifierChild(os.Args[1:], os.Stdout); handled {
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
-		return
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	if hostsync.IsWorkerInvocation(os.Args[1:]) {
-		if err := proc.CloseInheritedFDs(); err != nil {
+		if err := daemonkit.CloseInheritedFDs(); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
@@ -42,7 +34,7 @@ func main() {
 	}
 
 	// A nested ccp must not inherit the actual launched session's lease fd.
-	if err := proc.CloseInheritedFDs(); err != nil {
+	if err := daemonkit.CloseInheritedFDs(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}

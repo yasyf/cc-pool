@@ -2,8 +2,6 @@ package daemon
 
 import (
 	"time"
-
-	"github.com/yasyf/daemonkit/proc"
 )
 
 // This file owns the daemon's product-level auth and rate-limit policy tuning.
@@ -24,11 +22,30 @@ const (
 	rateLimitBackoffCap  = 30 * time.Minute
 )
 
+// backoff is the exponential failure-streak wait daemonkit/proc used to carry:
+// Base doubled per failure past the first, capped at Cap, with a non-positive
+// streak still waiting Base.
+type backoff struct {
+	Base time.Duration
+	Cap  time.Duration
+}
+
+func (b backoff) After(failures int) time.Duration {
+	d := b.Base
+	for i := 1; i < failures && d < b.Cap; i++ {
+		d *= 2
+	}
+	if d > b.Cap {
+		d = b.Cap
+	}
+	return d
+}
+
 // policy is one product gate's debounce and backoff tuning.
 type policy struct {
 	name     string
 	debounce int
-	backoff  proc.Backoff
+	backoff  backoff
 }
 
 // policies is THE self-heal policy table — one row per family, each referencing
@@ -42,10 +59,10 @@ var policies = map[string]policy{
 	// backoff; the trip gates further sampling within the backoff window.
 	"ratelimit.acct": {
 		name:    "ratelimit.acct",
-		backoff: proc.Backoff{Base: rateLimitBackoffBase, Cap: rateLimitBackoffCap},
+		backoff: backoff{Base: rateLimitBackoffBase, Cap: rateLimitBackoffCap},
 	},
 	"ratelimit.pool": {
 		name:    "ratelimit.pool",
-		backoff: proc.Backoff{Base: rateLimitBackoffBase, Cap: rateLimitBackoffCap},
+		backoff: backoff{Base: rateLimitBackoffBase, Cap: rateLimitBackoffCap},
 	},
 }

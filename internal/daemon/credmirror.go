@@ -17,7 +17,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/workerexec"
-	"github.com/yasyf/daemonkit/worker"
 )
 
 const (
@@ -175,7 +174,7 @@ func (settler *credentialWriteSettler) runWorker(
 	if err != nil {
 		return credentialWriteWorkerResponse{}, fmt.Errorf("resolve credential write worker home: %w", err)
 	}
-	result, runErr := settler.runner.Run(ctx, worker.CommandRequest{
+	result, runErr := settler.runner.Run(ctx, workerexec.CommandRequest{
 		Path: settler.workerExecutable, Dir: workerexec.TempDir(), Args: []string{writeWorkerArgument},
 		Env: []string{"HOME=" + home}, Stdin: input.Bytes(), TotalTimeout: credentialWriteWorkerTimeout,
 	})

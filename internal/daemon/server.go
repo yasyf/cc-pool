@@ -23,9 +23,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/cc-pool/internal/workerexec"
-	dkdaemon "github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/synckit/syncservice"
 )
@@ -57,11 +55,10 @@ const (
 
 // Server is the running daemon.
 type Server struct {
-	m          *pool.Manager
-	socket     string
-	syncSocket string // synckit consumer socket; tests point it into a short temp dir
-	snapshot   string // status mirror path; tests point it into a temp dir
-	log        *log.Logger
+	m        *pool.Manager
+	socket   string
+	snapshot string // status mirror path; tests point it into a temp dir
+	log      *log.Logger
 
 	// wg tracks product background loops canceled by the activation lifetime.
 	wg sync.WaitGroup
@@ -120,7 +117,8 @@ type Server struct {
 	holderActive        atomic.Bool
 	holderLost          atomic.Bool
 	runtimePublished    atomic.Bool
-	runtimeShutdown     func(context.Context) error
+	// stopServe begins a product-initiated drain; Start captures Ctx.Stop.
+	stopServe func(error)
 	// report publishes the product's half of Health.Detail; Start captures it.
 	report                        func([]byte)
 	bootstrapMu                   sync.Mutex
@@ -129,7 +127,7 @@ type Server struct {
 	provisionPresentationIdentity func(context.Context, store.Account) (store.FileProviderPresentationIdentity, error)
 	activatePrepared              func(context.Context, store.Account, tenantfs.PreparationLease, catalogproto.TenantPreparationProof, func() error) error
 	preflightCredential           func(context.Context, store.Account) error
-	disposableWorkers             *worker.Pool
+	disposableWorkers             workerexec.Runner
 	accountTerminals              *accountterminal.Manager
 
 	// led is the product self-heal ledger for auth.streak and the
@@ -162,24 +160,74 @@ type Server struct {
 var ensureHolderRuntime = EnsureHolderService
 
 // Run is the entry point for `cc-pool daemon`. It blocks until the process
-// is signalled.
+// is signalled or the daemon drains. The cross-era gate runs before Serve:
+// a live v0.20.9 incumbent holds a lock Serve's flock cannot see.
 func Run(ctx context.Context) error {
 	if err := pool.EnsureStateDir(); err != nil {
 		return err
 	}
-	s := &Server{
-		socket:     pool.SocketPath(),
-		syncSocket: pool.SyncSocketPath(),
-		snapshot:   pool.StatusSnapshotPath(),
-		log:        log.New(os.Stderr, "[cc-pool] ", log.LstdFlags),
-		startedAt:  time.Now(),
-		cl:         newClaims(),
-		led:        newLedgers(),
+	spec, err := ProductionSpec()
+	if err != nil {
+		return err
 	}
-	return s.serve(ctx)
+	legacyLock, err := crossEraGate(ctx, launchctlRunner, string(spec.Label))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = legacyLock.Close() }()
+	s := &Server{
+		socket:    pool.SocketPath(),
+		snapshot:  pool.StatusSnapshotPath(),
+		log:       log.New(os.Stderr, "[cc-pool] ", log.LstdFlags),
+		startedAt: time.Now(),
+		cl:        newClaims(),
+		led:       newLedgers(),
+	}
+	drained, err := daemonkit.Serve(ctx, spec, s.start)
+	s.log.Printf("daemon stopped")
+	if len(drained.Abandoned) > 0 {
+		s.log.Printf("drain abandoned stages: %v", drained.Abandoned)
+	}
+	if s.holderLost.Load() {
+		err = errors.Join(errHolderSessionLost, err)
+	}
+	if ctx.Err() != nil && (err == nil || errors.Is(err, ctx.Err())) {
+		return nil
+	}
+	return err
 }
 
-func (s *Server) activate(ctx context.Context) (err error) {
+// start builds the product once Serve proved ownership; its return is
+// readiness, so business admission opens exactly when it succeeds.
+func (s *Server) start(scope daemonkit.Ctx) (daemonkit.Product, error) {
+	s.report = scope.Report
+	s.stopServe = scope.Stop
+	m, err := pool.OpenDaemon(scope)
+	if err != nil {
+		return nil, err
+	}
+	s.m = m
+	if err := s.activate(scope); err != nil {
+		return nil, s.abortStart(err)
+	}
+	if err := s.startProductRuntime(scope.Context); err != nil {
+		return nil, s.abortStart(err)
+	}
+	s.runtimePublished.Store(true)
+	s.publishHealth()
+	return s, nil
+}
+
+// abortStart unwinds a partially activated product: Serve never calls Drain or
+// Close for a Start that failed.
+func (s *Server) abortStart(cause error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), daemonShutdownTimeout)
+	defer cancel()
+	return errors.Join(cause, s.drainProduct(ctx), s.closeProduct(ctx))
+}
+
+func (s *Server) activate(scope daemonkit.Ctx) (err error) {
+	ctx := scope.Context
 	s.beginBootstrap()
 	defer func() {
 		if err != nil {
@@ -195,20 +243,11 @@ func (s *Server) activate(ctx context.Context) (err error) {
 	if s.m == nil {
 		return errors.New("daemon manager is unavailable")
 	}
-	generation, err := proc.ProcessGeneration()
-	if err != nil {
-		return fmt.Errorf("derive account terminal generation: %w", err)
-	}
-	terminals, err := accountterminal.NewManager(accountTerminalLimit, &proc.Reaper{
-		Store: &proc.FileStore{Path: pool.AccountTerminalProcessStorePath()}, Generation: generation,
-	})
+	terminals, err := s.openAccountTerminals(scope)
 	if err != nil {
 		return err
 	}
 	s.accountTerminals = terminals
-	if err := terminals.Recover(ctx); err != nil {
-		return fmt.Errorf("recover account terminals: %w", err)
-	}
 	tenantClient, err := tenantfs.NewControlClient(ctx, pool.FuseKitSocketPath())
 	if err != nil {
 		return fmt.Errorf("connect FuseKit runtime: %w", err)
@@ -217,7 +256,7 @@ func (s *Server) activate(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	workers := s.m.DisposableWorkers()
+	workers := s.m.Workers()
 	s.m.ClaimCredentialMutation = func(accountID int) (func(), error) {
 		if !s.cl.ownExclusive(accountID) {
 			return nil, errAccountExclusive
@@ -234,12 +273,6 @@ func (s *Server) activate(ctx context.Context) (err error) {
 	s.scanProcesses = s.m.ScanProcesses
 	s.tenantCoordinator = newTenantCoordinator(ctx, s, preparer, tenantClient)
 	s.m.RetirePendingAdd = s.tenantCoordinator.retireReservedAccount
-	if err := s.recoverRetiredAccountMutations(ctx); err != nil {
-		return fmt.Errorf("recover account mutations: %w", err)
-	}
-	if err := s.recoverPendingAccountMutationPublications(ctx); err != nil {
-		return fmt.Errorf("recover account mutation publications: %w", err)
-	}
 	s.holderActive.Store(true)
 	monitorCtx, monitorCancel := context.WithCancel(ctx)
 	s.holderMonitorMu.Lock()
@@ -288,13 +321,12 @@ func (s *Server) monitorHolderSession(ctx context.Context, done <-chan struct{})
 	s.holderActive.Store(false)
 	s.holderLost.Store(true)
 	s.runtimePublished.Store(false)
-	if s.runtimeShutdown == nil {
+	s.publishHealth()
+	if s.stopServe == nil {
 		s.log.Printf("FuseKit runtime session lost without shutdown ownership")
 		return
 	}
-	if err := s.runtimeShutdown(context.WithoutCancel(ctx)); err != nil {
-		s.log.Printf("shut down after FuseKit runtime session loss: %v", err)
-	}
+	s.stopServe(errHolderSessionLost)
 }
 
 func (s *Server) clearActivation() {
@@ -317,7 +349,7 @@ func (s *Server) clearActivation() {
 const maxVersionOutput = 64 << 10
 
 // detectClaudeVersion runs `claude --version` in a disposable process group.
-func detectClaudeVersion(ctx context.Context, workers *worker.Pool) string {
+func detectClaudeVersion(ctx context.Context, workers workerexec.Runner) string {
 	if workers == nil {
 		return ""
 	}
@@ -327,7 +359,7 @@ func detectClaudeVersion(ctx context.Context, workers *worker.Pool) string {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	result, err := workers.Run(ctx, worker.CommandRequest{
+	result, err := workers.Run(ctx, workerexec.CommandRequest{
 		Path: executable, Dir: workerexec.TempDir(), Args: []string{"--version"}, TotalTimeout: 3 * time.Second,
 	})
 	if err != nil || len(result.Stdout) > maxVersionOutput {
@@ -345,121 +377,6 @@ func detectClaudeVersion(ctx context.Context, workers *worker.Pool) string {
 // version (the ua.detect startup row).
 func (s *Server) detectAndSetUserAgent(ctx context.Context) {
 	oauth.SetUserAgentVersion(detectClaudeVersion(ctx, s.disposableWorkers))
-}
-
-func (s *Server) serve(ctx context.Context) error {
-	m, err := pool.OpenDaemon(ctx)
-	if err != nil {
-		return err
-	}
-	s.m = m
-	_, runtime, err := s.runtime()
-	if err != nil {
-		return errors.Join(err, m.Close(ctx))
-	}
-	publication := dkdaemon.NewPublicationSlot[bool](runtime)
-	activation, err := runtime.Begin(ctx)
-	if err != nil {
-		return errors.Join(err, m.Close(ctx))
-	}
-	settlement, err := activation.ClaimProductSettlement()
-	if err != nil {
-		_ = activation.Fail(err)
-		return errors.Join(err, runtime.Wait(context.WithoutCancel(ctx)), m.Close(ctx))
-	}
-	lifetimeCtx, cancelLifetime := contextWithoutCancelUntil(ctx, activation.Context().Done())
-	defer cancelLifetime(context.Canceled)
-	cleanupDone := make(chan error, 1)
-	go func(ctx context.Context) {
-		<-activation.Context().Done()
-		cleanupDone <- s.settleProductRuntime(ctx, settlement)
-	}(lifetimeCtx)
-	fail := func(ctx context.Context, cause error) error {
-		failErr := activation.Fail(cause)
-		return errors.Join(cause, failErr, runtime.Wait(context.WithoutCancel(ctx)), <-cleanupDone)
-	}
-	if err := s.activate(lifetimeCtx); err != nil {
-		return fail(lifetimeCtx, err)
-	}
-	if err := s.startProductRuntime(lifetimeCtx); err != nil {
-		return fail(lifetimeCtx, err)
-	}
-	staged, err := publication.Stage(activation, true)
-	if err != nil {
-		return fail(lifetimeCtx, err)
-	}
-	if err := activation.CommitReady(staged); err != nil {
-		return fail(lifetimeCtx, err)
-	}
-	s.runtimePublished.Store(true)
-	go func(ctx context.Context) {
-		select {
-		case <-ctx.Done():
-			shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultEvictTimeout)
-			defer cancel()
-			_ = runtime.Shutdown(shutdownCtx)
-		case <-activation.Context().Done():
-		}
-	}(ctx)
-	err = runtime.Wait(context.WithoutCancel(ctx))
-	cleanupErr := <-cleanupDone
-	s.log.Printf("daemon stopped")
-	if s.holderLost.Load() {
-		err = errors.Join(errHolderSessionLost, err)
-	}
-	err = errors.Join(err, cleanupErr)
-	if ctx.Err() != nil && (err == nil || errors.Is(err, ctx.Err())) {
-		return nil
-	}
-	return err
-}
-
-func (s *Server) settleProductRuntime(ctx context.Context, settlement dkdaemon.ProductSettlement) error {
-	cleanupCtx, cancel := context.WithTimeout(
-		context.WithoutCancel(ctx),
-		daemonShutdownTimeout-defaultEvictTimeout,
-	)
-	defer cancel()
-	s.markClosing()
-	s.runtimePublished.Store(false)
-	s.cancelHolderMonitor()
-	s.execMu.Lock()
-	execCancel := s.execCancel
-	s.execMu.Unlock()
-	if execCancel != nil {
-		execCancel()
-	}
-	var result error
-	if s.accountTerminals != nil {
-		result = errors.Join(result, s.accountTerminals.Close(cleanupCtx))
-	}
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-cleanupCtx.Done():
-		result = errors.Join(result, fmt.Errorf("daemon: await product workers: %w", cleanupCtx.Err()))
-	}
-	if s.syncClient != nil {
-		result = errors.Join(result, s.syncClient.Close())
-		s.syncClient = nil
-	}
-	if s.tenantClient != nil {
-		s.holderActive.Store(false)
-		result = errors.Join(result, s.tenantClient.Close())
-	}
-	if s.m != nil {
-		result = errors.Join(result, s.m.Close(cleanupCtx))
-	}
-	s.clearActivation()
-	s.m = nil
-	if result != nil {
-		return result
-	}
-	return settlement.Complete()
 }
 
 // markClosing prevents maintenance tables from starting another pass while the
