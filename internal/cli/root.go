@@ -105,7 +105,7 @@ func withManager(ctx context.Context, fn func(*pool.Manager) error) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = m.Close(ctx) }()
+	defer func() { _ = m.Close() }()
 	return fn(m)
 }
 

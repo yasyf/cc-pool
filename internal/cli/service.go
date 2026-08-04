@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -16,97 +15,59 @@ import (
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
-	"github.com/yasyf/daemonkit/service"
-	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 )
 
 // Test seams: tests must never touch real processes, mounts, or launchctl/brew.
 var (
-	scanSessions                = procscan.Scan
-	stopDaemon                  = stopDaemonService
-	ensureHolder                = func(ctx context.Context) (holderServiceInstall, error) { return daemon.InstallHolderService(ctx) }
-	stopHolder                  = daemon.StopAndUninstallHolderService
-	serviceExecutable           = resolveDaemonServiceExecutable
-	daemonServiceReady          = waitForDaemonService
-	openDaemonServiceController = func(ctx context.Context) (daemonServiceController, error) {
-		return service.NewController(ctx, daemonServiceControllerConfig())
+	scanSessions        = procscan.Scan
+	stopDaemon          = stopDaemonService
+	ensureHolder        = func(ctx context.Context) (holderServiceInstall, error) { return daemon.InstallHolderService(ctx) }
+	stopHolder          = daemon.StopAndUninstallHolderService
+	ensureDaemonService = func(ctx context.Context) (daemonkit.Ensured, error) {
+		spec, err := daemon.ProductionSpec()
+		if err != nil {
+			return daemonkit.Ensured{}, err
+		}
+		client, err := daemonkit.Open(spec)
+		if err != nil {
+			return daemonkit.Ensured{}, err
+		}
+		return client.Ensure(ctx)
 	}
-	observeDaemonRuntime = func(ctx context.Context) (_ *daemon.HealthResponse, err error) {
-		client := daemon.NewClient()
-		defer func() { err = errors.Join(err, client.Close()) }()
-		return client.ObserveHealthContext(ctx)
+	stopDaemonRuntime = func(ctx context.Context) error {
+		if err := daemon.RemoveLegacyDaemon(ctx); err != nil {
+			return err
+		}
+		client, err := daemonkit.Open(daemon.Spec(daemonkit.Program{}, nil))
+		if err != nil {
+			return err
+		}
+		return client.Stop(ctx)
 	}
 )
 
+// The whole budgets each daemonkit lifecycle verb is worth: a caller that
+// stated its own deadline keeps it, per the fleet deadline-budget convention.
 const (
-	daemonServiceWorkerLimit  = 1
-	daemonServiceCloseTimeout = 30 * time.Second
-	daemonServiceReadyTimeout = 10 * time.Second
-	daemonServiceStopTimeout  = 65 * time.Second
-	daemonServicePATH         = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
+	daemonServiceEnsureTimeout = 90 * time.Second
+	daemonServiceStopTimeout   = 65 * time.Second
+	daemonServiceCloseTimeout  = 30 * time.Second
 )
 
-type daemonServiceController interface {
-	Converge(context.Context, []service.Agent) error
-	StopRuntime(context.Context, service.StopRuntimeRequest) (service.StopReceipt, error)
-	Close(context.Context) error
+// budgeted states budget as ctx's deadline when ctx carries none. A caller
+// that stated its own keeps it: the budget is this package's default, never an
+// override of a deadline the caller chose.
+func budgeted(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	if _, stated := ctx.Deadline(); stated {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, budget)
 }
 
 type holderServiceInstall interface {
 	Commit()
 	Rollback(context.Context) error
-}
-
-func ccpAgent(executable string) (service.Agent, error) {
-	if !filepath.IsAbs(executable) || filepath.Clean(executable) != executable {
-		return service.Agent{}, fmt.Errorf("daemon executable %q is not exact and absolute", executable)
-	}
-	return service.Agent{
-		Label:         daemon.ServiceRoleID,
-		Program:       executable,
-		Args:          []string{"daemon"},
-		LogPath:       pool.LogPath(),
-		RestartPolicy: service.RestartOnFailure,
-		Env: map[string]string{
-			"PATH": daemonServicePATH,
-		},
-	}, nil
-}
-
-func resolveDaemonServiceExecutable() (string, error) {
-	executable, err := daemon.CurrentServiceExecutable()
-	if err != nil {
-		return "", err
-	}
-	if !filepath.IsAbs(executable) || filepath.Clean(executable) != executable {
-		return "", fmt.Errorf("daemon service executable %q is not exact and absolute", executable)
-	}
-	return executable, nil
-}
-
-func daemonServiceControllerConfig() service.ControllerConfig {
-	return service.ControllerConfig{
-		StatePath:   pool.DaemonServiceStatePath(),
-		ProcessPath: pool.DaemonServiceProcessStorePath(),
-		WorkerLimit: daemonServiceWorkerLimit,
-	}
-}
-
-func withDaemonServiceController(
-	ctx context.Context,
-	run func(daemonServiceController) error,
-) (err error) {
-	controller, err := openDaemonServiceController(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), daemonServiceCloseTimeout)
-		defer cancel()
-		err = errors.Join(err, controller.Close(closeCtx))
-	}()
-	return run(controller)
 }
 
 func newServiceCmd() *cobra.Command {
@@ -231,14 +192,14 @@ func gateUninstallSessions(accts []store.Account) error {
 	return nil
 }
 
+// stopDaemonService leads with the direct legacy bootout — Client.Stop cannot
+// reach a live pre-daemonkit incumbent, whose listener refuses the attach —
+// then routes the marked world through Stop's own observe-drain-remove ladder.
 func stopDaemonService(cmd *cobra.Command) error {
 	out := cmd.OutOrStdout()
-	if err := withDaemonServiceController(cmd.Context(), func(controller daemonServiceController) error {
-		if err := stopObservedDaemonRuntime(cmd.Context(), controller, true); err != nil {
-			return err
-		}
-		return controller.Converge(cmd.Context(), nil)
-	}); err != nil {
+	stopCtx, cancel := budgeted(cmd.Context(), daemonServiceStopTimeout)
+	defer cancel()
+	if err := stopDaemonRuntime(stopCtx); err != nil {
 		return err
 	}
 	success(out, "Removed the daemon LaunchAgent. The signed FuseKit runtime and File Provider domains are preserved.")
@@ -304,15 +265,10 @@ func runServiceInstall(cmd *cobra.Command) (err error) {
 	return nil
 }
 
+// installDaemonService converges the daemon through Ensure, which places the
+// stable executable, applies the LaunchAgent, evicts a stale incumbent, and
+// subscribes on readiness — the retired controller's whole ladder in one verb.
 func installDaemonService(ctx context.Context) (err error) {
-	executable, err := serviceExecutable()
-	if err != nil {
-		return err
-	}
-	agent, err := ccpAgent(executable)
-	if err != nil {
-		return err
-	}
 	holderInstall, err := ensureHolder(ctx)
 	if err != nil {
 		return err
@@ -325,71 +281,26 @@ func installDaemonService(ctx context.Context) (err error) {
 		defer cancel()
 		err = errors.Join(err, holderInstall.Rollback(rollbackCtx))
 	}()
-	if err := withDaemonServiceController(ctx, func(controller daemonServiceController) error {
-		if err := stopObservedDaemonRuntime(ctx, controller, false); err != nil {
-			return err
-		}
-		holderInstall.Commit()
-		if err := controller.Converge(ctx, []service.Agent{agent}); err != nil {
-			return err
-		}
-		readyCtx, cancel := context.WithTimeout(ctx, daemonServiceReadyTimeout)
-		readyErr := daemonServiceReady(readyCtx, version.String())
-		cancel()
-		if readyErr == nil {
-			return nil
-		}
-		readyErr = fmt.Errorf("wait for cc-pool daemon readiness: %w", readyErr)
-		rollbackCtx, rollbackCancel := context.WithTimeout(
-			context.WithoutCancel(ctx), daemonServiceCloseTimeout,
-		)
-		defer rollbackCancel()
-		daemonRollbackErr := controller.Converge(rollbackCtx, nil)
-		return errors.Join(readyErr, daemonRollbackErr)
-	}); err != nil {
+	if err := daemon.RemoveLegacyDaemon(ctx); err != nil {
 		return err
 	}
-	return nil
-}
-
-func stopObservedDaemonRuntime(
-	ctx context.Context,
-	controller daemonServiceController,
-	stopCurrent bool,
-) error {
-	stopCtx, cancel := context.WithTimeout(ctx, daemonServiceStopTimeout)
+	ensureCtx, cancel := budgeted(ctx, daemonServiceEnsureTimeout)
 	defer cancel()
-	health, err := observeDaemonRuntime(stopCtx)
-	if errors.Is(err, daemon.ErrDaemonUnavailable) {
-		return nil
-	}
+	ensured, err := ensureDaemonService(ensureCtx)
 	if err != nil {
-		return fmt.Errorf("observe cc-pool daemon stop target: %w", err)
+		return fmt.Errorf("ensure cc-pool daemon: %w", err)
 	}
-	if !stopCurrent && health.RuntimeBuild == version.String() &&
-		health.State == daemon.RuntimeStateHealthy && !health.Draining && !health.Busy && health.Ready {
-		return nil
+	if ensured.After.Build != version.String() {
+		return fmt.Errorf(
+			"ensured daemon build %q is not this build %q", ensured.After.Build, version.String(),
+		)
 	}
-	_, err = controller.StopRuntime(stopCtx, service.StopRuntimeRequest{
-		OperationID: "cc-pool.stop-runtime.v1:" + health.ProcessGeneration,
-		RuntimeClientConfig: wire.RuntimeClientConfig{
-			Client: wire.ClientConfig{
-				Dial: wire.UnixDialer(pool.SocketPath()), WireBuild: daemon.WireBuild,
-				Role: trust.PeerRole(daemon.StopRoleID),
-			},
-			NoProgressTimeout: daemonServiceReadyTimeout,
-		},
-		ExpectedRuntimeBuild: health.RuntimeBuild,
-		ControlRole:          trust.PeerRole(daemon.StopRoleID),
-	})
-	if err != nil {
-		return fmt.Errorf("stop exact cc-pool daemon generation: %w", err)
-	}
+	holderInstall.Commit()
 	return nil
 }
 
 // ensureDaemon is best-effort: failures warn, callers fall back to direct
-// sampling. daemonkit Runtime owns any exact-build takeover.
+// sampling. Ensure owns any exact-build takeover.
 func ensureDaemon(cmd *cobra.Command) {
 	want := version.String()
 	if daemonAt(want) {

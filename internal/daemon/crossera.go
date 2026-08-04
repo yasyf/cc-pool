@@ -65,3 +65,18 @@ func crossEraGate(ctx context.Context, run launchd.Runner, label string) (*durab
 func legacyListenerLockPath() string {
 	return pool.SocketPath() + ".lock"
 }
+
+// RemoveLegacyDaemon boots out a live pre-daemonkit LaunchAgent directly
+// through launchd. Client.Stop cannot reach one — a pre-cut listener refuses
+// the protocol-2 attach before Stop's markerless fallback runs — so install
+// and uninstall lead with this call, then route the marked world through
+// Client.Stop. A marked plist or no plist at all is success: no legacy
+// incumbent exists.
+func RemoveLegacyDaemon(ctx context.Context) error {
+	removeCtx, cancel := context.WithTimeout(ctx, crossEraGateTimeout)
+	defer cancel()
+	if err := launchd.RemoveUnmarked(removeCtx, launchctlRunner, ServiceRoleID); err != nil && !errors.Is(err, launchd.ErrMarked) {
+		return fmt.Errorf("boot out the pre-daemonkit daemon: %w", err)
+	}
+	return nil
+}

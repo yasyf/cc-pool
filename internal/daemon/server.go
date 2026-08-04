@@ -24,6 +24,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/cc-pool/internal/workerexec"
 	"github.com/yasyf/daemonkit"
+	"github.com/yasyf/daemonkit/launchd"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/synckit/syncservice"
 )
@@ -52,6 +53,11 @@ const (
 	daemonShutdownTimeout = 30 * time.Second
 	accountTerminalLimit  = 4
 )
+
+// daemonPATH is the exact service PATH the retired plist Env block pinned.
+// Ensure's rendered LaunchAgent carries no Env, so a launchd-run daemon
+// re-pins it itself; a shell-run daemon keeps the caller's environment.
+const daemonPATH = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 // Server is the running daemon.
 type Server struct {
@@ -173,6 +179,11 @@ var ensureHolderRuntime = EnsureHolderService
 func Run(ctx context.Context) error {
 	if err := pool.EnsureStateDir(); err != nil {
 		return err
+	}
+	if os.Getenv(launchd.OwnerEnvKey) != "" {
+		if err := os.Setenv("PATH", daemonPATH); err != nil {
+			return err
+		}
 	}
 	spec, err := ProductionSpec()
 	if err != nil {

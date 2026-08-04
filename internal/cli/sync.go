@@ -155,7 +155,7 @@ func newSyncConvergeCmd() *cobra.Command {
 					return err
 				}
 				ensureDaemon(cmd)
-				return runSyncConverge(cmd.Context(), cmd.OutOrStdout(), syncEnsureDaemon, pool.SyncSocketPath())
+				return runSyncConverge(cmd.Context(), cmd.OutOrStdout(), syncEnsureDaemon)
 			})
 		},
 	}
@@ -176,7 +176,7 @@ func runSyncEnable(cmd *cobra.Command, m *pool.Manager) error {
 		warn(out, "mesh state unreadable: %v", err)
 		mesh = &hostregistry.Registry{}
 	}
-	if err := syncConverge(cmd.Context(), out, syncEnsureDaemon, pool.SyncSocketPath()); err != nil {
+	if err := syncConverge(cmd.Context(), out, syncEnsureDaemon); err != nil {
 		return err
 	}
 
@@ -235,7 +235,7 @@ func runSyncStatus(cmd *cobra.Command, m *pool.Manager) error {
 
 	probeSyncSocket(cmd.Context(), out)
 
-	reg, err := syncRegistryState(cmd.Context(), pool.SyncSocketPath())
+	reg, err := syncRegistryState(cmd.Context())
 	if err != nil {
 		warn(out, "shared registry unreadable: %v", err)
 	} else if len(reg) > 0 {
@@ -247,8 +247,8 @@ func runSyncStatus(cmd *cobra.Command, m *pool.Manager) error {
 	return nil
 }
 
-func syncRegistryState(ctx context.Context, sock string) (hostsync.Registry, error) {
-	cl := syncservice.NewClient(syncservice.Socket(sock))
+func syncRegistryState(ctx context.Context) (hostsync.Registry, error) {
+	cl := syncservice.NewClient(syncservice.Resident(hostsync.SyncServiceID))
 	defer func() { _ = cl.Close() }()
 	change, err := cl.Export(ctx, syncservice.ExportRequest{
 		ServiceID: hostsync.SyncServiceID, SchemaFingerprint: hostsync.SyncSchemaFingerprint,
@@ -269,16 +269,16 @@ func runSyncRPCServe(ctx context.Context, in io.Reader, out io.Writer, ensure fu
 	return rpc.Proxy(ctx, in, out, sock)
 }
 
-// runSyncConverge asks the daemon for one converge pass over the sync socket.
-func runSyncConverge(ctx context.Context, out io.Writer, ensure func(context.Context) bool, sock string) error {
+// runSyncConverge asks the resident helper for one converge pass.
+func runSyncConverge(ctx context.Context, out io.Writer, ensure func(context.Context) bool) error {
 	if !ensure(ctx) {
 		return fmt.Errorf("cc-pool daemon is not reachable; run `ccp service install`")
 	}
-	cl := syncservice.NewClient(syncservice.Socket(sock))
+	cl := syncservice.NewClient(syncservice.Resident(hostsync.SyncServiceID))
 	defer func() { _ = cl.Close() }()
 	res, err := cl.Reconcile(ctx, "")
 	if err != nil {
-		return fmt.Errorf("converge via %s: %w", sock, err)
+		return fmt.Errorf("converge via %s: %w", hostsync.SyncServiceID, err)
 	}
 	success(out, "Converged %d item(s), %d deferred busy.", res.Converged, res.SkippedBusy)
 	return nil
@@ -296,7 +296,7 @@ func ccpoolManifest() manifest.Manifest {
 			Debounce: codec.Duration(syncWatchDebounce),
 		},
 		Service: manifest.ServiceSpec{
-			Kind: "resident", Socket: pool.SyncSocketPath(),
+			Kind:              "resident",
 			SchemaFingerprint: hostsync.SyncSchemaFingerprint,
 		},
 	}
@@ -340,11 +340,11 @@ func printMesh(out io.Writer, mesh *hostregistry.Registry) {
 func probeSyncSocket(ctx context.Context, out io.Writer) {
 	ctx, cancel := context.WithTimeout(ctx, syncProbeTimeout)
 	defer cancel()
-	cl := syncservice.NewClient(syncservice.Socket(pool.SyncSocketPath()))
+	cl := syncservice.NewClient(syncservice.Resident(hostsync.SyncServiceID))
 	defer func() { _ = cl.Close() }()
 	caps, err := cl.Capabilities(ctx)
 	if err != nil {
-		warn(out, "sync socket %s not answering (%v); is the daemon running with sync enabled?", pool.SyncSocketPath(), err)
+		warn(out, "sync service %s not answering (%v); is the daemon running with sync enabled?", hostsync.SyncServiceID, err)
 		return
 	}
 	success(out, "Sync socket healthy: %s (%s).", caps.Name, plural(len(caps.Methods), "method"))

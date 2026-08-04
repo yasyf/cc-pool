@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/synckit/syncservice"
@@ -38,7 +39,7 @@ func syncRecordLabel(cmd *cobra.Command, m *pool.Manager, a store.Account) {
 		warn(cmd.ErrOrStderr(), "renamed locally, but the daemon is unavailable; run `ccp service install` to converge host sync")
 		return
 	}
-	cl := syncservice.NewClient(syncservice.Socket(pool.SyncSocketPath()))
+	cl := syncservice.NewClient(syncservice.Resident(hostsync.SyncServiceID))
 	defer func() { _ = cl.Close() }()
 	if _, err := cl.Reconcile(cmd.Context(), ""); err != nil {
 		warn(cmd.ErrOrStderr(), "renamed locally, but couldn't record it in the sync registry: %v — a peer converge may revert it", err)
