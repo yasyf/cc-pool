@@ -60,6 +60,10 @@ func snapshotProcessTable() (processSnapshot, error) {
 	if err != nil {
 		return processSnapshot{}, err
 	}
+	// SysctlKinfoProcSlice answers a zero-size probe with an empty slice and
+	// a nil error, and treating that as "nothing is alive" would settle every
+	// record and archive the ledger with a live login running. The check
+	// below refuses it as unauthoritative.
 	snapshot := processSnapshot{
 		stamps:   make(map[int]string, len(all)),
 		sessions: make(map[int]int, len(all)),
@@ -70,13 +74,33 @@ func snapshotProcessTable() (processSnapshot, error) {
 			continue
 		}
 		snapshot.stamps[pid] = legacyTerminalStamp(&all[index])
-		// A session this daemon's own era created is readable; one that is
-		// not belongs to another login and cannot be the recorded session.
+		// Getsid succeeds across sessions and users on darwin (verified;
+		// POSIX permits an EPERM restriction it does not impose), so an
+		// error here only means the process exited after the enumeration —
+		// and an exited process holds nothing.
 		if sid, err := unix.Getsid(pid); err == nil {
 			snapshot.sessions[pid] = sid
 		}
 	}
+	if err := snapshot.authoritative(); err != nil {
+		return processSnapshot{}, err
+	}
 	return snapshot, nil
+}
+
+// authoritative is the positive proof that the enumeration means anything:
+// this process is alive with certainty, so a snapshot that does not contain
+// it has proven nothing about absence, whatever its size. This closes the
+// zero-size success return and any future silent-empty path in one check —
+// it validates the instrument, not the reading.
+func (snapshot processSnapshot) authoritative() error {
+	if _, present := snapshot.stamps[os.Getpid()]; !present {
+		return fmt.Errorf(
+			"process enumeration omitted this process (pid %d) and is not authoritative about absence",
+			os.Getpid(),
+		)
+	}
+	return nil
 }
 
 // sweepLegacyAccountTerminals refuses the boot while any account-terminal

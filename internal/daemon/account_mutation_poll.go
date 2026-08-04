@@ -54,7 +54,10 @@ type pollAttachment struct {
 	// an attachment other than the one the caller is about to use. It is
 	// deliberately not pageMu: an input must never queue behind a parked
 	// poll. Lock order is pageMu then controlMu; nothing takes them the
-	// other way.
+	// other way. reposition holds it across a bounded ClaimControl retry,
+	// so a concurrent sendInput can wait out that transition — a latency
+	// property bounded by the caller's context, intended, and not a
+	// lock-order concern.
 	controlMu sync.Mutex
 
 	mu         sync.Mutex

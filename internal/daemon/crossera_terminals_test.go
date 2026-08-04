@@ -244,3 +244,25 @@ func TestSweepLegacyAccountTerminalsWithoutALedgerIsANoOp(t *testing.T) {
 		t.Fatalf("no-op sweep created an archive: %v", err)
 	}
 }
+
+// TestSnapshotAuthorityRequiresOurOwnPID pins the instrument validation: an
+// enumeration that omits a process known with certainty to be alive — this
+// one — has proven nothing about absence, and SysctlKinfoProcSlice can return
+// exactly that shape as a success (nil, nil on a zero-size probe).
+func TestSnapshotAuthorityRequiresOurOwnPID(t *testing.T) {
+	empty := processSnapshot{stamps: map[int]string{}, sessions: map[int]int{}}
+	if err := empty.authoritative(); err == nil {
+		t.Fatal("an empty enumeration passed as authoritative")
+	}
+	withoutUs := processSnapshot{stamps: map[int]string{1: "1.000001"}, sessions: map[int]int{}}
+	if err := withoutUs.authoritative(); err == nil {
+		t.Fatal("an enumeration omitting this process passed as authoritative")
+	}
+	real, err := snapshotProcessTable()
+	if err != nil {
+		t.Fatalf("real process enumeration = %v, want authoritative", err)
+	}
+	if _, present := real.stamps[os.Getpid()]; !present {
+		t.Fatal("real snapshot passed authority without containing this process")
+	}
+}
