@@ -1951,7 +1951,9 @@ func TestStrandedRetrySettlementIsSingleFlight(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	var inFlight, maxInFlight atomic.Int64
+	var entered atomic.Int64
+	gateReleased := make(chan struct{})
+	recovery.strandedRetryGate = func() { <-gateReleased }
 	start := make(chan struct{})
 	results := make([]error, 8)
 	clears := make([]bool, 8)
@@ -1960,22 +1962,16 @@ func TestStrandedRetrySettlementIsSingleFlight(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			current := inFlight.Add(1)
-			for {
-				observed := maxInFlight.Load()
-				if current <= observed || maxInFlight.CompareAndSwap(observed, current) {
-					break
-				}
-			}
+			entered.Add(1)
 			clears[i], results[i] = recovery.retryStrandedCredentialRecovery(t.Context(), account.ID)
-			inFlight.Add(-1)
 		}()
 	}
 	close(start)
-	wg.Wait()
-	if maxInFlight.Load() < 2 {
-		t.Fatalf("retries never overlapped (max in flight = %d); the race went untested", maxInFlight.Load())
+	for entered.Load() < int64(len(results)) {
+		time.Sleep(time.Millisecond)
 	}
+	close(gateReleased)
+	wg.Wait()
 	for i, retryErr := range results {
 		if retryErr != nil || !clears[i] {
 			t.Fatalf("concurrent retry %d = cleared=%v err=%v", i, clears[i], retryErr)

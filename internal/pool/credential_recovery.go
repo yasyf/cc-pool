@@ -76,10 +76,16 @@ func (m *Manager) claimForeignCredentialOperations(
 	}
 }
 
+type strandedRetryFlight struct {
+	done    chan struct{}
+	cleared bool
+	err     error
+}
+
 type strandedCredentialRecovery struct {
 	token string
 	cause error
-	retry chan struct{}
+	retry *strandedRetryFlight
 }
 
 type strandedRecoveryError struct {
@@ -144,46 +150,40 @@ func (m *Manager) strandedTokenAccount(token string) (int, bool) {
 // token can write a spurious durable quarantine. Joiners park on the winner's
 // retry channel and report its outcome.
 func (m *Manager) retryStrandedCredentialRecovery(ctx context.Context, accountID int) (cleared bool, err error) {
-	joined := false
-	for {
-		m.credentialMu.Lock()
-		strand, stranded := m.strandedRecovery[accountID]
-		if !stranded {
-			m.credentialMu.Unlock()
-			return joined, nil
-		}
-		if strand.retry == nil {
-			if joined {
-				m.credentialMu.Unlock()
-				return false, fmt.Errorf(
-					"%w: account %d: %w", ErrCredentialRecoveryPending, accountID, strand.cause,
-				)
-			}
-			retry := make(chan struct{})
-			strand.retry = retry
-			m.strandedRecovery[accountID] = strand
-			m.credentialMu.Unlock()
-			cleared, err := m.settleStrandedCredentialRecovery(ctx, accountID, strand.token)
-			m.credentialMu.Lock()
-			if current, ok := m.strandedRecovery[accountID]; ok && current.token == strand.token {
-				current.retry = nil
-				m.strandedRecovery[accountID] = current
-			}
-			m.credentialMu.Unlock()
-			close(retry)
-			return cleared, err
-		}
-		retry := strand.retry
+	m.credentialMu.Lock()
+	strand, stranded := m.strandedRecovery[accountID]
+	if !stranded {
 		m.credentialMu.Unlock()
-		joined = true
+		return false, nil
+	}
+	if strand.retry != nil {
+		flight := strand.retry
+		m.credentialMu.Unlock()
 		select {
-		case <-retry:
+		case <-flight.done:
+			return flight.cleared, flight.err
 		case <-ctx.Done():
 			return false, fmt.Errorf(
 				"%w: account %d: %w", ErrCredentialRecoveryPending, accountID, ctx.Err(),
 			)
 		}
 	}
+	flight := &strandedRetryFlight{done: make(chan struct{})}
+	strand.retry = flight
+	m.strandedRecovery[accountID] = strand
+	m.credentialMu.Unlock()
+	if gate := m.strandedRetryGate; gate != nil {
+		gate()
+	}
+	flight.cleared, flight.err = m.settleStrandedCredentialRecovery(ctx, accountID, strand.token)
+	m.credentialMu.Lock()
+	if current, ok := m.strandedRecovery[accountID]; ok && current.token == strand.token {
+		current.retry = nil
+		m.strandedRecovery[accountID] = current
+	}
+	m.credentialMu.Unlock()
+	close(flight.done)
+	return flight.cleared, flight.err
 }
 
 func (m *Manager) settleStrandedCredentialRecovery(
