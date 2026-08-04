@@ -11,6 +11,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/daemonkit"
+	"github.com/yasyf/daemonkit/bundle"
 	"github.com/yasyf/daemonkit/deploy"
 	"github.com/yasyf/daemonkit/launchd"
 	"github.com/yasyf/fusekit/holder"
@@ -33,6 +34,7 @@ var (
 	makeCandidatePlan   = packagedCandidatePlan
 	makeInstalledAgents = installedServiceAgents
 	installedAppPath    = pool.WidgetAppPath
+	deployInventory     = deploy.Inventory
 )
 
 // ServiceInstallReceipt binds one landed generation to the activation that
@@ -84,7 +86,10 @@ func ApplyPackagedApp(ctx context.Context, candidateSourcePath string) (ServiceI
 // RequireActiveService proves the installed application's FuseKit runtime is
 // serving. It only observes: landing a generation is ApplyPackagedApp's to
 // perform and launchd's to sustain, so requiring the service never activates
-// one.
+// one. WaitReady alone proves live-and-ready under the tenant lane's
+// same-user floor, which any same-UID listener clears — the executable-scoped
+// inventory is what ties the answering PID to the installed application's own
+// runtime binary.
 func RequireActiveService(ctx context.Context) error {
 	client, err := daemonkit.Open(tenantfs.Daemon())
 	if err != nil {
@@ -92,10 +97,23 @@ func RequireActiveService(ctx context.Context) error {
 	}
 	readyCtx, cancel := context.WithTimeout(ctx, holderbridge.ReadinessContract().ObservationTimeout())
 	defer cancel()
-	if _, err := client.WaitReady(readyCtx); err != nil {
+	health, err := client.WaitReady(readyCtx)
+	if err != nil {
 		return fmt.Errorf("CCPoolStatus: require the live FuseKit runtime: %w", err)
 	}
-	return nil
+	survivors, err := deployInventory(bundle.ExePath(installedAppPath(), holderbridge.ExecutableName))
+	if err != nil {
+		return fmt.Errorf("CCPoolStatus: inventory the installed runtime: %w", err)
+	}
+	for _, live := range survivors.Live {
+		if live.PID == health.PID {
+			return nil
+		}
+	}
+	return fmt.Errorf(
+		"CCPoolStatus: the process serving the tenant lane (pid %d) does not run the installed application",
+		health.PID,
+	)
 }
 
 // UninstallPackagedApp quiesces and removes the exact deploy-sealed installed application.
