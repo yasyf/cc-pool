@@ -18,9 +18,9 @@ import (
 
 const controlProtocol uint16 = 1
 
-// controlOperationTimeout is the tenant lane's per-call budget. A caller's own
-// stricter deadline always wins; a caller carrying none still cannot reach
-// daemonkit, which refuses a deadline-less Call outright.
+// controlOperationTimeout is the tenant lane's default per-call budget, spent
+// only by a caller that stated no deadline of its own — daemonkit refuses a
+// deadline-less Call outright, so every call carries one either way.
 const controlOperationTimeout = 30 * time.Second
 
 const holderLivenessPoll = time.Second
@@ -160,10 +160,15 @@ type leaseResponse struct {
 	Receipt catalogproto.FileProviderLeaseReceipt `json:"receipt"`
 }
 
+type businessSession interface {
+	Call(context.Context, string, []byte) (daemonkit.Reply, error)
+	Close(context.Context) error
+}
+
 // ControlClient owns one exact-build cc-pool tenant lane.
 type ControlClient struct {
 	client   *daemonkit.Client
-	business *daemonkit.Business
+	business businessSession
 	done     chan struct{}
 	stop     context.CancelFunc
 }
@@ -324,7 +329,7 @@ func (c *ControlClient) call(ctx context.Context, operation string, request, res
 	if err != nil {
 		return err
 	}
-	callCtx, cancel := context.WithTimeout(ctx, controlOperationTimeout)
+	callCtx, cancel := budgeted(ctx, controlOperationTimeout)
 	defer cancel()
 	reply, err := c.business.Call(callCtx, operation, payload)
 	if err != nil {
@@ -355,6 +360,16 @@ func (c *ControlClient) call(ctx context.Context, operation string, request, res
 		return errors.New("tenantfs: failed cc-pool holder response has no message")
 	}
 	return &ControlRemoteError{Code: header.Code, Message: header.Message}
+}
+
+// budgeted states budget as ctx's deadline when ctx carries none. A caller
+// that stated its own keeps it: the budget is this package's default, never an
+// override of a deadline the caller chose.
+func budgeted(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	if _, stated := ctx.Deadline(); stated {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, budget)
 }
 
 var controlHandlers = map[string]func(context.Context, daemonkit.Request, *holder.LocalTenantController) any{
@@ -528,10 +543,6 @@ func controlErrorHeader(err error) controlHeader {
 		return controlHeader{Protocol: controlProtocol, Code: ControlErrorOK}
 	}
 	return controlHeader{Protocol: controlProtocol, Code: classifyControlError(err), Message: err.Error()}
-}
-
-func controlFailure(code ControlErrorCode, message string) controlHeader {
-	return controlHeader{Protocol: controlProtocol, Code: code, Message: message}
 }
 
 func classifyControlError(err error) ControlErrorCode {
