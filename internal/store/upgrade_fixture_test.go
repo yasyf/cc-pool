@@ -2,6 +2,8 @@ package store
 
 import (
 	"bytes"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -237,5 +239,171 @@ func TestUpgradeAdoptsVZeroTwentyNineOwnerRowsAcrossAllFiveTables(t *testing.T) 
 	if remaining, _, err := s.PendingAddReservationsNotOwnedBy(v2, 0, CredentialOperationPageLimit); err != nil ||
 		len(remaining) != 0 {
 		t.Fatalf("unclaimed pending adds remain = %+v err=%v", remaining, err)
+	}
+}
+
+// TestUpgradeAdoptsOversizedVZeroTwentyNineOwner pins that owner size is
+// policed at mint alone: goldenA's captured field shape with every optional
+// field populated and a deep install path crosses the 1 KiB mint cap, and
+// every table still scans, claims, settles, and acknowledges it.
+func TestUpgradeAdoptsOversizedVZeroTwentyNineOwner(t *testing.T) {
+	s := openTest(t)
+	now := time.Unix(1_900_000_000, 0)
+	s.now = func() time.Time { return now }
+	executable := "/opt/homebrew/Cellar/cc-pool/0.20.9/libexec" +
+		strings.Repeat("/premigration-account-terminal-holder-segment", 22) + "/bin/cc-pool"
+	oversized := OwnerRecord(fmt.Sprintf(
+		`{"recovery_id":"com.yasyf.cc-pool.credential-owner.v1","pid":88888,"start_time":"1722700456.789012","boot":"9f2a6c1e-5b4d-4e3a-8890-abcdef012345","comm":"cc-pool","executable":%q,"audit_token":[245,1,0,0,245,1,0,0,245,1,0,0,20,0,0,0,245,1,0,0,146,16,0,0,109,135,1,0,105,122,0,0],"generation":"5aa1b2c3d4e5f60718293a4b5c6d7e8f","process_group":false,"session_id":0,"role":"credential-owner","operation_id":"account-mutation-relogin-0123456789abcdef","stop_session":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"preparation_nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"runtime_protocol":0,"target_process_generation":null,"stop_authority_state":"granted","expires_unix_milli":0}`,
+		executable,
+	))
+	if len(oversized) <= ownerRecordMaxBytes {
+		t.Fatalf("fixture owner is %d bytes, want > %d", len(oversized), ownerRecordMaxBytes)
+	}
+	if err := oversized.Validate(); err != nil {
+		t.Fatalf("oversized v0.20.9 owner fails validation: %v", err)
+	}
+
+	laneAccount := credentialOperationTestAccountID(t, s, 1)
+	receiptAccount := credentialOperationTestAccountID(t, s, 2)
+	mutationAccount := credentialOperationTestAccountID(t, s, 3)
+	committedAccount := credentialOperationTestAccountID(t, s, 4)
+
+	stagedPayload := []byte(`{"version":1,"upgrade":"oversized-staged"}`)
+	laneBegin, err := s.BeginCredentialOperation(credentialOperationTestRequest(
+		t, laneAccount, CredentialOperationEnsureFresh, CredentialTargetKeychain,
+		credentialOperationTestState("oversized-before", ""), "oversized-fresh", oversized,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	laneFence := laneBegin.Active.Fence()
+	if _, err := s.MarkCredentialOperationApplying(laneFence, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.StageCredentialOperationPublication(laneFence, stagedPayload); err != nil {
+		t.Fatal(err)
+	}
+
+	installPayload := []byte(`{"version":1,"upgrade":"oversized-install"}`)
+	installOutcome := credentialOperationTestState("oversized-installed", "")
+	installBegin, err := s.BeginCredentialOperation(credentialOperationTestRequest(
+		t, receiptAccount, CredentialOperationInstallSynced, CredentialTargetKeychain,
+		credentialOperationTestState("", ""), "oversized-install", oversized,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	installFence := installBegin.Active.Fence()
+	if _, err := s.MarkCredentialOperationApplying(installFence, installPayload); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MarkCredentialOperationApplied(
+		installFence, installOutcome, CredentialTerminalSucceeded,
+		CredentialResultInstalled, CredentialFailureNone, installPayload,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CommitCredentialOperation(
+		installFence, installOutcome, nil, now.Add(10*time.Minute),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	reloginBegin, err := s.BeginAccountMutation(t.Context(), existingAccountMutationTestRequest(
+		t, mutationAccount, AccountMutationRelogin, oversized,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	committedRequest := existingAccountMutationTestRequest(
+		t, committedAccount, AccountMutationRelogin, oversized,
+	)
+	committedBegin, err := s.BeginAccountMutation(t.Context(), committedRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	committedFence, err := s.MarkAccountMutationInputProvided(
+		committedBegin.Active.Fence(), credentialOperationTestDigest("oversized-input"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committedFence, err = s.MarkAccountMutationApplying(committedFence); err != nil {
+		t.Fatal(err)
+	}
+	if committedFence, err = s.MarkAccountMutationApplied(
+		committedFence, credentialOperationTestDigest("oversized-written"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if committedFence, err = s.SetAccountMutationMetadata(
+		committedFence, "oversized-label", "oversized-uuid",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if committedFence, err = s.MarkAccountMutationPublishing(committedFence); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CommitAccountMutation(committedFence, now.Add(10*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	reservation, err := s.ReserveAccountIndex(oversized)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	v2, err := MintOwnerRecord(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignLanes, _, err := s.CredentialOperationsNotOwnedBy(v2, 0, CredentialOperationPageLimit)
+	if err != nil || len(foreignLanes) != 1 || !bytes.Equal(foreignLanes[0].Owner, oversized) {
+		t.Fatalf("oversized foreign lanes = %+v err=%v", foreignLanes, err)
+	}
+	foreignMutations, _, err := s.AccountMutationsNotOwnedBy(v2, 0, CredentialOperationPageLimit)
+	if err != nil || len(foreignMutations) != 1 {
+		t.Fatalf("oversized foreign mutations = %+v err=%v", foreignMutations, err)
+	}
+	foreignPending, _, err := s.PendingAddReservationsNotOwnedBy(v2, 0, CredentialOperationPageLimit)
+	if err != nil || len(foreignPending) != 1 || foreignPending[0].ID != reservation.ID {
+		t.Fatalf("oversized foreign pending adds = %+v err=%v", foreignPending, err)
+	}
+
+	claimedLane, err := s.TakeoverCredentialOperation(foreignLanes[0].Fence(), v2)
+	if err != nil || claimedLane.OwnerEpoch != foreignLanes[0].OwnerEpoch+1 ||
+		!bytes.Equal(claimedLane.Owner, v2) {
+		t.Fatalf("claimed oversized lane = %+v err=%v", claimedLane, err)
+	}
+	claimedRelogin, err := s.TakeoverAccountMutation(t.Context(), reloginBegin.Active.Fence(), v2)
+	if err != nil || claimedRelogin.OwnerEpoch != reloginBegin.Active.OwnerEpoch+1 ||
+		!bytes.Equal(claimedRelogin.Owner, v2) {
+		t.Fatalf("claimed oversized relogin = %+v err=%v", claimedRelogin, err)
+	}
+	if err := s.ReleaseAccountIndex(reservation); err != nil {
+		t.Fatalf("release oversized-owned reservation = %v", err)
+	}
+
+	pendingWrites, _, err := s.UnacknowledgedCredentialWriteReceipts(0, CredentialOperationPageLimit)
+	if err != nil || len(pendingWrites) != 1 ||
+		!bytes.Equal(pendingWrites[0].Owner, oversized) {
+		t.Fatalf("oversized pending publication = %+v err=%v", pendingWrites, err)
+	}
+	if err := s.AcknowledgeCredentialOperation(pendingWrites[0].Token); err != nil {
+		t.Fatal(err)
+	}
+	committedReceipt, err := s.AccountMutationReceipt(committedRequest.OperationID)
+	if err != nil || !bytes.Equal(committedReceipt.Owner, oversized) ||
+		committedReceipt.Terminal != AccountMutationCommitted {
+		t.Fatalf("oversized mutation receipt = %+v err=%v", committedReceipt, err)
+	}
+	if err := s.AcknowledgeAccountMutationReceipt(committedRequest.OperationID); err != nil {
+		t.Fatal(err)
+	}
+
+	if remaining, _, err := s.PendingAddReservationsNotOwnedBy(v2, 0, CredentialOperationPageLimit); err != nil ||
+		len(remaining) != 0 {
+		t.Fatalf("oversized pending adds remain = %+v err=%v", remaining, err)
 	}
 }

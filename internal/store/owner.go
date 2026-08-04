@@ -31,8 +31,8 @@ type ownerIdentity struct {
 	Nonce   string `json:"nonce"`
 }
 
-// MintOwnerRecord derives a fresh generation identity. The nonce is the
-// identity; PID and Started are diagnostic only.
+// MintOwnerRecord derives a fresh generation identity, capped at one KiB.
+// The nonce is the identity; PID and Started are diagnostic only.
 func MintOwnerRecord(now time.Time) (OwnerRecord, error) {
 	var nonce [16]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
@@ -47,16 +47,18 @@ func MintOwnerRecord(now time.Time) (OwnerRecord, error) {
 	if err != nil {
 		return nil, fmt.Errorf("mint owner record: %w", err)
 	}
+	if len(encoded) > ownerRecordMaxBytes {
+		return nil, errors.New("mint owner record: identity exceeds its limit")
+	}
 	return encoded, nil
 }
 
-// Validate rejects an absent or oversized owner identity.
+// Validate rejects an absent owner identity. Size is deliberately not
+// checked: adopted bytes are echoed, never interpreted, so a prior era's
+// record length is not ours to police — the cap applies at mint alone.
 func (o OwnerRecord) Validate() error {
 	if len(o) == 0 {
 		return errors.New("credential operation owner record is required")
-	}
-	if len(o) > ownerRecordMaxBytes {
-		return errors.New("credential operation owner record exceeds its limit")
 	}
 	return nil
 }
