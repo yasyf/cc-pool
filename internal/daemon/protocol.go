@@ -39,8 +39,6 @@ const ReadinessRoleID = "com.yasyf.cc-pool.runtime-readiness"
 type Op string
 
 const (
-	// OpHealth returns the exact ready daemon build through daemonkit's immutable observation route.
-	OpHealth Op = "cc-pool.runtime.health"
 	// OpSelect prepares an inspection for PID 0 or reserves a tracked launch for PID > 0.
 	OpSelect Op = "select"
 	// OpSelectCommit commits a provisional selection immediately before launch.
@@ -57,8 +55,19 @@ const (
 	OpAccountHealth Op = "account-health"
 	// OpAccountMutation starts or attaches to one daemon-owned credential workflow.
 	OpAccountMutation Op = "account-mutation"
+	// OpAccountMutationPoll pages one attachment's terminal replay cursor.
+	OpAccountMutationPoll Op = "account-mutation-poll"
 	// OpAccountMutationAck acknowledges one replayed terminal workflow receipt.
 	OpAccountMutationAck Op = "account-mutation-ack"
+)
+
+const (
+	// MaxPollWaitMillis is the protocol ceiling on a parked poll. A request
+	// asking for longer is refused at decode, so no attachment can pin a
+	// business slot past the drain budget.
+	MaxPollWaitMillis = 30_000
+	// PollPageChunks bounds one poll page's terminal chunks.
+	PollPageChunks = 16
 )
 
 // AccountMutationKind names one daemon-only account/credential workflow.
@@ -164,22 +173,36 @@ type Request struct {
 	// DeleteCredential controls whether account removal destroys its Keychain item.
 	DeleteCredential bool `json:"delete_credential,omitempty"`
 	// Mutation is required only for OpAccountMutation.
-	Mutation        *AccountMutationRequest `json:"mutation,omitempty"`
-	MutationReceipt *[32]byte               `json:"mutation_receipt,omitempty"`
+	Mutation *AccountMutationRequest `json:"mutation,omitempty"`
+	// MutationPoll is required only for OpAccountMutationPoll.
+	MutationPoll    *AccountMutationPollRequest `json:"mutation_poll,omitempty"`
+	MutationReceipt *[32]byte                   `json:"mutation_receipt,omitempty"`
 }
 
-// HealthRequest selects the exact v1 immutable daemon-health schema.
-type HealthRequest struct {
-	Schema uint16 `json:"schema"`
+// AccountMutationPollRequest pages one attachment's terminal replay cursor
+// under the fence StartOrAttach issued.
+type AccountMutationPollRequest struct {
+	Fence          AccountMutationFence `json:"fence"`
+	TerminalCursor uint64               `json:"terminal_cursor"`
+	WaitMillis     int                  `json:"wait_millis,omitempty"`
 }
 
-// HealthResponse is one exact daemon process-generation lifecycle snapshot.
+// AccountMutationPollResponse is one page of a terminal's replay. An empty
+// Chunks with the cursor unmoved is the honest answer to a poll that parked
+// and was released by the drain, a superseding poll, or the wait ceiling.
+type AccountMutationPollResponse struct {
+	Chunks     [][]byte             `json:"chunks,omitempty"`
+	NextCursor uint64               `json:"next_cursor"`
+	State      AccountMutationState `json:"state"`
+	Done       bool                 `json:"done,omitempty"`
+}
+
+// HealthResponse is the product's half of Health.Detail. daemonkit carries the
+// protocol, generation, and PID of the serving instance in Health itself, so
+// none of them is restated here.
 type HealthResponse struct {
 	Schema             uint16       `json:"schema"`
 	RuntimeBuild       string       `json:"runtime_build"`
-	RuntimeProtocol    int          `json:"runtime_protocol"`
-	ProcessGeneration  string       `json:"process_generation"`
-	PID                int          `json:"pid"`
 	State              RuntimeState `json:"state"`
 	Draining           bool         `json:"draining"`
 	Busy               bool         `json:"busy"`

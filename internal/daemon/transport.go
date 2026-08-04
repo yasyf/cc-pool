@@ -5,137 +5,110 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
-	"time"
 
-	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/version"
-	dkdaemon "github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/service"
-	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit"
 )
 
 var errHolderSessionLost = errors.New("daemon: FuseKit runtime session lost")
 
-const daemonHealthMaxResponse = 16 << 10
-
-func operationLadder() (wire.Ladder, error) {
-	server := map[wire.Op]time.Duration{
-		wire.Op(OpHealth):             1500 * time.Millisecond,
-		wire.Op(OpSelect):             selectRequestTimeout,
-		wire.Op(OpSelectCommit):       2 * time.Second,
-		wire.Op(OpSelectAbort):        2 * time.Second,
-		wire.Op(OpStatus):             4 * time.Second,
-		wire.Op(OpAccountRemove):      3 * time.Minute,
-		wire.Op(OpAccountIdentity):    31 * time.Second,
-		wire.Op(OpAccountHealth):      61 * time.Second,
-		wire.Op(OpAccountMutation):    30 * time.Minute,
-		wire.Op(OpAccountMutationAck): 2 * time.Second,
+// Handle dispatches one business request. The client's own deadline rides the
+// wire into ctx, so the retired per-op server ladder has no successor here:
+// each op's budget is the one its caller stated.
+func (s *Server) Handle(ctx context.Context, req daemonkit.Request) (daemonkit.Reply, error) {
+	op := Op(req.Op)
+	var request Request
+	if err := decodeStrict(req.Body, &request); err != nil {
+		return daemonkit.Reply{}, fmt.Errorf("decode %s request: %w", op, err)
 	}
-	client := map[wire.Op]time.Duration{
-		wire.Op(OpHealth):             2 * time.Second,
-		wire.Op(OpSelect):             selectConnTimeout,
-		wire.Op(OpSelectCommit):       3 * time.Second,
-		wire.Op(OpSelectAbort):        3 * time.Second,
-		wire.Op(OpStatus):             5 * time.Second,
-		wire.Op(OpAccountRemove):      4 * time.Minute,
-		wire.Op(OpAccountIdentity):    32 * time.Second,
-		wire.Op(OpAccountHealth):      62 * time.Second,
-		wire.Op(OpAccountMutation):    31 * time.Minute,
-		wire.Op(OpAccountMutationAck): 3 * time.Second,
-	}
-	return wire.NewLadder(server, client)
-}
-
-func (s *Server) runtime() (*wire.Server, *dkdaemon.Runtime, error) {
-	ladder, err := operationLadder()
-	if err != nil {
-		return nil, nil, err
-	}
-	policy, err := daemonTrustPolicy()
-	if err != nil {
-		return nil, nil, err
-	}
-	wireServer := &wire.Server{
-		WireBuild: WireBuild, Ladder: ladder,
-	}
-	for _, op := range []Op{
-		OpSelect,
-		OpSelectCommit,
-		OpSelectAbort,
-		OpStatus,
-		OpAccountRemove,
-		OpAccountIdentity,
-		OpAccountHealth,
-		OpAccountMutation,
-		OpAccountMutationAck,
-	} {
-		op := op
-		wireServer.Register(wire.HandlerSpec{Op: wire.Op(op), Concurrent: true, Handler: func(ctx context.Context, wireRequest wire.Request) (any, error) {
-			var request Request
-			if err := decodeStrict(wireRequest.Payload, &request); err != nil {
-				return nil, fmt.Errorf("decode %s request: %w", op, err)
-			}
-			request.Op = op
-			if op == OpAccountMutation {
-				return s.handleAccountMutationWire(ctx, wireRequest, request)
-			}
-			return s.dispatch(ctx, request), nil
-		}})
-	}
-	if s.m == nil || s.m.DisposableWorkers() == nil || s.m.RuntimeChildren() == nil {
-		return nil, nil, errors.New("daemon: runtime process ownership is unavailable")
-	}
-	runtime, err := wire.NewRuntime(wire.RuntimeConfig{
-		Socket: s.socket, RuntimeBuild: version.String(), RuntimeProtocol: int(wire.ProtocolVersion),
-		Wire: wireServer, TrustPolicy: policy,
-		StopControlStore: &proc.FileStore{Path: pool.DaemonStopControlStorePath()},
-		Observations:     []wire.ObservationRoute{s.daemonHealthRoute()}, ListenerWait: s.evictTimeout,
-		Workers: s.m.DisposableWorkers(), Children: s.m.RuntimeChildren(),
-		ShutdownTimeout: daemonShutdownTimeout,
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	s.runtimeShutdown = runtime.Shutdown
-	s.runtimeHealth = runtime.Health
-	return wireServer, runtime, nil
-}
-
-func (s *Server) daemonHealthRoute() wire.ObservationRoute {
-	return wire.ObservationRoute{
-		Op: wire.Op(OpHealth), MaxResponseBytes: daemonHealthMaxResponse,
-		Handler: s.daemonHealthObservation,
+	request.Op = op
+	switch op {
+	case OpSelect, OpSelectCommit, OpSelectAbort, OpStatus,
+		OpAccountRemove, OpAccountIdentity, OpAccountHealth,
+		OpAccountMutation, OpAccountMutationAck:
+		return reply(s.dispatch(ctx, request))
+	case OpAccountMutationPoll:
+		return s.handleAccountMutationPoll(ctx, req, request)
+	default:
+		return daemonkit.Reply{}, &daemonkit.ProductError{
+			Message: fmt.Sprintf("daemon: unknown operation %q", req.Op),
+		}
 	}
 }
 
-func (s *Server) daemonHealthObservation(ctx context.Context, request wire.ObservationRequest) (wire.ObservationResponse, error) {
-	if err := ctx.Err(); err != nil {
-		return wire.ObservationResponse{}, err
-	}
-	if request.Op != wire.Op(OpHealth) || request.Tenant != "" {
-		return wire.ObservationResponse{}, errors.New("daemon health observation route is not exact")
-	}
-	var body HealthRequest
-	if err := decodeStrict(request.Payload, &body); err != nil {
-		return wire.ObservationResponse{}, fmt.Errorf("decode daemon health observation: %w", err)
-	}
-	if body.Schema != DaemonHealthSchema {
-		return wire.ObservationResponse{}, fmt.Errorf("daemon health schema %d is not exact", body.Schema)
-	}
-	if s.runtimeHealth == nil {
-		return wire.ObservationResponse{}, errors.New("daemon runtime health is unavailable")
-	}
-	health, err := s.runtimeHealth(ctx)
+func reply(response Response) (daemonkit.Reply, error) {
+	body, err := json.Marshal(response)
 	if err != nil {
-		return wire.ObservationResponse{}, fmt.Errorf("read daemon runtime health: %w", err)
+		return daemonkit.Reply{}, fmt.Errorf("encode daemon response: %w", err)
 	}
-	snapshot, err := daemonHealthSnapshot(health)
-	if err != nil {
-		return wire.ObservationResponse{}, fmt.Errorf("project daemon runtime health: %w", err)
+	return daemonkit.Reply{Body: body}, nil
+}
+
+// Drain stops admitting work and joins every saga goroutine. The join is
+// unconditional across every cleanup error: a successor may only claim this
+// generation's owner-keyed rows once no saga of ours can still write one, and
+// Serve holds the flock until this returns.
+func (s *Server) Drain(budget daemonkit.Budget) error {
+	ctx, cancel := budget.Context(context.Background())
+	defer cancel()
+	s.markClosing()
+	s.runtimePublished.Store(false)
+	s.cancelHolderMonitor()
+	s.execMu.Lock()
+	execCancel := s.execCancel
+	s.execMu.Unlock()
+	if execCancel != nil {
+		execCancel()
+	}
+	var result error
+	if s.accountTerminals != nil {
+		result = errors.Join(result, s.accountTerminals.Close(ctx))
+	}
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		result = errors.Join(result, fmt.Errorf("daemon: await product workers: %w", ctx.Err()))
+	}
+	return result
+}
+
+// Close releases the store and the holder session, after Drain proved no saga
+// still holds either.
+func (s *Server) Close(budget daemonkit.Budget) error {
+	ctx, cancel := budget.Context(context.Background())
+	defer cancel()
+	var result error
+	if s.syncClient != nil {
+		result = errors.Join(result, s.syncClient.Close())
+		s.syncClient = nil
+	}
+	if s.tenantClient != nil {
+		s.holderActive.Store(false)
+		result = errors.Join(result, s.tenantClient.Close(ctx))
+	}
+	if s.m != nil {
+		result = errors.Join(result, s.m.Close())
+	}
+	s.clearActivation()
+	s.m = nil
+	return result
+}
+
+// publishHealth hands daemonkit the product's half of Health.Detail. Readers
+// reach it through Control.Health, which answers during the drain too.
+func (s *Server) publishHealth() {
+	if s.report == nil {
+		return
+	}
+	snapshot := HealthResponse{
+		Schema: DaemonHealthSchema, RuntimeBuild: version.String(),
+		State: RuntimeStateHealthy,
+		Ready: s.runtimePublished.Load(), Draining: s.closing.Load(),
 	}
 	if s.cl != nil {
 		counts := s.cl.liveCounts()
@@ -143,72 +116,23 @@ func (s *Server) daemonHealthObservation(ctx context.Context, request wire.Obser
 		snapshot.ExclusiveClaims = counts.exclusive
 	}
 	if s.m != nil && s.m.Store != nil {
-		snapshot.ActiveSessions, err = s.m.Store.ActiveSessionTotal()
+		sessions, err := s.m.Store.ActiveSessionTotal()
 		if err != nil {
-			return wire.ObservationResponse{}, fmt.Errorf("count active sessions: %w", err)
+			snapshot.State = RuntimeStateDegraded
 		}
+		snapshot.ActiveSessions = sessions
 	}
-	payload, err := json.Marshal(snapshot)
+	detail, err := json.Marshal(snapshot)
 	if err != nil {
-		return wire.ObservationResponse{}, fmt.Errorf("encode daemon health observation: %w", err)
+		return
 	}
-	return wire.ObservationResponse{Payload: payload}, nil
+	s.report(detail)
 }
 
-func daemonHealthSnapshot(health dkdaemon.Health) (HealthResponse, error) {
-	state, err := daemonRuntimeStateFromDaemon(health.State)
-	if err != nil {
-		return HealthResponse{}, err
-	}
-	return HealthResponse{
-		Schema: DaemonHealthSchema, RuntimeBuild: health.RuntimeBuild, RuntimeProtocol: health.RuntimeProtocol,
-		ProcessGeneration: health.ProcessGeneration.String(), PID: health.PID, State: state,
-		Draining: health.Draining, Busy: health.Busy, Ready: health.Ready,
-	}, nil
-}
-
-func daemonRuntimeStateFromDaemon(state dkdaemon.State) (RuntimeState, error) {
-	switch state {
-	case dkdaemon.StateHealthy:
-		return RuntimeStateHealthy, nil
-	case dkdaemon.StateDegraded:
-		return RuntimeStateDegraded, nil
-	case dkdaemon.StateFailed:
-		return RuntimeStateFailed, nil
-	default:
-		return "", fmt.Errorf("daemon runtime state %q is not exact", state)
-	}
-}
-
-var currentServiceExecutable = service.CanonicalExecutable
-
-// CurrentServiceExecutable returns the exact resolved binary installed into launchd.
-func CurrentServiceExecutable() (string, error) {
-	rolePath, err := currentServiceExecutable()
-	if err != nil {
-		return "", fmt.Errorf("resolve current ccp executable: %w", err)
-	}
-	if !filepath.IsAbs(rolePath) || filepath.Clean(rolePath) != rolePath {
-		return "", fmt.Errorf("current ccp executable %q is not exact and absolute", rolePath)
-	}
-	return rolePath, nil
-}
-
-func daemonTrustPolicy() (trust.TrustPolicy, error) {
-	requirement := trust.Requirement{TeamID: ServiceTeamID, SigningIdentifier: ServiceRoleID}
-	return trust.NewTrustPolicy(trust.TrustPolicyConfig{
-		ExpectedUID: os.Geteuid(), AllowUnprotected: true,
-		Roles: map[trust.PeerRole]trust.Requirement{
-			trust.PeerRole(StopRoleID):      requirement,
-			trust.PeerRole(ReceiptRoleID):   requirement,
-			trust.PeerRole(ReadinessRoleID): requirement,
-		},
-		StopRoles:      []trust.PeerRole{trust.PeerRole(StopRoleID)},
-		ReceiptRoles:   []trust.PeerRole{trust.PeerRole(ReceiptRoleID)},
-		ReadinessRoles: []trust.PeerRole{trust.PeerRole(ReadinessRoleID)},
-	})
-}
-
+// startProductRuntime opens business admission in the one order the exclusion
+// argument needs: the owner is minted, the cross-era gate has already proven
+// no pre-cut daemon survives, foreign lanes are claimed, retired mutations are
+// recovered, and only then does the scheduler run.
 func (s *Server) startProductRuntime(ctx context.Context) error {
 	execCtx, cancel := context.WithCancel(ctx)
 	s.execMu.Lock()
@@ -227,9 +151,9 @@ func (s *Server) startProductRuntime(ctx context.Context) error {
 		cancel()
 		return errors.New("FuseKit runtime session monitor is unavailable")
 	}
-	if err := s.m.RecoverRetiredCredentialOwners(execCtx); err != nil {
+	if err := s.m.ClaimForeignLanes(execCtx); err != nil {
 		cancel()
-		return fmt.Errorf("recover retired credential owners: %w", err)
+		return fmt.Errorf("claim foreign credential lanes: %w", err)
 	}
 	s.log.Printf("daemon %s started; socket=%s", version.String(), s.socket)
 	s.wg.Add(1)

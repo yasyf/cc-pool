@@ -76,7 +76,7 @@ func canonicalSchema(path string) ([]byte, error) {
 		}
 	}
 	reachable := make(map[string]bool)
-	queue := []string{"Request", "Response", "HealthRequest", "HealthResponse"}
+	queue := []string{"Request", "Response", "HealthResponse"}
 	for len(queue) > 0 {
 		name := queue[0]
 		queue = queue[1:]

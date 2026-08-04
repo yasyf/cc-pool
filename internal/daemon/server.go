@@ -50,10 +50,6 @@ const (
 // reservation lifetime and the outer request deadline.
 const preflightTimeout = 8 * time.Second
 
-// defaultEvictTimeout bounds how long a starting daemon waits for a
-// version-skewed holder to release the socket after being told to step down.
-const defaultEvictTimeout = 5 * time.Second
-
 const (
 	daemonShutdownTimeout = 30 * time.Second
 	accountTerminalLimit  = 4
@@ -66,9 +62,6 @@ type Server struct {
 	syncSocket string // synckit consumer socket; tests point it into a short temp dir
 	snapshot   string // status mirror path; tests point it into a temp dir
 	log        *log.Logger
-
-	// evictTimeout bounds the wait for a skewed holder to release the socket.
-	evictTimeout time.Duration
 
 	// wg tracks product background loops canceled by the activation lifetime.
 	wg sync.WaitGroup
@@ -118,17 +111,18 @@ type Server struct {
 	// select may not have exec'd its claude yet.
 	startedAt time.Time
 
-	tenantClient                  *tenantfs.ControlClient
-	tenantCoordinator             *tenantCoordinator
-	sessionLeases                 sessionLeaseManager
-	holderSessionDone             <-chan struct{}
-	holderMonitorMu               sync.Mutex
-	holderMonitorCancel           context.CancelFunc
-	holderActive                  atomic.Bool
-	holderLost                    atomic.Bool
-	runtimePublished              atomic.Bool
-	runtimeShutdown               func(context.Context) error
-	runtimeHealth                 func(context.Context) (dkdaemon.Health, error)
+	tenantClient        *tenantfs.ControlClient
+	tenantCoordinator   *tenantCoordinator
+	sessionLeases       sessionLeaseManager
+	holderSessionDone   <-chan struct{}
+	holderMonitorMu     sync.Mutex
+	holderMonitorCancel context.CancelFunc
+	holderActive        atomic.Bool
+	holderLost          atomic.Bool
+	runtimePublished    atomic.Bool
+	runtimeShutdown     func(context.Context) error
+	// report publishes the product's half of Health.Detail; Start captures it.
+	report                        func([]byte)
 	bootstrapMu                   sync.Mutex
 	bootstrap                     bootstrapState
 	prepareAccount                func(context.Context, store.Account, tenantfs.PreparationLease) (catalogproto.TenantPreparationProof, error)
@@ -174,14 +168,13 @@ func Run(ctx context.Context) error {
 		return err
 	}
 	s := &Server{
-		socket:       pool.SocketPath(),
-		syncSocket:   pool.SyncSocketPath(),
-		snapshot:     pool.StatusSnapshotPath(),
-		log:          log.New(os.Stderr, "[cc-pool] ", log.LstdFlags),
-		evictTimeout: defaultEvictTimeout,
-		startedAt:    time.Now(),
-		cl:           newClaims(),
-		led:          newLedgers(),
+		socket:     pool.SocketPath(),
+		syncSocket: pool.SyncSocketPath(),
+		snapshot:   pool.StatusSnapshotPath(),
+		log:        log.New(os.Stderr, "[cc-pool] ", log.LstdFlags),
+		startedAt:  time.Now(),
+		cl:         newClaims(),
+		led:        newLedgers(),
 	}
 	return s.serve(ctx)
 }

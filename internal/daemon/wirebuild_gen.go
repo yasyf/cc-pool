@@ -4,4 +4,4 @@ package daemon
 
 import "github.com/yasyf/daemonkit"
 
-const RuntimeSchema daemonkit.Schema = "com.yasyf.cc-pool.control/986fb1a10bd56a40369530da493bbb469178dffe045250558f3d7f16d2f18390/v2"
+const RuntimeSchema daemonkit.Schema = "com.yasyf.cc-pool.control/c727c0633413001b186b670d506672d270a9f7d82b10efcc2422bace03bdeb5a/v2"
