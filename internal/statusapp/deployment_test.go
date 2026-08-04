@@ -377,6 +377,65 @@ func TestRequireActiveServiceRetriesTheBracketForAHolderStartedMidObservation(t 
 	}
 }
 
+// TestRequireActiveServiceSpendsAStatedDeadlineOnMoreObservations pins the
+// observation timeout as a cap on one window rather than a ceiling on the
+// whole wait: a holder that only publishes readiness after the first window
+// expires is still accepted when the caller's own deadline affords a second
+// bracket, and refused when it does not.
+func TestRequireActiveServiceSpendsAStatedDeadlineOnMoreObservations(t *testing.T) {
+	const observationWindow = 20 * time.Millisecond
+	tests := []struct {
+		name         string
+		deadline     time.Duration
+		wantRefusal  string
+		observations int
+	}{
+		{"a deadline past one window buys a second observation", 5 * time.Second, "", 2},
+		{"a deadline inside one window stops at the first", observationWindow / 2, "require the live FuseKit runtime", 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			observations := 0
+			swapDeploymentVar(t, &tenantLaneReady, func(ctx context.Context) (daemonkit.Health, error) {
+				observations++
+				window, cancel := context.WithTimeout(ctx, observationWindow)
+				defer cancel()
+				if observations > 1 {
+					return daemonkit.Health{Phase: daemonkit.PhaseReady, PID: 4242}, nil
+				}
+				<-window.Done()
+				return daemonkit.Health{}, window.Err()
+			})
+			swapDeploymentVar(t, &deployInventory, func(...string) (deploy.Survivors, error) {
+				return deploy.Survivors{Live: []deploy.LiveProcess{{PID: 4242, Start: 2, Boot: 1}}}, nil
+			})
+			ctx, cancel := context.WithTimeout(t.Context(), tt.deadline)
+			defer cancel()
+
+			err := RequireActiveService(ctx)
+			if tt.wantRefusal == "" && err != nil {
+				t.Fatalf("holder ready on the second observation = %v, want the stated deadline to buy it", err)
+			}
+			if tt.wantRefusal != "" && (err == nil || !strings.Contains(err.Error(), tt.wantRefusal)) {
+				t.Fatalf("exhausted deadline = %v, want a refusal carrying %q", err, tt.wantRefusal)
+			}
+			if observations != tt.observations {
+				t.Fatalf("observations = %d, want %d", observations, tt.observations)
+			}
+		})
+	}
+}
+
+func TestReadinessBudgetAffordsTwoCompleteObservations(t *testing.T) {
+	floor := 2*holderbridge.ReadinessContract().ObservationTimeout() + bracketRetryCadence
+	if budget := readinessBudget(); budget <= floor {
+		t.Fatalf(
+			"readiness budget %v does not exceed two observation windows paced by the retry cadence (%v)",
+			budget, floor,
+		)
+	}
+}
+
 func swapDeploymentVar[T any](t *testing.T, target *T, replacement T) {
 	t.Helper()
 	previous := *target

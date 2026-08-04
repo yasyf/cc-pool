@@ -37,12 +37,14 @@ var (
 	installedAppPath    = pool.WidgetAppPath
 	deployInventory     = deploy.Inventory
 	// readinessBudget is this package's default deadline for the whole
-	// bracket-retry observation when the caller stated none: two full
-	// readiness observations under the fleet contract, so one legitimate
-	// slow start and one mid-bracket restart both converge inside it, while
-	// a copy that can never pin is refused instead of retried forever.
+	// bracket-retry observation when the caller stated none: two complete
+	// observation windows under the fleet contract, the cadence that paces
+	// them, and one cadence of headroom — so one legitimate slow start and
+	// one mid-bracket restart both converge inside it, while a copy that can
+	// never pin is refused instead of retried forever. A caller that states a
+	// longer deadline buys more observations, never a longer one.
 	readinessBudget = func() time.Duration {
-		return 2 * holderbridge.ReadinessContract().ObservationTimeout()
+		return 2*holderbridge.ReadinessContract().ObservationTimeout() + 2*bracketRetryCadence
 	}
 	tenantLaneReady = func(ctx context.Context) (daemonkit.Health, error) {
 		client, err := daemonkit.Open(observerTenantDaemon())
@@ -126,11 +128,14 @@ const bracketRetryCadence = 250 * time.Millisecond
 // that must both pin the answering PID to one process instance
 // ({Start, Boot}): only a stable signed, inventory-pinned instance succeeds.
 // Everything short of that retries the complete bracket within ctx — a
-// holder appearing mid-observation, disappearing and being replaced, and
-// re-pinning under a reused PID are one family of legitimate launchd restart
-// transients, refused only when ctx runs out, never admitted early. A caller
-// that states no deadline gets the package's readiness budget, so a
-// persistent mismatch refuses instead of retrying forever.
+// holder appearing mid-observation, disappearing and being replaced,
+// re-pinning under a reused PID, and failing to publish readiness inside one
+// observation window are one family of legitimate launchd restart transients,
+// refused only when ctx runs out, never admitted early. The contract's
+// observation timeout caps one window, never the whole wait: a caller stating
+// a longer deadline spends it on further complete brackets. A caller that
+// states no deadline gets the package's readiness budget, so a persistent
+// mismatch refuses instead of retrying forever.
 func RequireActiveService(ctx context.Context) error {
 	ctx, cancel := budgeted(ctx, readinessBudget())
 	defer cancel()
@@ -142,7 +147,10 @@ func RequireActiveService(ctx context.Context) error {
 	for {
 		health, err := tenantLaneReady(ctx)
 		if err != nil {
-			return fmt.Errorf("CCPoolStatus: require the live FuseKit runtime: %w", err)
+			if !errors.Is(err, context.DeadlineExceeded) || !awaitBracketRetry(ctx) {
+				return fmt.Errorf("CCPoolStatus: require the live FuseKit runtime: %w", err)
+			}
+			continue
 		}
 		after, err := deployInventory(executable)
 		if err != nil {
@@ -154,14 +162,24 @@ func RequireActiveService(ctx context.Context) error {
 			return nil
 		}
 		before = after
-		select {
-		case <-ctx.Done():
+		if !awaitBracketRetry(ctx) {
 			return fmt.Errorf(
 				"CCPoolStatus: the process serving the tenant lane (pid %d) does not run the installed application",
 				health.PID,
 			)
-		case <-time.After(bracketRetryCadence):
 		}
+	}
+}
+
+// awaitBracketRetry paces the next complete bracket and reports whether ctx
+// still affords one. A ctx already done takes the refusal immediately: the
+// cadence is never ready before Done on the very first select.
+func awaitBracketRetry(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(bracketRetryCadence):
+		return true
 	}
 }
 
