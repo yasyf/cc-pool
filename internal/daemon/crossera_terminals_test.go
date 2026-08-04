@@ -106,7 +106,7 @@ func TestSweepLegacyAccountTerminalsRefusesWhileRecordsRemain(t *testing.T) {
 			}
 
 			command := advertisedRecovery(t, refusal)
-			output, err := exec.Command("/bin/sh", "-c", command).CombinedOutput()
+			output, err := exec.Command("/bin/sh", "-c", command).CombinedOutput() //nolint:gosec // G204 flags command: handing the advertised recovery to a shell verbatim is the assertion — an unquoted home path has to fail here.
 			if err != nil {
 				t.Fatalf("advertised recovery %s = %v: %s", command, err, output)
 			}
