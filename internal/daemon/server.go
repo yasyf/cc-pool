@@ -198,7 +198,7 @@ func Run(ctx context.Context) error {
 		return err
 	}
 	defer func() { _ = legacyLock.Close() }()
-	if err := sweepLegacyAccountTerminals(ctx); err != nil {
+	if err := sweepLegacyAccountTerminals(); err != nil {
 		return err
 	}
 	s := &Server{

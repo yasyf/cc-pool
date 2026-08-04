@@ -38,12 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The first launch after upgrading from `0.64.x` retires the previous service
   registration and takes over the legacy socket lock before claiming any work,
   so it replaces a running legacy daemon rather than racing it. If a crashed
-  `0.64.x` daemon left an interactive `claude auth login` still running, the
-  new daemon refuses to start rather than let that login overwrite credentials
-  it manages: the log names the surviving process and the exact `kill` command
-  to end it, and the daemon keeps retrying and starts on its own once the
-  process is gone. It never ends the login itself — you may be in the middle of
-  it. Both checks happen once per machine.
+  `0.64.x` daemon left tracked interactive `claude auth login` terminals
+  behind, the first launch refuses to start rather than risk a surviving login
+  overwriting credentials it manages: the log names the exact command that
+  clears the old terminal ledger once you have confirmed no login window is
+  open, and the daemon retries automatically and starts once it is cleared.
+  It never ends a login itself — you may be in the middle of one. Both checks
+  happen once per machine.
 - The sync helper runs as a resident service on its own socket, addressed by
   the service it registers rather than by a path the pool computes.
 
