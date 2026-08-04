@@ -135,8 +135,7 @@ func TestApplyPackagedAppInstallsAndActivatesTheExactCandidate(t *testing.T) {
 			controller.installCalls, controller.supersedeCalls, controller.activateCalls,
 		)
 	}
-	if receipt.ConsumerBuild == "" || receipt.Generation != installed ||
-		receipt.Activation.Generation != installed {
+	if receipt.Generation != installed || receipt.Activation.Generation != installed {
 		t.Fatalf("receipt = %#v", receipt)
 	}
 	if err := receipt.Rollback(t.Context()); err != nil {

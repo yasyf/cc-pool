@@ -34,12 +34,11 @@ var (
 	installedAppPath    = pool.WidgetAppPath
 )
 
-// ServiceInstallReceipt binds one landed generation to the updater build that
-// applied it and to the activation that proved its runtime live.
+// ServiceInstallReceipt binds one landed generation to the activation that
+// proved its runtime live.
 type ServiceInstallReceipt struct {
-	ConsumerBuild string
-	Generation    deploy.Generation
-	Activation    deploy.Activation
+	Generation deploy.Generation
+	Activation deploy.Activation
 }
 
 // Rollback is idempotent because deploy settles every outstanding swap before
@@ -49,10 +48,6 @@ func (ServiceInstallReceipt) Rollback(context.Context) error { return nil }
 // ApplyPackagedApp installs or upgrades one exact packaged signed application candidate.
 func ApplyPackagedApp(ctx context.Context, candidateSourcePath string) (ServiceInstallReceipt, error) {
 	appVersion, err := statusAppVersion()
-	if err != nil {
-		return ServiceInstallReceipt{}, err
-	}
-	consumerBuild, err := holderbridge.DeploymentIdentity()
 	if err != nil {
 		return ServiceInstallReceipt{}, err
 	}
@@ -82,9 +77,7 @@ func ApplyPackagedApp(ctx context.Context, candidateSourcePath string) (ServiceI
 	if !sameApplicationBytes(activation.Generation, generation) {
 		return ServiceInstallReceipt{}, errors.New("CCPoolStatus: activation does not prove the landed generation")
 	}
-	return ServiceInstallReceipt{
-		ConsumerBuild: consumerBuild, Generation: generation, Activation: activation,
-	}, nil
+	return ServiceInstallReceipt{Generation: generation, Activation: activation}, nil
 }
 
 // RequireActiveService converges the exact installed application and proves its live FuseKit runtime ready.

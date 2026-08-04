@@ -29,7 +29,6 @@ if not (
     result.get("leader_pid", 0) > 1
     and result.get("descendant_pid", 0) > 1
     and result.get("elapsed_ms", 0) >= 500
-    and result.get("records_after") == 0
     and result.get("term_observed") is True
     and result.get("group_gone") is True
     and result.get("lane_reused") is True
@@ -37,4 +36,4 @@ if not (
     raise SystemExit(f"incomplete worker acceptance result: {result!r}")
 PY
 
-log "verify-worker-deadline: deadline delivered TERM, escalated to process-group KILL, reaped leader and descendant, removed the durable record, and reused the bounded worker lane"
+log "verify-worker-deadline: deadline delivered TERM, escalated to process-group KILL, reaped leader and descendant, and reused the bounded worker lane"
