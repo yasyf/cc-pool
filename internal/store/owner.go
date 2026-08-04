@@ -60,3 +60,10 @@ func (o OwnerRecord) Validate() error {
 	}
 	return nil
 }
+
+func ownerPredicate(owned bool) string {
+	if owned {
+		return "owner_record=?"
+	}
+	return "owner_record<>?"
+}

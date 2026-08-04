@@ -748,9 +748,9 @@ func (s *Store) credentialOperationsPage(
 	rows, err := s.db.Query(
 		`SELECT `+operationSelectColumns+`
 		 FROM credential_operations
-		 WHERE (owner_record=?)=? AND account_id>?
+		 WHERE `+ownerPredicate(owned)+` AND account_id>?
 		 ORDER BY account_id LIMIT ?`,
-		[]byte(owner), owned, afterAccountID, limit+1,
+		[]byte(owner), afterAccountID, limit+1,
 	)
 	if err != nil {
 		return nil, false, err

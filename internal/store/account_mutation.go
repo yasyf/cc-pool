@@ -551,9 +551,9 @@ func (s *Store) accountMutationsPage(
 	}
 	rows, err := s.db.Query(
 		`SELECT `+accountMutationColumns+` FROM account_mutations
-		 WHERE (owner_record=?)=? AND account_id>?
+		 WHERE `+ownerPredicate(owned)+` AND account_id>?
 		 ORDER BY account_id LIMIT ?`,
-		[]byte(owner), owned, afterAccountID, limit+1,
+		[]byte(owner), afterAccountID, limit+1,
 	)
 	if err != nil {
 		return nil, false, err

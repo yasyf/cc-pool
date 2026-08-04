@@ -349,11 +349,11 @@ func (s *Store) pendingAddReservationsPage(
 	}
 	rows, err := s.db.Query(
 		`SELECT id,instance_id,generation,owner_record,created_at FROM pending_adds
-		 WHERE (owner_record=?)=? AND id>?
+		 WHERE `+ownerPredicate(owned)+` AND id>?
 		 AND NOT EXISTS (SELECT 1 FROM account_mutations WHERE account_id=pending_adds.id AND account_instance_id=pending_adds.instance_id AND account_generation=pending_adds.generation)
 		 AND NOT EXISTS (SELECT 1 FROM account_mutation_receipts WHERE account_id=pending_adds.id AND account_instance_id=pending_adds.instance_id AND account_generation=pending_adds.generation)
 		 ORDER BY id LIMIT ?`,
-		[]byte(owner), owned, afterAccountID, limit+1,
+		[]byte(owner), afterAccountID, limit+1,
 	)
 	if err != nil {
 		return nil, false, err
