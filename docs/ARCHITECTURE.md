@@ -68,8 +68,9 @@ new generation, and recovers or rolls back every durable phase. `ccp package uni
 likewise delegates quiescence and canonical removal to daemonkit's sealed transaction.
 
 The same app owns the File Provider broker endpoint in App Group `SXKCTF23Q2.ccp`.
-`CCPoolFileProvider.appex` reaches only that broker. The app forwards catalog traffic to
-the ordinary `~/.cc-pool/fusekit/fusekit.sock` endpoint; the pure-Go cc-pool account daemon
+`CCPoolFileProvider.appex` reaches only that broker. The app forwards catalog traffic over
+the spawn channel it inherits, delegating each accepted extension connection up to the
+holder rather than dialing an endpoint of its own; the pure-Go cc-pool account daemon
 never resolves, names, binds, dials, or traverses the Group Container. Host and extension
 signatures, Team ID, hardened runtime, provisioning, and entitlements are release gates.
 There is no second signed daemon identity and no direct home-directory exception in the

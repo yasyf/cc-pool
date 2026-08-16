@@ -15,9 +15,6 @@ func TestFuseKitPathsArePrivate(t *testing.T) {
 	if got := FuseKitRuntimeDir(); got != runtime {
 		t.Fatalf("FuseKitRuntimeDir() = %q, want %q", got, runtime)
 	}
-	if got := FuseKitSocketPath(); got != filepath.Join(runtime, "fusekit.sock") {
-		t.Fatalf("FuseKitSocketPath() = %q", got)
-	}
 	backing := filepath.Join(runtime, "backing")
 	if got := FuseKitBackingRoot(); got != backing {
 		t.Fatalf("FuseKitBackingRoot() = %q, want %q", got, backing)

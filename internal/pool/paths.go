@@ -54,9 +54,6 @@ func statePath(elements ...string) string {
 // FuseKitRuntimeDir is the consumer-owned private FuseKit runtime directory.
 func FuseKitRuntimeDir() string { return statePath("fusekit") }
 
-// FuseKitSocketPath is the exact persistent runtime session socket.
-func FuseKitSocketPath() string { return filepath.Join(FuseKitRuntimeDir(), "fusekit.sock") }
-
 // DaemonServiceStatePath is the cc-pool LaunchAgent controller's durable desired state.
 func DaemonServiceStatePath() string { return statePath("daemon-services.db") }
 

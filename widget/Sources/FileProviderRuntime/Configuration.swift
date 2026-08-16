@@ -9,24 +9,8 @@ enum CCPoolFileProviderConfiguration {
     socketLeaf: "fusekit.sock"
   )
 
-  static var realHome: String {
-    if let pw = getpwuid(getuid()), let dir = pw.pointee.pw_dir {
-      return String(cString: dir)
-    }
-    return NSHomeDirectory()
-  }
-
-  static var holderSocketPath: String {
-    URL(fileURLWithPath: realHome, isDirectory: true)
-      .appendingPathComponent(".cc-pool/fusekit/fusekit.sock", isDirectory: false)
-      .path
-  }
-
   static var brokerConfiguration: CatalogBroker.Configuration {
-    .init(
-      appGroupEndpoint: appGroupEndpoint,
-      daemonSocketPath: holderSocketPath
-    )
+    .init(appGroupEndpoint: appGroupEndpoint)
   }
 
   static func makeRuntime(
