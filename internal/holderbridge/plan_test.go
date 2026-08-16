@@ -35,9 +35,12 @@ func TestRuntimeTrustPinsBothLanes(t *testing.T) {
 	const requiredAppGroup = "ABCDE12345.ccp"
 	trust := RuntimeTrust(requiredAppGroup)
 	controller := trust.Controller
-	if controller.TeamID != TeamID || controller.SigningIdentifier != BundleID ||
+	if controller.TeamID != TeamID || controller.SigningIdentifier != controllerBundleID ||
 		controller.RequiredAppGroup != "" || controller.RequiredEntitlements != nil {
 		t.Fatalf("controller requirement = %#v", controller)
+	}
+	if controller.SigningIdentifier == BundleID {
+		t.Fatal("controller requirement pins the app, which never opens a control session")
 	}
 	extension := trust.FileProviderExtension
 	if extension.TeamID != TeamID || extension.SigningIdentifier != fileProviderBundleID ||

@@ -17,6 +17,10 @@ const (
 
 const fileProviderBundleID = "com.yasyf.cc-pool.status.fileprovider"
 
+// Control's only peer is the Homebrew CLI; the app drives its runtime in process and opens no wire
+// session, so pinning the app's identity here rejects the lane the requirement exists to protect.
+const controllerBundleID = "com.yasyf.cc-pool"
+
 const runtimePolicyDigest daemonkit.PolicyDigest = "cca1c08f02957912b419b602a6c4b943b8ef9d65906c7b5f3d38d29d2633b838"
 
 // Application returns cc-pool's exact fixed signed application identity.
@@ -37,7 +41,7 @@ func ReadinessContract() holder.ReadinessContract { return holder.StandardReadin
 // RuntimeTrust returns the signed peers admitted to FuseKit's two trust lanes.
 func RuntimeTrust(requiredAppGroup string) holder.RuntimeTrust {
 	return holder.RuntimeTrust{
-		Controller: daemonkit.Requirement{TeamID: TeamID, SigningIdentifier: BundleID},
+		Controller: daemonkit.Requirement{TeamID: TeamID, SigningIdentifier: controllerBundleID},
 		FileProviderExtension: daemonkit.Requirement{
 			TeamID: TeamID, SigningIdentifier: fileProviderBundleID, RequiredAppGroup: requiredAppGroup,
 		},

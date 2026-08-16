@@ -6,6 +6,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.65.1] - 2026-08-16
+
+### Fixed
+- `ccp package install` no longer fails with `peer failed trust verification:
+  wire: untrusted peer`. The FuseKit runtime admitted only the status app's
+  signing identity on its control lane, but the app drives its runtime in
+  process and never opens a wire session — the lane's only peer is the Homebrew
+  CLI, signed `com.yasyf.cc-pool`, so the runtime rejected the one caller the
+  requirement exists to protect. On a machine with no app installed this
+  surfaced late, at `activate installed application`, after the app, the
+  LaunchAgent, and the running job had all landed correctly; `ccp init` and
+  `ccp doctor` then reported a healthy pool, because nothing outside deploy's
+  own idempotency check reads the activation record that was never sealed. The
+  same rejection blocks every subsequent install outright, at
+  `land packaged candidate`: superseding an installed app drains the running
+  daemon over that same refused lane, and deploy's session-less fallback covers
+  only a draining or absent peer. Upgrades were unreachable on any machine that
+  had installed `0.65.0`.
+
+  Installing `0.65.1` over `0.65.0` needs the old runtime booted out first,
+  since the `0.65.0` daemon still refuses the drain:
+  `launchctl bootout gui/$(id -u)/com.yasyf.cc-pool.status.fusekit`, then
+  `ccp package install`.
+
 ## [0.65.0] - 2026-08-04
 
 cc-pool moves to daemonkit v0.21. Credential ownership is fenced on an opaque
@@ -725,7 +749,8 @@ new owner records and stays broken until upgraded again.
   picked automatically when fuse-t is present); CI and release workflows.
 - License: PolyForm Noncommercial 1.0.0.
 
-[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.65.0...HEAD
+[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.65.1...HEAD
+[0.65.1]: https://github.com/yasyf/cc-pool/compare/v0.65.0...v0.65.1
 [0.65.0]: https://github.com/yasyf/cc-pool/compare/v0.64.9...v0.65.0
 [0.64.9]: https://github.com/yasyf/cc-pool/compare/v0.64.8...v0.64.9
 [0.64.8]: https://github.com/yasyf/cc-pool/compare/v0.64.6...v0.64.8
