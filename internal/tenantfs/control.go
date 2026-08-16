@@ -65,6 +65,11 @@ func (e *ControlRemoteError) Error() string {
 	return fmt.Sprintf("cc-pool holder: %s: %s", e.Code, e.Message)
 }
 
+// Unwrap re-derives the sentinel the holder classified into Code, so a caller
+// matches the rejection with errors.Is instead of its transported text. Only a
+// code naming exactly one fact carries a sentinel.
+func (e *ControlRemoteError) Unwrap() error { return controlSentinels[e.Code] }
+
 // ControlTransportError reports a daemonkit session outcome without replaying
 // a possibly dispatched mutation. Undispatched is true only when the transport
 // proved the request never reached the holder.
@@ -543,6 +548,10 @@ func controlErrorHeader(err error) controlHeader {
 		return controlHeader{Protocol: controlProtocol, Code: ControlErrorOK}
 	}
 	return controlHeader{Protocol: controlProtocol, Code: classifyControlError(err), Message: err.Error()}
+}
+
+var controlSentinels = map[ControlErrorCode]error{
+	ControlErrorNotFound: catalog.ErrNotFound,
 }
 
 func classifyControlError(err error) ControlErrorCode {

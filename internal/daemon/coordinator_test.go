@@ -1190,6 +1190,53 @@ func TestRetireReservedAccountRequiresExactFileProviderAbsenceProof(t *testing.T
 	}
 }
 
+func TestRetireReservedAccountAcceptsATenantProvisioningNeverCreated(t *testing.T) {
+	tests := []struct {
+		name      string
+		removeErr error
+		wantErr   bool
+	}{
+		{"absent tenant", catalog.ErrNotFound, false},
+		{"absent tenant over the holder lane", controlRemoteError(tenantfs.ControlErrorNotFound), false},
+		{"generation fence rejection", controlRemoteError(tenantfs.ControlErrorConflict), true},
+		{"unclassified rejection", controlRemoteError(tenantfs.ControlErrorFailed), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testhome.Sandbox(t, t.TempDir())
+			reservation := store.PendingAccountReservation{
+				ID: 9, InstanceID: "0123456789abcdef0123456789abcdef", Generation: 4,
+			}
+			runtime := &lifecycleRuntimeStub{
+				stateErr:  controlRemoteError(tenantfs.ControlErrorNotFound),
+				removeErr: tt.removeErr,
+			}
+			coordinator := newTenantCoordinator(t.Context(), nil, nil, runtime)
+			proof, err := coordinator.retireReservedAccount(t.Context(), reservation)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("retireReservedAccount(%v) = %+v, want the rejection reported", tt.removeErr, proof)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := pool.PendingAddRetirementProof{
+				AccountID: reservation.ID, AccountInstanceID: reservation.InstanceID,
+				AccountGeneration: reservation.Generation,
+				PublicPath:        pool.FileProviderConfigDir(reservation.ID),
+			}
+			if proof != want {
+				t.Fatalf("reserved retirement proof = %+v, want %+v", proof, want)
+			}
+			if runtime.removeExpected != reservation.Generation {
+				t.Fatalf("retirement expected generation = %d, want %d", runtime.removeExpected, reservation.Generation)
+			}
+		})
+	}
+}
+
 func TestOnDemandProvisioningCoalescesOneTenantGeneration(t *testing.T) {
 	const requests = 32
 	runtime := newBlockingLifecycleRuntime(requests)

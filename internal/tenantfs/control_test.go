@@ -3,6 +3,8 @@ package tenantfs
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -85,5 +87,28 @@ func TestTenantLaneCallStatesItsOwnBudgetForADeadlinelessCaller(t *testing.T) {
 			"lane call deadline = %v, want the lane's own %v budget stated at the call",
 			business.deadline, controlOperationTimeout,
 		)
+	}
+}
+
+func TestControlRemoteErrorCarriesItsCodeAsTheSentinelAndStatesTheFactOnce(t *testing.T) {
+	tests := []struct {
+		name       string
+		code       ControlErrorCode
+		message    string
+		wantAbsent bool
+	}{
+		{"absent", ControlErrorNotFound, catalog.ErrNotFound.Error(), true},
+		{"unclassified", ControlErrorFailed, "retire tenant: disk is full", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := &ControlRemoteError{Code: tt.code, Message: tt.message}
+			if got := errors.Is(err, catalog.ErrNotFound); got != tt.wantAbsent {
+				t.Fatalf("errors.Is(%v, catalog.ErrNotFound) = %t, want %t", err, got, tt.wantAbsent)
+			}
+			if got := strings.Count(err.Error(), tt.message); got != 1 {
+				t.Fatalf("%q states %q %d times, want 1", err, tt.message, got)
+			}
+		})
 	}
 }

@@ -460,12 +460,14 @@ func (c *tenantCoordinator) retireReservedAccount(
 		return pool.PendingAddRetirementProof{}, errors.New("reserved FuseKit tenant generation drifted")
 	}
 	retired, err := c.runtime.RetireTenant(ctx, tenantAccount, reservation.Generation)
-	if err != nil {
+	switch {
+	case err == nil:
+		if retired.Tenant != tenantID || retired.Generation != catalog.Generation(reservation.Generation) ||
+			!retired.FileProviderAbsent {
+			return pool.PendingAddRetirementProof{}, errors.New("retire reserved FuseKit tenant: invalid proof")
+		}
+	case !errors.Is(err, catalog.ErrNotFound):
 		return pool.PendingAddRetirementProof{}, fmt.Errorf("retire reserved FuseKit tenant: %w", err)
-	}
-	if retired.Tenant != tenantID || retired.Generation != catalog.Generation(reservation.Generation) ||
-		!retired.FileProviderAbsent {
-		return pool.PendingAddRetirementProof{}, errors.New("retire reserved FuseKit tenant: invalid proof")
 	}
 	c.forgetTenant(tenantID)
 	return pool.PendingAddRetirementProof{
