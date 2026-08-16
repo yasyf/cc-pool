@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.65.2] - 2026-08-16
+
+### Changed
+- Builds now use Go 1.26.6, which patches five standard-library advisories
+  reachable from cc-pool's own call graph: GO-2026-5972 (`encoding/asn1`),
+  GO-2026-6088 (`net/url`), GO-2026-6089 (`crypto/tls`), GO-2026-6090
+  (`net/http`), and GO-2026-6218 (`encoding/xml`). All five were published
+  against 1.26.5 after `0.65.0` shipped. The `go` directive stays at 1.26.5 so
+  consumers are not forced up.
+
 ## [0.65.1] - 2026-08-16
 
 ### Fixed
@@ -749,7 +759,8 @@ new owner records and stays broken until upgraded again.
   picked automatically when fuse-t is present); CI and release workflows.
 - License: PolyForm Noncommercial 1.0.0.
 
-[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.65.1...HEAD
+[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.65.2...HEAD
+[0.65.2]: https://github.com/yasyf/cc-pool/compare/v0.65.1...v0.65.2
 [0.65.1]: https://github.com/yasyf/cc-pool/compare/v0.65.0...v0.65.1
 [0.65.0]: https://github.com/yasyf/cc-pool/compare/v0.64.9...v0.65.0
 [0.64.9]: https://github.com/yasyf/cc-pool/compare/v0.64.8...v0.64.9

@@ -2,6 +2,8 @@ module github.com/yasyf/cc-pool
 
 go 1.26.5
 
+toolchain go1.26.6
+
 require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/huh v1.0.0
