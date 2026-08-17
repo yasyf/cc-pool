@@ -6,6 +6,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.66.0] - 2026-08-17
+
+### Fixed
+
+- `ccp add` provisions an account again. Since the daemonkit v0.21.3 migration
+  every add failed with `daemonkit: business session: context deadline
+  exceeded`, and no timeout was ever going to be long enough: the File Provider
+  broker could not start at all. The signed app was launched with the daemon's
+  socket path in its argv and compared it against a constant of its own, and
+  when that migration moved the daemon's socket the two stopped agreeing. The
+  app refused every broker it was handed — `daemonSocketMismatch` in
+  `~/.cc-pool/fusekit/broker.log` — so provisioning waited on a runtime that
+  was never coming up.
+
+  The broker now takes its sessions over the channel it inherits at spawn
+  (fusekit v1.17.0, daemonkit v0.22.0), so there is no path for the two sides
+  to disagree about, and none for another process on the account to bind first.
+  `holderSocketPath` is gone from the widget's configuration, as is
+  `pool.FuseKitSocketPath`, which nothing had called since the holder stopped
+  binding that path.
+
+- A rollback no longer buries the failure that caused it. Retiring a reserved
+  FuseKit tenant that provisioning never got around to creating reported
+  not-found, so the add reported its cleanup error alongside the real one —
+  `retire reserved FuseKit tenant: cc-pool holder: not_found: catalog: not
+  found: catalog: not found`. Already absent is the end state a retirement
+  wants, so it now succeeds, and `ControlRemoteError` carries the holder's
+  classification through `Unwrap` rather than only in its text.
+
 ## [0.65.2] - 2026-08-16
 
 ### Changed
@@ -759,7 +788,8 @@ new owner records and stays broken until upgraded again.
   picked automatically when fuse-t is present); CI and release workflows.
 - License: PolyForm Noncommercial 1.0.0.
 
-[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.65.2...HEAD
+[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.66.0...HEAD
+[0.66.0]: https://github.com/yasyf/cc-pool/compare/v0.65.2...v0.66.0
 [0.65.2]: https://github.com/yasyf/cc-pool/compare/v0.65.1...v0.65.2
 [0.65.1]: https://github.com/yasyf/cc-pool/compare/v0.65.0...v0.65.1
 [0.65.0]: https://github.com/yasyf/cc-pool/compare/v0.64.9...v0.65.0
