@@ -6,6 +6,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.68.0] - 2026-08-27
+
+### Fixed
+
+- **Requires fusekit v1.19.0, which stops the FuseKit holder wedging itself.**
+  fusekit drew every reap receipt's sequence from one counter shared by all
+  eight recovery IDs, while the catalog's source-owner floor demands strict
+  contiguity. One unclean holder exit with the catalog worker still tracked left
+  a hole in the source-owner sequence that nothing could close, and
+  `CCPoolStatus` then failed the same way on every start:
+
+  ```
+  CCPoolStatus: FuseKit runtime start failed: FuseKit runtime: daemon returned before readiness
+  FuseKit runtime: recover source-owner receipts: catalog: mutation id reused with different request
+  catalog: reap receipt acknowledgement is out of order
+  ```
+
+  Because `ccp daemon` requires a live tenants runtime and `CCPoolStatus`
+  provides it, the pool daemon cannot come up behind a wedged holder. One
+  machine crash-looped this way for six days, `~/.cc-pool/fusekit/holder.log`
+  reaching 108,651 lines.
+
+  v1.19.0 numbers each recovery ID separately and migrates an existing
+  `~/.cc-pool/fusekit/processes.db` in place. It does not repair a ledger that
+  already holds a gap: a holder still failing on `reap receipt acknowledgement
+  is out of order` after this upgrade needs `catalog.sqlite` and `processes.db`
+  removed together from `~/.cc-pool/fusekit/`, which rebuilds both from the
+  pool's own account state. Deleting either alone re-wedges on the other, and
+  neither file holds account data — accounts live in `~/.cc-pool/pool-v1.db`
+  and the Keychain.
+
+- **Requires fusekit v1.19.0's boot-session fix.** fusekit identified a boot by
+  rendering `kern.boottime`, which darwin slews as the clock is adjusted, so a
+  process record captured before an adjustment could be declared cross-boot and
+  retired without its PID ever being probed. A `CCPoolStatus` generation that
+  was still running could be retired under a live owner.
+
 ## [0.67.0] - 2026-08-26
 
 ### Changed
@@ -810,7 +847,8 @@ new owner records and stays broken until upgraded again.
   picked automatically when fuse-t is present); CI and release workflows.
 - License: PolyForm Noncommercial 1.0.0.
 
-[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.67.0...HEAD
+[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.68.0...HEAD
+[0.68.0]: https://github.com/yasyf/cc-pool/compare/v0.67.0...v0.68.0
 [0.67.0]: https://github.com/yasyf/cc-pool/compare/v0.66.0...v0.67.0
 [0.66.0]: https://github.com/yasyf/cc-pool/compare/v0.65.2...v0.66.0
 [0.65.2]: https://github.com/yasyf/cc-pool/compare/v0.65.1...v0.65.2
