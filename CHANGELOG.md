@@ -6,6 +6,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.67.0] - 2026-08-26
+
+### Changed
+
+- Requires daemonkit v0.23.0 and fusekit v1.18.0, which move every daemon's
+  private state from `~/.daemonkit/agents/<Label>` to `~/.daemonkit/a/<Label>`.
+  daemonkit v0.22.0's root spent 18 of the 103 bytes darwin's `sun_path` leaves
+  a socket path, which put cc-orchestrate's pty daemons one byte over the limit
+  under a long account name; the byte comes out of the root rather than out of
+  any consumer's label.
+
+  Both of cc-pool's daemons — `com.yasyf.cc-pool` and the FuseKit status holder
+  `com.yasyf.cc-pool.status.fusekit` — come up fresh under the new root. There
+  is no migration and no fallback read, so a `~/<Label>` directory left by a
+  0.65.x build stays where it lies and is deleted by hand once the daemon is
+  confirmed running under `~/.daemonkit/a/`. Upgrading straight from 0.65.x
+  skips the intermediate root entirely, leaving one stale directory per daemon
+  rather than two; 0.66.0 is the only release that creates the intermediate one.
+
+  `~/.cc-pool` is unaffected — that is cc-pool's own application directory, not
+  daemon state.
+
 ## [0.66.0] - 2026-08-17
 
 ### Fixed
@@ -788,7 +810,8 @@ new owner records and stays broken until upgraded again.
   picked automatically when fuse-t is present); CI and release workflows.
 - License: PolyForm Noncommercial 1.0.0.
 
-[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.66.0...HEAD
+[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.67.0...HEAD
+[0.67.0]: https://github.com/yasyf/cc-pool/compare/v0.66.0...v0.67.0
 [0.66.0]: https://github.com/yasyf/cc-pool/compare/v0.65.2...v0.66.0
 [0.65.2]: https://github.com/yasyf/cc-pool/compare/v0.65.1...v0.65.2
 [0.65.1]: https://github.com/yasyf/cc-pool/compare/v0.65.0...v0.65.1
