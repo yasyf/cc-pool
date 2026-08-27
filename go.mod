@@ -13,7 +13,7 @@ require (
 	github.com/muesli/cancelreader v0.2.2
 	github.com/spf13/cobra v1.10.2
 	github.com/yasyf/daemonkit v0.23.0
-	github.com/yasyf/fusekit v1.17.0
+	github.com/yasyf/fusekit v1.18.0
 	github.com/yasyf/synckit v0.37.1
 	go.etcd.io/bbolt v1.5.0
 	golang.org/x/net v0.56.0
