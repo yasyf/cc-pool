@@ -553,11 +553,11 @@ func TestResetPackagedAppAcceptsAWedgedInstalledApplication(t *testing.T) {
 		{"absent application", func(*testing.T, string) {}},
 		{"non-executable runtime", func(t *testing.T, appPath string) {
 			macos := filepath.Join(appPath, "Contents", "MacOS")
-			if err := os.MkdirAll(macos, 0o755); err != nil {
+			if err := os.MkdirAll(macos, 0o750); err != nil {
 				t.Fatal(err)
 			}
 			executable := filepath.Join(macos, holderbridge.ExecutableName)
-			if err := os.WriteFile(executable, []byte("not a runtime"), 0o644); err != nil {
+			if err := os.WriteFile(executable, []byte("not a runtime"), 0o600); err != nil {
 				t.Fatal(err)
 			}
 		}},

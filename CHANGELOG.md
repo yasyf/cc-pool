@@ -61,7 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Requires fusekit v1.20.0 for `LocalTenantController.DesiredSourceFleet`,
   which reads an owner's published fleet back without publishing; an owner that
-  has never published reads as absent.
+  has never published reads as absent. The widget's Swift `FuseKit` pin moves to
+  1.20.0 with it — `verify-suite-pins.sh` refuses the skew.
 
 ## [0.68.0] - 2026-08-27
 

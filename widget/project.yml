@@ -13,7 +13,7 @@ options:
 packages:
   FuseKit:
     url: https://github.com/yasyf/fusekit.git
-    exactVersion: 1.19.0
+    exactVersion: 1.20.0
   DaemonKit:
     url: https://github.com/yasyf/daemonkit.git
     exactVersion: 0.23.0
