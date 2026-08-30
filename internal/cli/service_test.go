@@ -51,7 +51,6 @@ func TestBudgetedStatesTheDefaultWhenNoneIsCarried(t *testing.T) {
 func TestInstallDaemonServiceRollsBackHolderOnEnsureFailure(t *testing.T) {
 	ensureFailed := errors.New("ensure failed")
 	commits, rollbacks := 0, 0
-	swapVar(t, &removeLegacyDaemon, func(context.Context) error { return nil })
 	swapVar(t, &ensureHolder, func(context.Context) (holderServiceInstall, error) {
 		return testHolderInstall{commit: func() { commits++ }, rollback: func() { rollbacks++ }}, nil
 	})
@@ -99,7 +98,6 @@ func TestInstallDaemonServiceCommitsHolderOnEnsureSuccess(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			commits, rollbacks := 0, 0
-			swapVar(t, &removeLegacyDaemon, func(context.Context) error { return nil })
 			swapVar(t, &ensureHolder, func(context.Context) (holderServiceInstall, error) {
 				return testHolderInstall{commit: func() { commits++ }, rollback: func() { rollbacks++ }}, nil
 			})

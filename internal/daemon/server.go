@@ -183,8 +183,7 @@ type Server struct {
 var ensureHolderRuntime = EnsureHolderService
 
 // Run is the entry point for `cc-pool daemon`. It blocks until the process
-// is signalled or the daemon drains. The cross-era gate runs before Serve:
-// a live v0.20.9 incumbent holds a lock Serve's flock cannot see.
+// is signalled or the daemon drains.
 func Run(ctx context.Context) error {
 	if err := pool.EnsureStateDir(); err != nil {
 		return err
@@ -196,14 +195,6 @@ func Run(ctx context.Context) error {
 	}
 	spec, err := ProductionSpec()
 	if err != nil {
-		return err
-	}
-	legacyLock, err := crossEraGate(ctx, launchctlRunner, string(spec.Label))
-	if err != nil {
-		return err
-	}
-	defer func() { _ = legacyLock.Close() }()
-	if err := sweepLegacyAccountTerminals(); err != nil {
 		return err
 	}
 	s := &Server{

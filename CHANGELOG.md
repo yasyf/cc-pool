@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- The v0.20.9 cross-era migration: the boot-time gate that booted out an
+  unmarked pre-daemonkit LaunchAgent and held that era's listener lock, the
+  legacy account-terminal ledger sweep that refused a boot while a
+  pre-upgrade `claude auth login` was still recorded, and the direct legacy
+  bootout `ccp service install`/`stop` led with. It was written for one
+  transition cycle out of v0.21.x and has run on every boot since; no v0.20.9
+  incumbent survives to gate. A machine still carrying
+  `~/.cc-pool/account-terminals-v1.db` or a stale `daemon.sock.lock` loses both
+  to `ccp service uninstall --purge`.
+
 ## [0.68.0] - 2026-08-27
 
 ### Fixed

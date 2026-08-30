@@ -635,9 +635,6 @@ const poolUpgradeGoldenOwner = `{"recovery_id":"com.yasyf.cc-pool.credential-own
 // whose owner_record bytes are a literal v0.20.9 proc.Record are claimed by a
 // v2 successor exactly as any dead generation's rows, with the pending-add
 // retirement proof hook and account-mutation transfer intact.
-// TODO(dk-v021 integration): add the daemon-boot arm once Lane D's spec exists —
-// the cross-era gate (RemoveUnmarked + legacy lock) plus Serve → Start →
-// ClaimForeignLanes against a live v0.20.9 incumbent.
 func TestClaimForeignLanesAdoptsVZeroTwentyNineRows(t *testing.T) {
 	st := openTestStore(t)
 	credentialAccount := persistTestAccount(t, st, store.Account{

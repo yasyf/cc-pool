@@ -166,10 +166,9 @@ func (s *Server) publishHealth() {
 }
 
 // startProductRuntime opens business admission in the one order the exclusion
-// argument needs: the owner is minted, the cross-era gate has already proven
-// no pre-cut daemon survives, foreign lanes are claimed and retired mutations
-// recovered while no worker of ours can hold a reservation, and only then do
-// the resident sync helper and the scheduler go live.
+// argument needs: the owner is minted, foreign lanes are claimed and retired
+// mutations recovered while no worker of ours can hold a reservation, and only
+// then do the resident sync helper and the scheduler go live.
 func (s *Server) startProductRuntime(ctx context.Context) error {
 	execCtx, cancel := context.WithCancel(ctx)
 	s.execMu.Lock()

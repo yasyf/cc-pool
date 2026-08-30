@@ -84,9 +84,6 @@ func HostSyncHelperChildStorePath() string { return statePath("hostsync-helper-c
 // HostSyncHelperStopStorePath is the resident sync helper's v1 stop-control ledger.
 func HostSyncHelperStopStorePath() string { return statePath("hostsync-helper-stop-v1.db") }
 
-// AccountTerminalProcessStorePath is the product account-terminal v1 process ledger.
-func AccountTerminalProcessStorePath() string { return statePath("account-terminals-v1.db") }
-
 // FuseKitBackingRoot is the private source root behind every account presentation.
 func FuseKitBackingRoot() string { return filepath.Join(FuseKitRuntimeDir(), "backing") }
 

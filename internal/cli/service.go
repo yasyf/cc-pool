@@ -35,7 +35,6 @@ var (
 		}
 		return client.Ensure(ctx)
 	}
-	removeLegacyDaemon = daemon.RemoveLegacyDaemon
 	// daemonHealthContext is the Control-routed health observation, seamed
 	// because daemonkit's control lane refuses an in-process self-attach
 	// (daemonkit control.go:136): a test daemon serves the business lane
@@ -44,9 +43,6 @@ var (
 		return cl.HealthContext(ctx)
 	}
 	stopDaemonRuntime = func(ctx context.Context) error {
-		if err := removeLegacyDaemon(ctx); err != nil {
-			return err
-		}
 		client, err := daemonkit.Open(daemon.Spec(daemonkit.Program{}, nil))
 		if err != nil {
 			return err
@@ -200,9 +196,8 @@ func gateUninstallSessions(accts []store.Account) error {
 	return nil
 }
 
-// stopDaemonService leads with the direct legacy bootout — Client.Stop cannot
-// reach a live pre-daemonkit incumbent, whose listener refuses the attach —
-// then routes the marked world through Stop's own observe-drain-remove ladder.
+// stopDaemonService routes the daemon through Stop's own
+// observe-drain-remove ladder.
 func stopDaemonService(cmd *cobra.Command) error {
 	out := cmd.OutOrStdout()
 	stopCtx, cancel := budgeted(cmd.Context(), daemonServiceStopTimeout)
@@ -289,9 +284,6 @@ func installDaemonService(ctx context.Context) (err error) {
 		defer cancel()
 		err = errors.Join(err, holderInstall.Rollback(rollbackCtx))
 	}()
-	if err := removeLegacyDaemon(ctx); err != nil {
-		return err
-	}
 	ensureCtx, cancel := budgeted(ctx, daemonServiceEnsureTimeout)
 	defer cancel()
 	if _, err := ensureDaemonService(ensureCtx); err != nil {
