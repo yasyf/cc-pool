@@ -9,11 +9,24 @@ import (
 	"github.com/yasyf/fusekit/holder"
 )
 
+// ClaudeSourceFleetController is the local controller surface cc-pool's source
+// fleet publication drives; *holder.LocalTenantController satisfies it.
+type ClaudeSourceFleetController interface {
+	DesiredSourceFleet(
+		ctx context.Context,
+	) (*catalog.DesiredSourceAuthorityFleetState, []catalog.SourceAuthorityDeclaration, error)
+	PublishSourceFleet(
+		ctx context.Context,
+		publication holder.LocalSourceFleetPublication,
+	) (catalog.DesiredSourceAuthorityFleetState, error)
+}
+
 // PublishClaudeSourceFleet publishes cc-pool's complete v1 topology directly
-// through the fixed signed runtime's pinned local controller.
+// through the fixed signed runtime's pinned local controller, and publishes
+// nothing when the stored fleet already carries that exact topology.
 func PublishClaudeSourceFleet(
 	ctx context.Context,
-	controller *holder.LocalTenantController,
+	controller ClaudeSourceFleetController,
 	policy ClaudeAuthorityPolicy,
 ) error {
 	if controller == nil {
@@ -22,6 +35,13 @@ func PublishClaudeSourceFleet(
 	publication, expected, err := claudeSourceFleetPublication(policy)
 	if err != nil {
 		return err
+	}
+	current, _, err := controller.DesiredSourceFleet(ctx)
+	if err != nil {
+		return err
+	}
+	if current != nil && *current == expected {
+		return nil
 	}
 	state, err := controller.PublishSourceFleet(ctx, publication)
 	if err != nil {

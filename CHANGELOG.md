@@ -16,6 +16,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   incumbent survives to gate. A machine still carrying
   `~/.cc-pool/account-terminals-v1.db` or a stale `daemon.sock.lock` loses both
   to `ccp service uninstall --purge`.
+### Fixed
+
+- **`CCPoolStatus` no longer crash-loops on `catalog: tenant generation
+  mismatch`.** Every runtime start republished cc-pool's v1 source-authority
+  topology unconditionally, always at the hard-cut generation 1. fusekit's
+  catalog admits a publication only when the generation it expects matches the
+  one already stored, so the first start stored generation 1 and every start
+  after it was refused:
+
+  ```
+  CCPoolStatus: FuseKit runtime start failed: publish exact source fleet: catalog: tenant generation mismatch
+  ```
+
+  Both machines running 0.68.0 wedged this way, and removing
+  `~/.cc-pool/fusekit/catalog.sqlite` bought one boot before the same refusal
+  came back. A start now reads the stored desired fleet first and publishes
+  nothing when its owner, generation, authority count, and both digests already
+  match the topology this build compiles. A stored fleet that genuinely differs
+  is still republished, and the catalog's refusal still surfaces rather than
+  being swallowed.
+
+- Requires fusekit v1.20.0 for `LocalTenantController.DesiredSourceFleet`,
+  which reads an owner's published fleet back without publishing; an owner that
+  has never published reads as absent.
 
 ## [0.68.0] - 2026-08-27
 
