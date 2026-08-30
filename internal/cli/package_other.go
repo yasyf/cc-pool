@@ -10,6 +10,7 @@ import (
 var (
 	installPackage   = unsupportedPackage
 	uninstallPackage = unsupportedPackage
+	resetPackage     = unsupportedPackage
 )
 
 func unsupportedPackage(context.Context) error {

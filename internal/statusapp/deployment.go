@@ -23,6 +23,7 @@ type deploymentController interface {
 	Supersede(context.Context, deploy.Candidate) (deploy.Generation, error)
 	Activate(context.Context) (deploy.Activation, error)
 	Uninstall(context.Context) (deploy.Removal, error)
+	Reset(context.Context) error
 }
 
 type candidatePlan struct {
@@ -220,6 +221,21 @@ func UninstallPackagedApp(ctx context.Context) error {
 	defer cancel()
 	if _, err := controller.Uninstall(removeCtx); err != nil {
 		return fmt.Errorf("CCPoolStatus: uninstall packaged application: %w", err)
+	}
+	return nil
+}
+
+// ResetPackagedApp retires the installed application's agents and leaves its
+// installed bytes in place, recovering a deployment no other verb accepts.
+func ResetPackagedApp(ctx context.Context) error {
+	controller, err := openInstalledDeployment(installedAppPath())
+	if err != nil {
+		return err
+	}
+	resetCtx, cancel := context.WithTimeout(ctx, holderbridge.RuntimeShutdownTimeout)
+	defer cancel()
+	if err := controller.Reset(resetCtx); err != nil {
+		return fmt.Errorf("CCPoolStatus: reset packaged application: %w", err)
 	}
 	return nil
 }

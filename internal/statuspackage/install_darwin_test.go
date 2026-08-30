@@ -102,11 +102,27 @@ func TestUninstallDelegatesSealedRemoval(t *testing.T) {
 	}
 }
 
+func TestResetDelegatesTheAgentRetirement(t *testing.T) {
+	want := errors.New("sealed reset failed")
+	calls := 0
+	ops := operations{reset: func(context.Context) error {
+		calls++
+		return want
+	}}
+	if err := reset(t.Context(), ops); !errors.Is(err, want) {
+		t.Fatalf("reset error = %v, want %v", err, want)
+	}
+	if calls != 1 {
+		t.Fatalf("reset calls = %d, want 1", calls)
+	}
+}
+
 func testOperations(source, target string) operations {
 	return operations{
 		packagedPath:  func() (string, error) { return source, nil },
 		installedPath: func() string { return target },
 		apply:         func(context.Context, string) error { return nil },
 		uninstall:     func(context.Context) error { return nil },
+		reset:         func(context.Context) error { return nil },
 	}
 }

@@ -38,6 +38,18 @@ func newPackageCmd() *cobra.Command {
 				return err
 			},
 		},
+		&cobra.Command{
+			Use:   "reset",
+			Short: "Retire the installed application's agents, keeping its installed bytes",
+			Args:  cobra.NoArgs,
+			RunE: func(cmd *cobra.Command, _ []string) error {
+				if err := resetPackage(cmd.Context()); err != nil {
+					return err
+				}
+				_, err := fmt.Fprintln(cmd.OutOrStdout(), "reset: CCPoolStatus package")
+				return err
+			},
+		},
 	)
 	return cmd
 }

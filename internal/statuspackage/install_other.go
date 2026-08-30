@@ -17,3 +17,8 @@ func Install(context.Context) error {
 func Uninstall(context.Context) error {
 	return errors.New("cc-pool package: signed application packaging requires macOS")
 }
+
+// Reset reports that signed application packaging requires macOS.
+func Reset(context.Context) error {
+	return errors.New("cc-pool package: signed application packaging requires macOS")
+}

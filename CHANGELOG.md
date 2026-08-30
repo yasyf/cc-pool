@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   incumbent survives to gate. A machine still carrying
   `~/.cc-pool/account-terminals-v1.db` or a stale `daemon.sock.lock` loses both
   to `ccp service uninstall --purge`.
+### Added
+
+- `ccp package reset` retires the installed application's launchd agents through
+  daemonkit's `Deployment.Reset` and leaves the installed bytes where they are.
+  It is the way out of a deployment state no other verb accepts — a sealed
+  activation whose daemon has since restarted, a removal proof for an app that
+  was put back by hand, a plain file planted at a generation slot — where
+  `ccp package install` refuses and `ccp package uninstall` would throw away a
+  working installation.
+
 ### Fixed
 
 - **`CCPoolStatus` no longer crash-loops on `catalog: tenant generation

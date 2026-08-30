@@ -20,6 +20,9 @@ func TestPackageCommandsAreExplicitMachineOperations(t *testing.T) {
 		{name: "uninstall", want: "uninstalled: CCPoolStatus package", swap: func(t *testing.T, fn func(context.Context) error) {
 			swapVar(t, &uninstallPackage, fn)
 		}},
+		{name: "reset", want: "reset: CCPoolStatus package", swap: func(t *testing.T, fn func(context.Context) error) {
+			swapVar(t, &resetPackage, fn)
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			called := 0

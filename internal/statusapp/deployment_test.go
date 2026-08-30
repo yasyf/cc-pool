@@ -37,6 +37,8 @@ type recordingDeployer struct {
 	activateCalls  int
 	uninstallErr   error
 	uninstallCalls int
+	resetErr       error
+	resetCalls     int
 }
 
 func (d *recordingDeployer) Install(_ context.Context, _ deploy.Candidate) (deploy.Generation, error) {
@@ -57,6 +59,11 @@ func (d *recordingDeployer) Activate(context.Context) (deploy.Activation, error)
 func (d *recordingDeployer) Uninstall(context.Context) (deploy.Removal, error) {
 	d.uninstallCalls++
 	return deploy.Removal{}, d.uninstallErr
+}
+
+func (d *recordingDeployer) Reset(context.Context) error {
+	d.resetCalls++
+	return d.resetErr
 }
 
 func exactTestGeneration(appPath string) deploy.Generation {
@@ -517,6 +524,24 @@ func TestUninstallPackagedAppDelegatesTheSealedRemoval(t *testing.T) {
 	controller.uninstallErr = want
 	if err := UninstallPackagedApp(t.Context()); !errors.Is(err, want) {
 		t.Fatalf("uninstall error = %v, want %v", err, want)
+	}
+}
+
+func TestResetPackagedAppDelegatesTheAgentRetirement(t *testing.T) {
+	controller := &recordingDeployer{}
+	useDeploymentMetadata(t, controller)
+
+	if err := ResetPackagedApp(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if controller.resetCalls != 1 || controller.uninstallCalls != 0 {
+		t.Fatalf("calls = reset %d, uninstall %d", controller.resetCalls, controller.uninstallCalls)
+	}
+
+	want := errors.New("no control lane can stop this daemon")
+	controller.resetErr = want
+	if err := ResetPackagedApp(t.Context()); !errors.Is(err, want) {
+		t.Fatalf("reset error = %v, want %v", err, want)
 	}
 }
 

@@ -21,6 +21,7 @@ type operations struct {
 	installedPath func() string
 	apply         func(context.Context, string) error
 	uninstall     func(context.Context) error
+	reset         func(context.Context) error
 }
 
 var defaultOperations = operations{
@@ -30,6 +31,7 @@ var defaultOperations = operations{
 		return err
 	},
 	uninstall: statusapp.UninstallPackagedApp,
+	reset:     statusapp.ResetPackagedApp,
 }
 
 // PackagedPath returns the application resource beside the resolved cc-pool executable.
@@ -80,6 +82,19 @@ func Uninstall(ctx context.Context) error {
 func uninstall(ctx context.Context, ops operations) error {
 	if err := ops.uninstall(ctx); err != nil {
 		return fmt.Errorf("cc-pool package: uninstall signed application: %w", err)
+	}
+	return nil
+}
+
+// Reset retires the installed application's agents through daemonkit, leaving
+// its installed bytes in place.
+func Reset(ctx context.Context) error {
+	return reset(ctx, defaultOperations)
+}
+
+func reset(ctx context.Context, ops operations) error {
+	if err := ops.reset(ctx); err != nil {
+		return fmt.Errorf("cc-pool package: reset signed application: %w", err)
 	}
 	return nil
 }
