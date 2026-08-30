@@ -226,9 +226,17 @@ func UninstallPackagedApp(ctx context.Context) error {
 }
 
 // ResetPackagedApp retires the installed application's agents and leaves its
-// installed bytes in place, recovering a deployment no other verb accepts.
+// installed bytes in place, recovering a deployment no other verb accepts. It
+// binds the deployment from the compiled service contract alone, never from
+// the installed bundle, so a missing or mangled application cannot refuse the
+// reset that exists to clean it up.
 func ResetPackagedApp(ctx context.Context) error {
-	controller, err := openInstalledDeployment(installedAppPath())
+	appPath := installedAppPath()
+	agent := launchd.Agent{
+		Label:   holderbridge.DeploymentServiceLabel,
+		Program: bundle.ExePath(appPath, holderbridge.ExecutableName),
+	}
+	controller, err := openDeployment(appPath, []launchd.Agent{agent})
 	if err != nil {
 		return err
 	}

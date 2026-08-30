@@ -18,13 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to `ccp service uninstall --purge`.
 ### Added
 
-- `ccp package reset` retires the installed application's launchd agents through
-  daemonkit's `Deployment.Reset` and leaves the installed bytes where they are.
+- `ccp package reset` retires the installed application's launchd agents and
+  deployment records through daemonkit's `Deployment.Reset`; the installed bytes
+  and the FuseKit catalog under `~/.cc-pool/fusekit/` stay where they are.
   It is the way out of a deployment state no other verb accepts — a sealed
   activation whose daemon has since restarted, a removal proof for an app that
   was put back by hand, a plain file planted at a generation slot — where
   `ccp package install` refuses and `ccp package uninstall` would throw away a
-  working installation.
+  working installation. The verb binds the deployment from the compiled service
+  contract alone, never from the installed bundle, so a missing or mangled
+  application cannot refuse the reset that exists to clean it up.
 
 ### Fixed
 

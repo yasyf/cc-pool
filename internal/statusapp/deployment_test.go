@@ -545,6 +545,54 @@ func TestResetPackagedAppDelegatesTheAgentRetirement(t *testing.T) {
 	}
 }
 
+func TestResetPackagedAppAcceptsAWedgedInstalledApplication(t *testing.T) {
+	tests := []struct {
+		name    string
+		install func(t *testing.T, appPath string)
+	}{
+		{"absent application", func(*testing.T, string) {}},
+		{"non-executable runtime", func(t *testing.T, appPath string) {
+			macos := filepath.Join(appPath, "Contents", "MacOS")
+			if err := os.MkdirAll(macos, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			executable := filepath.Join(macos, holderbridge.ExecutableName)
+			if err := os.WriteFile(executable, []byte("not a runtime"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			appPath := filepath.Join(root, "Applications", "CCPoolStatus.app")
+			tt.install(t, appPath)
+			swapDeploymentVar(t, &installedAppPath, func() string { return appPath })
+			controller := &recordingDeployer{}
+			swapDeploymentVar(t, &newDeployer, func(config deploy.Config) (deploymentController, error) {
+				controller.config = config
+				return controller, nil
+			})
+
+			if err := ResetPackagedApp(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if controller.resetCalls != 1 {
+				t.Fatalf("reset calls = %d, want 1", controller.resetCalls)
+			}
+			agents := controller.config.Agents
+			program := filepath.Join(appPath, "Contents", "MacOS", holderbridge.ExecutableName)
+			if len(agents) != 1 || agents[0].Label != holderbridge.DeploymentServiceLabel ||
+				agents[0].Program != program {
+				t.Fatalf("reset deployment agents = %+v", agents)
+			}
+		})
+	}
+}
+
 func TestSameApplicationBytesIgnoresOnlyLocation(t *testing.T) {
 	base := exactTestGeneration("/Applications/CCPoolStatus.app")
 	moved := base

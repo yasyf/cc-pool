@@ -40,7 +40,7 @@ func newPackageCmd() *cobra.Command {
 		},
 		&cobra.Command{
 			Use:   "reset",
-			Short: "Retire the installed application's agents, keeping its installed bytes",
+			Short: "Retire the installed application's agents and deployment records, keeping its installed bytes and the FuseKit catalog",
 			Args:  cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, _ []string) error {
 				if err := resetPackage(cmd.Context()); err != nil {
