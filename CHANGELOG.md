@@ -46,12 +46,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `~/.cc-pool/fusekit/catalog.sqlite` bought one boot before the same refusal
   came back. A start now reads the stored desired fleet first and publishes
   nothing when its owner, authority count, and both digests already match the
-  topology this build compiles, whatever generation carries them. A stored
-  fleet that genuinely differs is republished at the next generation, expecting
-  exactly the one just read, and a start that loses the publication race to a
-  concurrent start re-reads once — accepting the winner's topology when it
-  matches, advancing from it when it does not. A second refusal still surfaces
-  rather than being swallowed.
+  topology this build compiles. A start that loses the publication race to a
+  concurrent start re-reads once and accepts the winner's topology, so two
+  starts from an empty catalog no longer leave one of them refused.
+
+  The generation stays cc-pool's hard-cut v1 rather than advancing from the one
+  just read. `resolveClaudePhysicalPolicy` refuses a stored source-task identity
+  whose `FleetGeneration` is not `SourceAuthorityFleetGeneration`, so a fleet
+  advanced to generation 2 would leave a daemon that cannot start at all — a
+  worse wedge than the one this fixes. A stored topology that genuinely differs
+  from the compiled one still surfaces the catalog's refusal rather than being
+  swallowed; it already fails earlier, inside the driver factory, and making
+  that case converge is a separate change.
 
 - Requires fusekit v1.20.0 for `LocalTenantController.DesiredSourceFleet`,
   which reads an owner's published fleet back without publishing; an owner that

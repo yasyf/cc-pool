@@ -12,7 +12,7 @@ import (
 )
 
 func TestClaudeSourceFleetPublicationIsExactV1Topology(t *testing.T) {
-	publication, expected, err := claudeSourceFleetPublication(testClaudePolicy(), 0)
+	publication, expected, err := claudeSourceFleetPublication(testClaudePolicy())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestPublishClaudeSourceFleetRepublishesNothingOnRestart(t *testing.T) {
 	}
 }
 
-func TestPublishClaudeSourceFleetAdvancesADivergedStoredTopology(t *testing.T) {
+func TestPublishClaudeSourceFleetSurfacesADivergedStoredTopology(t *testing.T) {
 	controller := newCatalogSourceFleet(t)
 	stored := testClaudePolicy()
 	stored.ClaudeDir = "/Users/test/.claude-v0"
@@ -74,27 +74,22 @@ func TestPublishClaudeSourceFleetAdvancesADivergedStoredTopology(t *testing.T) {
 	}
 	controller.acknowledgeStagedFleetAsRuntimeStart(t)
 
-	if err := PublishClaudeSourceFleet(t.Context(), controller, testClaudePolicy()); err != nil {
-		t.Fatalf("diverged publication: %v", err)
+	err := PublishClaudeSourceFleet(t.Context(), controller, testClaudePolicy())
+	if !errors.Is(err, catalog.ErrGenerationMismatch) {
+		t.Fatalf("diverged publication = %v, want %v", err, catalog.ErrGenerationMismatch)
 	}
-	if controller.publications != 2 {
-		t.Fatalf("catalog publications = %d, want the diverged topology republished", controller.publications)
+	current, _, readErr := controller.DesiredSourceFleet(t.Context())
+	if readErr != nil || current == nil {
+		t.Fatalf("fleet after divergence = %+v, %v", current, readErr)
 	}
-	current, _, err := controller.DesiredSourceFleet(t.Context())
-	if err != nil || current == nil {
-		t.Fatalf("fleet after divergence = %+v, %v", current, err)
-	}
-	want := claudeFleetState(t, testClaudePolicy(), SourceAuthorityFleetGeneration+1)
-	if *current != want {
-		t.Fatalf("fleet after divergence = %+v, want %+v", *current, want)
+	if want := claudeFleetState(t, stored, SourceAuthorityFleetGeneration); *current != want {
+		t.Fatalf("fleet after divergence = %+v, want the stored topology left at %+v", *current, want)
 	}
 }
 
-func TestPublishClaudeSourceFleetRetriesOnceBehindARaceWinner(t *testing.T) {
+func TestPublishClaudeSourceFleetSettlesBehindARaceWinner(t *testing.T) {
 	controller := newCatalogSourceFleet(t)
-	winner := testClaudePolicy()
-	winner.ClaudeDir = "/Users/test/.claude-v0"
-	if err := PublishClaudeSourceFleet(t.Context(), controller, winner); err != nil {
+	if err := PublishClaudeSourceFleet(t.Context(), controller, testClaudePolicy()); err != nil {
 		t.Fatalf("winning publication: %v", err)
 	}
 	controller.acknowledgeStagedFleetAsRuntimeStart(t)
@@ -106,15 +101,14 @@ func TestPublishClaudeSourceFleetRetriesOnceBehindARaceWinner(t *testing.T) {
 	if loser.reads != 2 {
 		t.Fatalf("desired fleet reads = %d, want the stale read and one re-read", loser.reads)
 	}
-	if controller.publications != 3 {
-		t.Fatalf("catalog publications = %d, want the winner, the lost race, and the retry", controller.publications)
+	if controller.publications != 2 {
+		t.Fatalf("catalog publications = %d, want the winner and the lost race only", controller.publications)
 	}
 	current, _, err := controller.DesiredSourceFleet(t.Context())
 	if err != nil || current == nil {
 		t.Fatalf("fleet after race = %+v, %v", current, err)
 	}
-	want := claudeFleetState(t, testClaudePolicy(), SourceAuthorityFleetGeneration+1)
-	if *current != want {
+	if want := claudeFleetState(t, testClaudePolicy(), SourceAuthorityFleetGeneration); *current != want {
 		t.Fatalf("fleet after race = %+v, want %+v", *current, want)
 	}
 }
