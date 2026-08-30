@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.69.0] - 2026-08-30
+
 ### Removed
 - The v0.20.9 cross-era migration: the boot-time gate that booted out an
   unmarked pre-daemonkit LaunchAgent and held that era's listener lock, the
@@ -905,7 +907,8 @@ new owner records and stays broken until upgraded again.
   picked automatically when fuse-t is present); CI and release workflows.
 - License: PolyForm Noncommercial 1.0.0.
 
-[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.68.0...HEAD
+[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.69.0...HEAD
+[0.69.0]: https://github.com/yasyf/cc-pool/compare/v0.68.0...v0.69.0
 [0.68.0]: https://github.com/yasyf/cc-pool/compare/v0.67.0...v0.68.0
 [0.67.0]: https://github.com/yasyf/cc-pool/compare/v0.66.0...v0.67.0
 [0.66.0]: https://github.com/yasyf/cc-pool/compare/v0.65.2...v0.66.0
