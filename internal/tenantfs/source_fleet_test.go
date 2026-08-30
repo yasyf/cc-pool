@@ -12,7 +12,7 @@ import (
 )
 
 func TestClaudeSourceFleetPublicationIsExactV1Topology(t *testing.T) {
-	publication, expected, err := claudeSourceFleetPublication(testClaudePolicy())
+	publication, expected, err := claudeSourceFleetPublication(testClaudePolicy(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestPublishClaudeSourceFleetRepublishesNothingOnRestart(t *testing.T) {
 	}
 }
 
-func TestPublishClaudeSourceFleetSurfacesADivergedStoredTopology(t *testing.T) {
+func TestPublishClaudeSourceFleetAdvancesADivergedStoredTopology(t *testing.T) {
 	controller := newCatalogSourceFleet(t)
 	stored := testClaudePolicy()
 	stored.ClaudeDir = "/Users/test/.claude-v0"
@@ -74,13 +74,92 @@ func TestPublishClaudeSourceFleetSurfacesADivergedStoredTopology(t *testing.T) {
 	}
 	controller.acknowledgeStagedFleetAsRuntimeStart(t)
 
-	err := PublishClaudeSourceFleet(t.Context(), controller, testClaudePolicy())
-	if !errors.Is(err, catalog.ErrGenerationMismatch) {
-		t.Fatalf("diverged publication error = %v, want %v", err, catalog.ErrGenerationMismatch)
+	if err := PublishClaudeSourceFleet(t.Context(), controller, testClaudePolicy()); err != nil {
+		t.Fatalf("diverged publication: %v", err)
 	}
 	if controller.publications != 2 {
 		t.Fatalf("catalog publications = %d, want the diverged topology republished", controller.publications)
 	}
+	current, _, err := controller.DesiredSourceFleet(t.Context())
+	if err != nil || current == nil {
+		t.Fatalf("fleet after divergence = %+v, %v", current, err)
+	}
+	want := claudeFleetState(t, testClaudePolicy(), SourceAuthorityFleetGeneration+1)
+	if *current != want {
+		t.Fatalf("fleet after divergence = %+v, want %+v", *current, want)
+	}
+}
+
+func TestPublishClaudeSourceFleetRetriesOnceBehindARaceWinner(t *testing.T) {
+	controller := newCatalogSourceFleet(t)
+	winner := testClaudePolicy()
+	winner.ClaudeDir = "/Users/test/.claude-v0"
+	if err := PublishClaudeSourceFleet(t.Context(), controller, winner); err != nil {
+		t.Fatalf("winning publication: %v", err)
+	}
+	controller.acknowledgeStagedFleetAsRuntimeStart(t)
+
+	loser := &staleReadSourceFleet{catalogSourceFleet: controller}
+	if err := PublishClaudeSourceFleet(t.Context(), loser, testClaudePolicy()); err != nil {
+		t.Fatalf("losing publication: %v", err)
+	}
+	if loser.reads != 2 {
+		t.Fatalf("desired fleet reads = %d, want the stale read and one re-read", loser.reads)
+	}
+	if controller.publications != 3 {
+		t.Fatalf("catalog publications = %d, want the winner, the lost race, and the retry", controller.publications)
+	}
+	current, _, err := controller.DesiredSourceFleet(t.Context())
+	if err != nil || current == nil {
+		t.Fatalf("fleet after race = %+v, %v", current, err)
+	}
+	want := claudeFleetState(t, testClaudePolicy(), SourceAuthorityFleetGeneration+1)
+	if *current != want {
+		t.Fatalf("fleet after race = %+v, want %+v", *current, want)
+	}
+}
+
+func claudeFleetState(
+	t *testing.T,
+	policy ClaudeAuthorityPolicy,
+	generation causal.Generation,
+) catalog.DesiredSourceAuthorityFleetState {
+	t.Helper()
+	declaration, err := ClaudeSourceAuthorityDeclaration(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authoritiesDigest, err := catalog.SourceAuthorityFleetDigest(
+		[]causal.SourceAuthorityID{declaration.Authority},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	declarationsDigest, err := catalog.SourceAuthorityFleetDeclarationsDigest(
+		[]catalog.SourceAuthorityDeclaration{declaration},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return catalog.DesiredSourceAuthorityFleetState{
+		Owner: SourceAuthorityFleetOwner, Generation: generation, AuthorityCount: 1,
+		AuthoritiesDigest: authoritiesDigest, DeclarationsDigest: declarationsDigest,
+	}
+}
+
+type staleReadSourceFleet struct {
+	*catalogSourceFleet
+	reads int
+}
+
+func (c *staleReadSourceFleet) DesiredSourceFleet(
+	ctx context.Context,
+) (*catalog.DesiredSourceAuthorityFleetState, []catalog.SourceAuthorityDeclaration, error) {
+	c.reads++
+	if c.reads == 1 {
+		return nil, nil, nil
+	}
+	return c.catalogSourceFleet.DesiredSourceFleet(ctx)
 }
 
 type catalogSourceFleet struct {

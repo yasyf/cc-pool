@@ -22,8 +22,10 @@ type ClaudeSourceFleetController interface {
 }
 
 // PublishClaudeSourceFleet publishes cc-pool's complete v1 topology directly
-// through the fixed signed runtime's pinned local controller, and publishes
-// nothing when the stored fleet already carries that exact topology.
+// through the fixed signed runtime's pinned local controller. It publishes
+// nothing when the stored fleet already carries that exact topology, advances
+// a diverged stored fleet from the generation it read, and retries once when
+// a concurrent start publishes between its read and its publication.
 func PublishClaudeSourceFleet(
 	ctx context.Context,
 	controller ClaudeSourceFleetController,
@@ -32,15 +34,34 @@ func PublishClaudeSourceFleet(
 	if controller == nil {
 		return errors.New("tenantfs: local tenant controller is required")
 	}
-	publication, expected, err := claudeSourceFleetPublication(policy)
-	if err != nil {
-		return err
+	err := publishClaudeSourceFleet(ctx, controller, policy)
+	if errors.Is(err, catalog.ErrGenerationMismatch) {
+		return publishClaudeSourceFleet(ctx, controller, policy)
 	}
+	return err
+}
+
+func publishClaudeSourceFleet(
+	ctx context.Context,
+	controller ClaudeSourceFleetController,
+	policy ClaudeAuthorityPolicy,
+) error {
 	current, _, err := controller.DesiredSourceFleet(ctx)
 	if err != nil {
 		return err
 	}
-	if current != nil && *current == expected {
+	var stored causal.Generation
+	if current != nil {
+		stored = current.Generation
+	}
+	publication, expected, err := claudeSourceFleetPublication(policy, stored)
+	if err != nil {
+		return err
+	}
+	if current != nil && current.Owner == expected.Owner &&
+		current.AuthorityCount == expected.AuthorityCount &&
+		current.AuthoritiesDigest == expected.AuthoritiesDigest &&
+		current.DeclarationsDigest == expected.DeclarationsDigest {
 		return nil
 	}
 	state, err := controller.PublishSourceFleet(ctx, publication)
@@ -55,6 +76,7 @@ func PublishClaudeSourceFleet(
 
 func claudeSourceFleetPublication(
 	policy ClaudeAuthorityPolicy,
+	stored causal.Generation,
 ) (holder.LocalSourceFleetPublication, catalog.DesiredSourceAuthorityFleetState, error) {
 	declaration, err := ClaudeSourceAuthorityDeclaration(policy)
 	if err != nil {
@@ -72,13 +94,13 @@ func claudeSourceFleetPublication(
 		return holder.LocalSourceFleetPublication{}, catalog.DesiredSourceAuthorityFleetState{}, err
 	}
 	publication := holder.LocalSourceFleetPublication{
-		ExpectedGeneration: 0,
-		Generation:         SourceAuthorityFleetGeneration,
+		ExpectedGeneration: stored,
+		Generation:         stored + 1,
 		Declarations:       declarations,
 	}
 	expected := catalog.DesiredSourceAuthorityFleetState{
 		Owner:              SourceAuthorityFleetOwner,
-		Generation:         SourceAuthorityFleetGeneration,
+		Generation:         stored + 1,
 		AuthorityCount:     1,
 		AuthoritiesDigest:  authoritiesDigest,
 		DeclarationsDigest: declarationsDigest,

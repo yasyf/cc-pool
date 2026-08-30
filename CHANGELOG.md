@@ -42,10 +42,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Both machines running 0.68.0 wedged this way, and removing
   `~/.cc-pool/fusekit/catalog.sqlite` bought one boot before the same refusal
   came back. A start now reads the stored desired fleet first and publishes
-  nothing when its owner, generation, authority count, and both digests already
-  match the topology this build compiles. A stored fleet that genuinely differs
-  is still republished, and the catalog's refusal still surfaces rather than
-  being swallowed.
+  nothing when its owner, authority count, and both digests already match the
+  topology this build compiles, whatever generation carries them. A stored
+  fleet that genuinely differs is republished at the next generation, expecting
+  exactly the one just read, and a start that loses the publication race to a
+  concurrent start re-reads once — accepting the winner's topology when it
+  matches, advancing from it when it does not. A second refusal still surfaces
+  rather than being swallowed.
 
 - Requires fusekit v1.20.0 for `LocalTenantController.DesiredSourceFleet`,
   which reads an owner's published fleet back without publishing; an owner that
