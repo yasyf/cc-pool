@@ -122,6 +122,16 @@ jobs:
         with:
           version: latest
 
+  hooks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          python-version: "3.13"
+      - name: Test capt-hook hooks
+        run: uvx --isolated --python 3.13 'capt-hook>=12.72.0' test
+
   vuln:
     runs-on: ubuntu-latest
     steps:

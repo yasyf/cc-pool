@@ -1,11 +1,3 @@
-"""Nudge when an edit leaves an oversized contiguous comment run in Swift source.
-
-Swift-only: the builtin general pack's ``comments.py`` already covers Go (and every other
-ast-grep language) at a stricter diff-gated budget, so this fills the one gap — ast-grep has
-no Swift grammar. Text-based for the same reason. A run must exceed :data:`COMMENT_RUN_LIMIT`
-lines, so a normal doc comment never fires; only genuine bloat does.
-"""
-
 from __future__ import annotations
 
 from captain_hook import (
@@ -22,7 +14,6 @@ from captain_hook import (
 
 COMMENT_RUN_LIMIT = 6
 
-# Fixtures for the inline tests — module constants keep each physical line short.
 GO_BLOAT = (
     "package p\n\n"
     "// F does a thing in the pool.\n"
@@ -51,8 +42,8 @@ PY_HASH_RUN = (
 )
 
 
+# WORKAROUND: ast-grep has no Swift grammar, so comment runs are scanned as text.
 def longest_comment_run(text: str) -> int:
-    """Longest run of contiguous comment lines: adjacent ``//`` lines or a ``/* */`` block."""
     longest = run = 0
     in_block = False
     for raw in text.splitlines():
@@ -71,29 +62,20 @@ def longest_comment_run(text: str) -> int:
 
 
 class ExcessiveCommentRun(CustomCondition):
-    """True when the written content contains a comment run past the line budget."""
-
     def check(self, evt: BaseHookEvent) -> bool:
         return evt.content is not None and longest_comment_run(evt.content) > COMMENT_RUN_LIMIT
 
 
 nudge(
-    f"Comment bloat: this edit leaves a comment run longer than {COMMENT_RUN_LIMIT} lines. "
-    "Comments are terse and sparing — names, types, and organization carry the meaning; a "
-    "godoc is a description, not an essay. Move rationale, history, or investigation notes "
-    "to cc-notes (`ccn doc add`) and keep at most a one-line pointer. Legitimate exceptions "
-    "(load-bearing invariants, workarounds) stay. See: STYLEGUIDE.md § Comments.",
+    f"This edit leaves a comment run longer than {COMMENT_RUN_LIMIT} lines. "
+    "Move the rationale to `ccn doc add` and keep at most a one-line pointer.",
     only_if=[Tool("Edit", "Write"), FilePath("*.swift"), ExcessiveCommentRun()],
     events=Event.PostToolUse,
     max_fires=3,
     tests={
-        # Bloated Swift run — warned.
-        Input(tool="Write", file="Tile.swift", content=SWIFT_BLOCK_BLOAT): Warn(pattern="Comment bloat"),
-        # At or under the budget — allowed.
+        Input(tool="Write", file="Tile.swift", content=SWIFT_BLOCK_BLOAT): Warn(pattern="comment run"),
         Input(tool="Write", file="Tile.swift", content=SWIFT_SHORT_DOC): Allow(),
-        # Go is the builtin general pack's job — out of scope here even when bloated.
         Input(file="pool.go", content=GO_BLOAT): Allow(),
-        # Other languages are out of scope (the builtin general pack covers them).
         Input(file="conf.py", content=PY_HASH_RUN): Allow(),
     },
 )
