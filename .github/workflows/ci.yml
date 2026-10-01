@@ -130,7 +130,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Test capt-hook hooks
-        run: uvx --isolated --python 3.13 'capt-hook>=12.72.0' test
+        run: uvx --isolated --python 3.13 'capt-hook>=12.74.0' test
 
   vuln:
     runs-on: ubuntu-latest
