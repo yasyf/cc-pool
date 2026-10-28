@@ -27,7 +27,6 @@ func (r scopedRunner) Run(
 	result, err := r.scope.Run(runCtx, daemonkit.Cmd{
 		Path: request.Path, Args: request.Args, Dir: request.Dir,
 		Env: request.Env, Stdin: request.Stdin, MaxOutput: 1 << 20,
-		Exec: daemonkit.ServingSameUser(),
 	})
 	return workerexec.CommandResult{
 		Stdout: result.Stdout, Stderr: result.Stderr, ExitCode: result.Exit.Code,

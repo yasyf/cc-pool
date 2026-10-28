@@ -2,7 +2,7 @@ module github.com/yasyf/cc-pool
 
 go 1.26.5
 
-toolchain go1.26.6
+toolchain go1.26.10
 
 require (
 	github.com/charmbracelet/bubbletea v1.3.10
@@ -12,9 +12,9 @@ require (
 	github.com/descope/go-free-email-providers v0.0.0-20260427134210-d71f4c2c7632
 	github.com/muesli/cancelreader v0.2.2
 	github.com/spf13/cobra v1.10.2
-	github.com/yasyf/daemonkit v0.23.0
-	github.com/yasyf/fusekit v1.20.0
-	github.com/yasyf/synckit v0.37.1
+	github.com/yasyf/daemonkit v0.35.2
+	github.com/yasyf/fusekit v1.21.1
+	github.com/yasyf/synckit v0.47.0
 	golang.org/x/net v0.56.0
 	golang.org/x/sync v0.22.0
 	golang.org/x/sys v0.47.0
@@ -39,8 +39,10 @@ require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/ebitengine/purego v0.10.1 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
+	github.com/fsnotify/fsnotify v1.10.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
+	github.com/klauspost/compress v1.20.1 // indirect
 	github.com/lucasb-eyer/go-colorful v1.4.0 // indirect
 	github.com/mattn/go-isatty v0.0.22 // indirect
 	github.com/mattn/go-localereader v0.0.1 // indirect
@@ -57,7 +59,6 @@ require (
 	github.com/vishvananda/netns v0.0.0-20200728191858-db3c7e526aae // indirect
 	github.com/winfsp/cgofuse v1.6.1-0.20260531120352-2fa812d1bdc7 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
-	go.etcd.io/bbolt v1.5.0 // indirect
 	golang.org/x/mod v0.37.0 // indirect
 	golang.org/x/tools v0.47.0 // indirect
 	howett.net/plist v1.0.1 // indirect

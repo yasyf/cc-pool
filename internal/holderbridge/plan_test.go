@@ -5,16 +5,13 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/yasyf/daemonkit"
 )
 
-func TestRuntimePlanSpecPinsProductIdentityAndProtectedPolicy(t *testing.T) {
+func TestRuntimePlanSpecPinsProductIdentity(t *testing.T) {
 	const appPath = "/Users/test/Applications/CCPoolStatus.app"
 	const runtimeDirectory = "/Users/test/.cc-pool/fusekit"
 	const buildID = "v0.60.0"
-	const requiredAppGroup = "ABCDE12345.ccp"
-	spec := RuntimePlanSpec(appPath, runtimeDirectory, buildID, requiredAppGroup)
+	spec := RuntimePlanSpec(appPath, runtimeDirectory, buildID)
 	application := spec.Application
 	if application != Application(appPath) || application.BundleID != BundleID ||
 		application.TeamID != TeamID || application.Broker != application.Runtime ||
@@ -25,52 +22,8 @@ func TestRuntimePlanSpecPinsProductIdentityAndProtectedPolicy(t *testing.T) {
 	if spec.RuntimeDirectory != runtimeDirectory || spec.Native != nil ||
 		spec.BuildID != buildID ||
 		spec.Readiness != ReadinessContract() ||
-		!spec.SourceCapable || spec.BrokerPolicy.RequiredAppGroup != requiredAppGroup ||
-		spec.RuntimePolicy.RequiredAppGroup != requiredAppGroup {
+		!spec.SourceCapable {
 		t.Fatalf("runtime plan spec = %#v", spec)
-	}
-}
-
-func TestRuntimeTrustPinsBothLanes(t *testing.T) {
-	const requiredAppGroup = "ABCDE12345.ccp"
-	trust := RuntimeTrust(requiredAppGroup)
-	controller := trust.Controller
-	if controller.TeamID != TeamID || controller.SigningIdentifier != controllerBundleID ||
-		controller.RequiredAppGroup != "" || controller.RequiredEntitlements != nil {
-		t.Fatalf("controller requirement = %#v", controller)
-	}
-	if controller.SigningIdentifier == BundleID {
-		t.Fatal("controller requirement pins the app, which never opens a control session")
-	}
-	extension := trust.FileProviderExtension
-	if extension.TeamID != TeamID || extension.SigningIdentifier != fileProviderBundleID ||
-		extension.RequiredAppGroup != requiredAppGroup || extension.RequiredEntitlements != nil {
-		t.Fatalf("File Provider extension requirement = %#v", extension)
-	}
-}
-
-func TestOpaqueDeploymentDigestMatchesSignedSwiftPolicy(t *testing.T) {
-	payload, err := os.ReadFile(filepath.Join(
-		"..", "..", "widget", "Sources", "FileProviderRuntime", "Configuration.swift",
-	))
-	if err != nil {
-		t.Fatal(err)
-	}
-	const marker = `static let appGroupIdentifier = "`
-	start := strings.Index(string(payload), marker)
-	if start < 0 {
-		t.Fatal("signed Swift configuration does not declare the App Group identifier")
-	}
-	value := string(payload)[start+len(marker):]
-	end := strings.IndexByte(value, '"')
-	if end <= 0 {
-		t.Fatal("signed Swift configuration has an invalid App Group identifier")
-	}
-	requirement := daemonkit.Requirement{
-		TeamID: TeamID, SigningIdentifier: BundleID, RequiredAppGroup: value[:end],
-	}
-	if digest := requirement.Digest(); digest != runtimePolicyDigest {
-		t.Fatalf("opaque deployment digest = %s, signed Swift policy digest = %s", runtimePolicyDigest, digest)
 	}
 }
 

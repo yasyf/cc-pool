@@ -52,7 +52,7 @@ type Client struct {
 // NewClient returns a lazy client for the daemon's own identity. The spec is a
 // fixed value, so a construction failure is a build defect, not a condition.
 func NewClient() *Client {
-	client, err := daemonkit.Open(Spec(daemonkit.Program{}, nil))
+	client, err := daemonkit.Open(Spec(daemonkit.Program{}))
 	if err != nil {
 		panic(fmt.Sprintf("daemon: open client for the fixed spec: %v", err))
 	}
@@ -77,10 +77,7 @@ func (c *Client) Close() error {
 	c.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := c.business.Close(ctx); err != nil && !errors.Is(err, daemonkit.ErrLaneClosed) {
-		return err
-	}
-	return nil
+	return errors.Join(c.business.Close(ctx), c.client.Close(ctx))
 }
 
 // Available reports whether a ready daemon of this exact build answers.
@@ -189,28 +186,22 @@ func (c *Client) HealthContext(ctx context.Context) (*HealthResponse, error) {
 	return response, nil
 }
 
-// ObserveHealthContext reads the product half of Health.Detail through the
-// control lane, which answers during drain and without readiness. daemonkit
-// itself pins the serving PID and generation at attach. Lifecycle readiness
-// derives from the live Health.Phase, which daemonkit recomputes on every
-// call, folded over the decoded detail: the detail replays the last report,
-// so on its own it can say a draining daemon still serves.
+// ObserveHealthContext reads the product half of Health.Detail on the client's
+// session, which answers during drain and without readiness. Lifecycle
+// readiness derives from the live Health.Phase, folded over the decoded
+// detail: the detail replays the last report, so on its own it can say a
+// draining daemon still serves.
 func (c *Client) ObserveHealthContext(ctx context.Context) (*HealthResponse, error) {
 	if _, stated := ctx.Deadline(); !stated {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, 2*time.Second)
 		defer cancel()
 	}
-	control, err := c.client.Control(ctx)
+	health, err := c.client.Health(ctx)
 	if err != nil {
 		if errors.Is(err, daemonkit.ErrAbsent) {
 			return nil, fmt.Errorf("%w: %w", ErrDaemonUnavailable, err)
 		}
-		return nil, err
-	}
-	defer func() { _ = control.Close(ctx) }()
-	health, err := control.Health(ctx)
-	if err != nil {
 		return nil, err
 	}
 	return decodeDaemonHealthDetail(health)

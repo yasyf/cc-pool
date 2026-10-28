@@ -39,23 +39,12 @@ const foregroundHeadroom = 8
 
 // Spec is the cc-pool daemon's whole identity, read by the process that serves
 // it and by every client that reaches it.
-//
-// control is a test seam. Every production call passes nil, which is the
-// same-user floor: cc-pool's control callers are the Homebrew CLI and the
-// status widget, both unsigned or same-user, and Trust.Control gates Health,
-// WaitReady, Ensure and Drain alike — so a stated requirement would lock out
-// the CLI lane it is meant to protect.
-func Spec(program daemonkit.Program, control *daemonkit.Requirement) daemonkit.Daemon {
+func Spec(program daemonkit.Program) daemonkit.Daemon {
 	return daemonkit.Daemon{
-		Label:   ServiceRoleID,
-		Program: program,
-		Args:    []string{"daemon"},
-		Schemas: []daemonkit.Schema{RuntimeSchema},
-		Trust: daemonkit.Trust{
-			Serving:  daemonkit.ServingSameUser(),
-			Control:  control,
-			Business: nil,
-		},
+		Label:       ServiceRoleID,
+		Program:     program,
+		Args:        []string{"daemon"},
+		Schemas:     []daemonkit.Schema{RuntimeSchema},
 		Restart:     daemonkit.RestartAlways,
 		Shutdown:    daemonkit.Grace(daemonShutdownTimeout),
 		Handshake:   daemonkit.Grace(daemonHandshakeTimeout),
@@ -65,11 +54,11 @@ func Spec(program daemonkit.Program, control *daemonkit.Requirement) daemonkit.D
 }
 
 // ProductionSpec is the daemon identity every real entry point uses: the
-// stable executable path launchd runs, and the same-user control floor.
-func ProductionSpec() (daemonkit.Daemon, error) {
-	program, err := daemonkit.Stable()
+// stable executable path launchd runs, named by build.
+func ProductionSpec(build string) (daemonkit.Daemon, error) {
+	program, err := daemonkit.Stable(build)
 	if err != nil {
 		return daemonkit.Daemon{}, err
 	}
-	return Spec(program, nil), nil
+	return Spec(program), nil
 }

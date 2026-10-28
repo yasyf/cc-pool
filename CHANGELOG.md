@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Any process running as the same user can now connect to the pool daemon
+  and File Provider runtime.** Peer and child signature requirements,
+  entitlement policies, and runtime policy digests are removed. Health, drain,
+  and product requests share a daemonkit connection, and rebuilds are identified
+  by their release version or development binary modification time. Installing
+  the status app still verifies its code signature.
+- The status widget pins DaemonKit 0.35.2 and FuseKit 1.21.1, which speak the
+  daemon's new wire protocol. The Go side builds against daemonkit 0.35.2,
+  fusekit 1.21.1, and synckit 0.47.0 with Go 1.26.10.
+
 ## [0.69.0] - 2026-08-30
 
 ### Removed

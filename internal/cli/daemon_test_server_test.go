@@ -18,12 +18,6 @@ import (
 
 type daemonTestHandler func(context.Context, ccdaemon.Op, ccdaemon.Request) ccdaemon.Response
 
-// daemonTestReadyOp is the fixture-owned readiness probe: intercepted before
-// the consumer handler, retried until the daemon stops refusing, because
-// WaitReady routes through the control lane and daemonkit refuses an
-// in-process self-attach there (control.go:136). The retired transport had no
-// such guard — the old fixture's in-process Control coverage exercised a
-// shape daemonkit now forbids by design.
 const daemonTestReadyOp = "__fixture-ready"
 
 type daemonTestProduct struct {
@@ -49,13 +43,6 @@ func (p daemonTestProduct) Handle(ctx context.Context, req daemonkit.Request) (d
 func (daemonTestProduct) Drain(daemonkit.Budget) error { return nil }
 func (daemonTestProduct) Close(daemonkit.Budget) error { return nil }
 
-// startDaemonTestServer serves handler in-process on the real label-derived
-// socket, so the consumer RPC path is exercised end to end over the business
-// lane. The control lane is stubbed at the cli seam with the same exact-ready
-// validation the client applies: build mismatch surfaces as the client's own
-// ErrDaemonBuildMismatch. Callers that sandboxed already keep their home; the
-// root must be short — macOS caps sun_path at 104 bytes and daemonkit refuses
-// a longer socket path typed.
 func startDaemonTestServer(t *testing.T, build string, handler daemonTestHandler) {
 	t.Helper()
 	if build == "" {
@@ -78,7 +65,11 @@ func startDaemonTestServer(t *testing.T, build string, handler daemonTestHandler
 			State: ccdaemon.RuntimeStateHealthy, Ready: true,
 		}, nil
 	})
-	spec := ccdaemon.Spec(daemonkit.Program{}, nil)
+	program, err := daemonkit.Stable("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := ccdaemon.Spec(program)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {

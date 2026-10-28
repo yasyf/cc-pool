@@ -25,7 +25,7 @@ type Lane struct {
 
 // Start serves the tenant lane in the background and returns once it is
 // admitting. ctx bounds only the wait; the lane runs until Close.
-func (l *Lane) Start(ctx context.Context, controller *holder.LocalTenantController) error {
+func (l *Lane) Start(ctx context.Context, controller *holder.LocalTenantController, program daemonkit.Program) error {
 	l.mu.Lock()
 	if l.started {
 		l.mu.Unlock()
@@ -38,9 +38,11 @@ func (l *Lane) Start(ctx context.Context, controller *holder.LocalTenantControll
 	l.mu.Unlock()
 
 	admitting := make(chan struct{})
+	spec := Daemon()
+	spec.Program = program
 	go func() {
 		defer close(done)
-		_, err := daemonkit.Serve(serveCtx, Daemon(), func(daemonkit.Ctx) (daemonkit.Product, error) {
+		_, err := daemonkit.Serve(serveCtx, spec, func(daemonkit.Ctx) (daemonkit.Product, error) {
 			close(admitting)
 			return NewProduct(controller), nil
 		})

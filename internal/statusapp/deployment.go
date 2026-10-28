@@ -48,28 +48,16 @@ var (
 		return 2*holderbridge.ReadinessContract().ObservationTimeout() + 2*bracketRetryCadence
 	}
 	tenantLaneReady = func(ctx context.Context) (daemonkit.Health, error) {
-		client, err := daemonkit.Open(observerTenantDaemon())
+		client, err := daemonkit.Open(tenantfs.Daemon())
 		if err != nil {
 			return daemonkit.Health{}, fmt.Errorf("CCPoolStatus: open the cc-pool tenant lane: %w", err)
 		}
 		readyCtx, cancel := context.WithTimeout(ctx, holderbridge.ReadinessContract().ObservationTimeout())
 		defer cancel()
+		defer func() { _ = client.Close(readyCtx) }()
 		return client.WaitReady(readyCtx)
 	}
 )
-
-// observerTenantDaemon is the tenant lane as CCPoolStatus attaches to it:
-// the shared identity, with the serving process additionally required to
-// prove the installed application's own signing identity on the very
-// connection the health observation rides. The same-user floor admits any
-// same-UID listener and a process-table snapshot cannot bind an answer to
-// the answerer; the authenticated session does. Trust.Serving is read only
-// by the attaching client, so the shared serving side is untouched.
-func observerTenantDaemon() daemonkit.Daemon {
-	d := tenantfs.Daemon()
-	d.Trust.Serving = daemonkit.ServingSigned(statusAppRequirement())
-	return d
-}
 
 // ServiceInstallReceipt binds one landed generation to the activation that
 // proved its runtime live.
@@ -132,19 +120,18 @@ const bracketRetryCadence = 250 * time.Millisecond
 // RequireActiveService proves the installed application's FuseKit runtime is
 // serving. It only observes: landing a generation is ApplyPackagedApp's to
 // perform and launchd's to sustain, so requiring the service never activates
-// one. The connection itself requires the installed application's signing
-// identity, and the health observation is bracketed between two inventories
-// that must both pin the answering PID to one process instance
-// ({Start, Boot}): only a stable signed, inventory-pinned instance succeeds.
-// Everything short of that retries the complete bracket within ctx — a
-// holder appearing mid-observation, disappearing and being replaced,
-// re-pinning under a reused PID, and failing to publish readiness inside one
-// observation window are one family of legitimate launchd restart transients,
-// refused only when ctx runs out, never admitted early. The contract's
-// observation timeout caps one window, never the whole wait: a caller stating
-// a longer deadline spends it on further complete brackets. A caller that
-// states no deadline gets the package's readiness budget, so a persistent
-// mismatch refuses instead of retrying forever.
+// one. The health observation is bracketed between two inventories that must
+// both pin the answering PID to one process instance ({Start, Boot}): only a
+// stable, inventory-pinned instance succeeds. Everything short of that retries
+// the complete bracket within ctx — a holder appearing mid-observation,
+// disappearing and being replaced, re-pinning under a reused PID, and failing
+// to publish readiness inside one observation window are one family of
+// legitimate launchd restart transients, refused only when ctx runs out, never
+// admitted early. The contract's observation timeout caps one window, never
+// the whole wait: a caller stating a longer deadline spends it on further
+// complete brackets. A caller that states no deadline gets the package's
+// readiness budget, so a persistent mismatch refuses instead of retrying
+// forever.
 func RequireActiveService(ctx context.Context) error {
 	ctx, cancel := budgeted(ctx, readinessBudget())
 	defer cancel()
@@ -257,13 +244,13 @@ func openInstalledDeployment(appPath string) (deploymentController, error) {
 }
 
 func openDeployment(appPath string, agents []launchd.Agent) (deploymentController, error) {
-	requirement := statusAppRequirement()
 	controller, err := newDeployer(deploy.Config{
-		App:         appPath,
-		Requirement: requirement,
+		App: appPath,
+		Requirement: deploy.Requirement{
+			TeamID: holderbridge.TeamID, SigningIdentifier: holderbridge.BundleID,
+		},
 		Daemon: daemonkit.Daemon{
 			Label: daemonkit.Label(holderbridge.DeploymentServiceLabel),
-			Trust: daemonkit.Trust{Serving: daemonkit.ServingSigned(requirement)},
 		},
 		Agents: agents,
 	})
@@ -271,10 +258,6 @@ func openDeployment(appPath string, agents []launchd.Agent) (deploymentControlle
 		return nil, fmt.Errorf("CCPoolStatus: open sealed deployment: %w", err)
 	}
 	return controller, nil
-}
-
-func statusAppRequirement() daemonkit.Requirement {
-	return daemonkit.Requirement{TeamID: holderbridge.TeamID, SigningIdentifier: holderbridge.BundleID}
 }
 
 func packagedCandidatePlan(appPath, buildID, sourceAppPath string) (candidatePlan, error) {

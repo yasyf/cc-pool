@@ -9,7 +9,7 @@ import (
 
 func testSpec(t *testing.T) daemonkit.Daemon {
 	t.Helper()
-	return Spec(daemonkit.Program{}, nil)
+	return Spec(daemonkit.Program{})
 }
 
 // TestSpecMaxDetailCarriesTheLargestPollPage is trap 1 of the migration guide:
@@ -35,17 +35,8 @@ func TestSpecConcurrencyCarriesEveryParkedPollPlusForegroundWork(t *testing.T) {
 	}
 }
 
-func TestSpecStatesTheSameUserFloorAndRestartAlways(t *testing.T) {
+func TestSpecStatesRestartAlways(t *testing.T) {
 	spec := testSpec(t)
-	if spec.Trust.Control != nil {
-		t.Errorf("production Trust.Control = %+v, want nil — the same-user floor alone", spec.Trust.Control)
-	}
-	if spec.Trust.Business != nil {
-		t.Errorf("production Trust.Business = %+v, want nil — the same-user floor alone", spec.Trust.Business)
-	}
-	if spec.Trust.Serving != daemonkit.ServingSameUser() {
-		t.Errorf("Trust.Serving = %+v, want the same-user posture", spec.Trust.Serving)
-	}
 	// The zero Restart is RestartNever, which would leave a drained daemon
 	// dead until the next CLI call: state it.
 	if spec.Restart != daemonkit.RestartAlways {
@@ -60,14 +51,5 @@ func TestSpecCarriesExactlyTheCurrentSchema(t *testing.T) {
 	}
 	if spec.Label != ServiceRoleID {
 		t.Fatalf("Label = %q, want %q", spec.Label, ServiceRoleID)
-	}
-}
-
-func TestSpecAcceptsAnInjectedControlRequirement(t *testing.T) {
-	want := daemonkit.Requirement{TeamID: ServiceTeamID, SigningIdentifier: ServiceRoleID}
-	spec := Spec(daemonkit.Program{}, &want)
-	if spec.Trust.Control == nil || spec.Trust.Control.TeamID != want.TeamID ||
-		spec.Trust.Control.SigningIdentifier != want.SigningIdentifier {
-		t.Fatalf("Trust.Control = %+v, want the injected requirement", spec.Trust.Control)
 	}
 }

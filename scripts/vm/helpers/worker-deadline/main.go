@@ -77,7 +77,6 @@ while :; do sleep 10; done
 		Path: "/bin/sh", Dir: root,
 		Args:      []string{"-c", script, "worker", leaderPath, descendantPath, termPath},
 		MaxOutput: 1024,
-		Exec:      daemonkit.ServingSameUser(),
 	})
 	cancelRun()
 	elapsed := time.Since(started)
@@ -117,7 +116,7 @@ while :; do sleep 10; done
 	reuseCtx, cancelReuse := context.WithTimeout(scopeCtx, requestTimeout)
 	defer cancelReuse()
 	if _, err := scope.Run(reuseCtx, daemonkit.Cmd{
-		Path: "/usr/bin/true", Dir: root, MaxOutput: 1024, Exec: daemonkit.ServingSameUser(),
+		Path: "/usr/bin/true", Dir: root, MaxOutput: 1024,
 	}); err != nil {
 		return fmt.Errorf("reuse worker lane: %w", err)
 	}
