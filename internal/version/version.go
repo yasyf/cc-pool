@@ -25,4 +25,6 @@ func String() string {
 	return v
 }
 
+// Build is the running binary's resolved build version without the commit, the
+// identity daemonkit places and compares.
 func Build() string { return dkversion.Running(Version) }

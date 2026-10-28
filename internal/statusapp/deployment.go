@@ -117,6 +117,21 @@ func ApplyPackagedApp(ctx context.Context, candidateSourcePath string) (ServiceI
 // transient converges, so an unconverged check waits rather than spinning.
 const bracketRetryCadence = 250 * time.Millisecond
 
+// RequireActiveService proves the installed application's FuseKit runtime is
+// serving. It only observes: landing a generation is ApplyPackagedApp's to
+// perform and launchd's to sustain, so requiring the service never activates
+// one. The health observation is bracketed between two inventories that must
+// both pin the answering PID to one process instance ({Start, Boot}): only a
+// stable, inventory-pinned instance succeeds. Everything short of that retries
+// the complete bracket within ctx — a holder appearing mid-observation,
+// disappearing and being replaced, re-pinning under a reused PID, and failing
+// to publish readiness inside one observation window are one family of
+// legitimate launchd restart transients, refused only when ctx runs out, never
+// admitted early. The contract's observation timeout caps one window, never
+// the whole wait: a caller stating a longer deadline spends it on further
+// complete brackets. A caller that states no deadline gets the package's
+// readiness budget, so a persistent mismatch refuses instead of retrying
+// forever.
 func RequireActiveService(ctx context.Context) error {
 	ctx, cancel := budgeted(ctx, readinessBudget())
 	defer cancel()

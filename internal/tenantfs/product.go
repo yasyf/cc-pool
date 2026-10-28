@@ -9,6 +9,8 @@ import (
 	"github.com/yasyf/fusekit/holder"
 )
 
+// Label names cc-pool's tenant lane, served inside the signed app beside
+// FuseKit's own daemon.
 const Label daemonkit.Label = "com.yasyf.cc-pool.tenants"
 
 // Schema names the tenant lane's application protocol era.

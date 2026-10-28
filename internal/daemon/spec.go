@@ -53,6 +53,8 @@ func Spec(program daemonkit.Program) daemonkit.Daemon {
 	}
 }
 
+// ProductionSpec is the daemon identity every real entry point uses: the
+// stable executable path launchd runs, named by build.
 func ProductionSpec(build string) (daemonkit.Daemon, error) {
 	program, err := daemonkit.Stable(build)
 	if err != nil {

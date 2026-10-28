@@ -186,6 +186,11 @@ func (c *Client) HealthContext(ctx context.Context) (*HealthResponse, error) {
 	return response, nil
 }
 
+// ObserveHealthContext reads the product half of Health.Detail on the client's
+// session, which answers during drain and without readiness. Lifecycle
+// readiness derives from the live Health.Phase, folded over the decoded
+// detail: the detail replays the last report, so on its own it can say a
+// draining daemon still serves.
 func (c *Client) ObserveHealthContext(ctx context.Context) (*HealthResponse, error) {
 	if _, stated := ctx.Deadline(); !stated {
 		var cancel context.CancelFunc
