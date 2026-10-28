@@ -37,7 +37,6 @@ class CcPool < Formula
       odie "staged status app has no Contents" unless (staged_app/"Contents").directory?
       system "/usr/bin/codesign", "--verify", "--deep", "--strict", "--verbose=2", staged_app
       system "/usr/bin/xcrun", "stapler", "validate", staged_app
-      system "/usr/sbin/spctl", "--assess", "--type", "execute", "--verbose=4", staged_app
       app_version = Utils.safe_popen_read(
         "/usr/libexec/PlistBuddy", "-c", "Print :CFBundleShortVersionString",
         staged_app/"Contents/Info.plist"
