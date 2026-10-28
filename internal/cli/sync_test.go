@@ -106,11 +106,6 @@ func (c cliTestSyncConsumer) Reconcile(context.Context, string) (syncservice.Rec
 	return c.reconcile, nil
 }
 
-// startCLITestSyncHelper serves the resident helper in-process on the
-// label-derived socket under a short sandboxed home (macOS caps sun_path at
-// 104 bytes, and daemonkit refuses a longer path typed). Readiness rides the
-// business lane — Capabilities retried until the socket answers — because the
-// control lane refuses an in-process self-attach by design.
 func startCLITestSyncHelper(t *testing.T, consumer syncservice.SyncConsumer) {
 	t.Helper()
 	if os.Getenv(testhome.EnvOverride) == "" {

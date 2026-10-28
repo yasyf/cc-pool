@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync/atomic"
 	"syscall"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/cc-pool/internal/version"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/fusekit/holder"
 )
 
@@ -63,32 +65,34 @@ func CCPoolFuseKitDispatchChild() C.int32_t {
 }
 
 //export CCPoolFuseKitStart
-func CCPoolFuseKitStart(appGroupIdentifier *C.char) C.int32_t {
-	if appGroupIdentifier == nil {
-		return operationStatus("runtime start", errors.New("signed app group identifier is required"))
-	}
-	requiredAppGroup := C.GoString(appGroupIdentifier)
+func CCPoolFuseKitStart() C.int32_t {
 	ctx, cancel := context.WithTimeout(
 		context.Background(), holderbridge.ReadinessContract().StartupTimeout(),
 	)
 	defer cancel()
-	return operationStatus("runtime start", startHolder(ctx, requiredAppGroup))
+	return operationStatus("runtime start", startHolder(ctx))
 }
 
-func startHolder(ctx context.Context, requiredAppGroup string) error {
+func startHolder(ctx context.Context) error {
+	program, err := daemonkit.InBundle(
+		pool.WidgetAppPath(), filepath.Join("Contents", "MacOS", holderbridge.ExecutableName),
+	)
+	if err != nil {
+		return err
+	}
 	var runtime *holder.Runtime
 	if err := embeddedHolder.Start(ctx, func(ctx context.Context) (holderbridge.ProcessRuntime, error) {
-		constructed, err := newHolderRuntime(ctx, requiredAppGroup)
+		constructed, err := newHolderRuntime(ctx)
 		runtime = constructed
 		return constructed, err
 	}); err != nil {
 		return err
 	}
-	err := tenantfs.PublishClaudeSourceFleet(
+	err = tenantfs.PublishClaudeSourceFleet(
 		ctx, runtime.LocalTenantController(), claudeAuthorityPolicy(),
 	)
 	if err == nil {
-		err = embeddedTenants.Start(ctx, runtime.LocalTenantController())
+		err = embeddedTenants.Start(ctx, runtime.LocalTenantController(), program)
 	}
 	if err == nil {
 		go superviseEmbedded(context.WithoutCancel(ctx))
@@ -190,9 +194,9 @@ func closeEmbedded(ctx context.Context) error {
 	return settlement
 }
 
-func newHolderRuntime(ctx context.Context, requiredAppGroup string) (*holder.Runtime, error) {
+func newHolderRuntime(ctx context.Context) (*holder.Runtime, error) {
 	plan, err := holderbridge.NewRuntimePlan(
-		pool.WidgetAppPath(), pool.FuseKitRuntimeDir(), version.String(), requiredAppGroup,
+		pool.WidgetAppPath(), pool.FuseKitRuntimeDir(), version.String(),
 	)
 	if err != nil {
 		return nil, err
@@ -203,7 +207,6 @@ func newHolderRuntime(ctx context.Context, requiredAppGroup string) (*holder.Run
 	}
 	return holderbridge.NewRuntime(ctx, holderbridge.RuntimeSpec{
 		Plan:  plan,
-		Trust: holderbridge.RuntimeTrust(requiredAppGroup),
 		Owner: tenantfs.SourceAuthorityFleetOwner, Drivers: drivers,
 		CatalogAuthorizer: tenantfs.NewCatalogAuthorizer(),
 		Authorizer:        tenantfs.NewMountAuthorizer(),

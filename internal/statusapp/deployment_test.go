@@ -5,13 +5,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/holderbridge"
-	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/daemonkit/deploy"
@@ -404,20 +402,6 @@ func TestRequireActiveServiceRetriesTheBracketForAPIDReusedByTheReplacement(t *t
 	}
 }
 
-func TestObserverTenantDaemonRequiresTheInstalledSigningIdentity(t *testing.T) {
-	observer := observerTenantDaemon()
-	if !reflect.DeepEqual(observer.Trust.Serving, daemonkit.ServingSigned(statusAppRequirement())) {
-		t.Fatalf("observer serving trust = %+v, want the installed application's signing requirement", observer.Trust.Serving)
-	}
-	shared := tenantfs.Daemon()
-	if observer.Label != shared.Label {
-		t.Fatalf("observer label = %q diverged from the shared lane %q", observer.Label, shared.Label)
-	}
-	if !reflect.DeepEqual(shared.Trust.Serving, daemonkit.ServingSameUser()) {
-		t.Fatalf("shared serving trust = %+v; the observer requirement must not leak into the shared identity", shared.Trust.Serving)
-	}
-}
-
 func TestRequireActiveServiceRetriesTheBracketForAHolderStartedMidObservation(t *testing.T) {
 	observations := 0
 	swapDeploymentVar(t, &tenantLaneReady, func(context.Context) (daemonkit.Health, error) {
@@ -538,7 +522,7 @@ func TestResetPackagedAppDelegatesTheAgentRetirement(t *testing.T) {
 		t.Fatalf("calls = reset %d, uninstall %d", controller.resetCalls, controller.uninstallCalls)
 	}
 
-	want := errors.New("no control lane can stop this daemon")
+	want := errors.New("daemon cannot be stopped")
 	controller.resetErr = want
 	if err := ResetPackagedApp(t.Context()); !errors.Is(err, want) {
 		t.Fatalf("reset error = %v, want %v", err, want)

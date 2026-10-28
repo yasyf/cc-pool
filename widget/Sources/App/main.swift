@@ -17,9 +17,7 @@ do {
   exit(1)
 }
 
-let runtimeStartStatus = CCPoolFileProviderConfiguration.appGroupIdentifier.withCString {
-  CCPoolFuseKitStart($0)
-}
+let runtimeStartStatus = CCPoolFuseKitStart()
 guard runtimeStartStatus == 0 else {
   exit(1)
 }

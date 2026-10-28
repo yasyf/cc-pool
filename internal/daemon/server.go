@@ -193,7 +193,7 @@ func Run(ctx context.Context) error {
 			return err
 		}
 	}
-	spec, err := ProductionSpec()
+	spec, err := ProductionSpec(version.Build())
 	if err != nil {
 		return err
 	}

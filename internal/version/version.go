@@ -18,9 +18,11 @@ var (
 // stamped release passes through; an unstamped "dev" build resolves to daemonkit's
 // DevString via the executable's mtime. Commit is appended in parens when set.
 func String() string {
-	v := dkversion.Running(Version)
+	v := Build()
 	if Commit != "" {
 		v += " (" + Commit + ")"
 	}
 	return v
 }
+
+func Build() string { return dkversion.Running(Version) }

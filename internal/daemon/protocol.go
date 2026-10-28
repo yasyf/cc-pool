@@ -23,9 +23,6 @@ const DaemonHealthSchema uint16 = 1
 // ServiceRoleID is the exact request-daemon role shared by launchd and lifecycle admission.
 const ServiceRoleID = "com.yasyf.cc-pool"
 
-// ServiceTeamID is the release signing team accepted by daemon lifecycle control.
-const ServiceTeamID = "SXKCTF23Q2"
-
 // StopRoleID is the controller-launched one-shot daemon settlement role.
 const StopRoleID = "com.yasyf.cc-pool.stop-control"
 

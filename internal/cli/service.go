@@ -25,7 +25,7 @@ var (
 	ensureHolder        = func(ctx context.Context) (holderServiceInstall, error) { return daemon.InstallHolderService(ctx) }
 	stopHolder          = daemon.StopAndUninstallHolderService
 	ensureDaemonService = func(ctx context.Context) (daemonkit.Ensured, error) {
-		spec, err := daemon.ProductionSpec()
+		spec, err := daemon.ProductionSpec(version.Build())
 		if err != nil {
 			return daemonkit.Ensured{}, err
 		}
@@ -33,20 +33,18 @@ var (
 		if err != nil {
 			return daemonkit.Ensured{}, err
 		}
+		defer func() { _ = client.Close(ctx) }()
 		return client.Ensure(ctx)
 	}
-	// daemonHealthContext is the Control-routed health observation, seamed
-	// because daemonkit's control lane refuses an in-process self-attach
-	// (daemonkit control.go:136): a test daemon serves the business lane
-	// in-process but can never answer this verb.
 	daemonHealthContext = func(ctx context.Context, cl *daemon.Client) (*daemon.HealthResponse, error) {
 		return cl.HealthContext(ctx)
 	}
 	stopDaemonRuntime = func(ctx context.Context) error {
-		client, err := daemonkit.Open(daemon.Spec(daemonkit.Program{}, nil))
+		client, err := daemonkit.Open(daemon.Spec(daemonkit.Program{}))
 		if err != nil {
 			return err
 		}
+		defer func() { _ = client.Close(ctx) }()
 		return client.Stop(ctx)
 	}
 )

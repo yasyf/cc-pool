@@ -49,7 +49,6 @@ func (r scopeRunner) Run(
 	result, err := r.scope.Run(runCtx, daemonkit.Cmd{
 		Path: request.Path, Args: request.Args, Dir: request.Dir, Env: request.Env,
 		Stdin: request.Stdin, MaxOutput: hostsync.MaxWorkerResponse,
-		Exec: daemonkit.ServingSameUser(),
 	})
 	observed := workerexec.CommandResult{
 		Stdout: result.Stdout, Stderr: result.Stderr, ExitCode: result.Exit.Code,
@@ -113,7 +112,6 @@ func (s *Server) startSyncHelper(ctx context.Context, executable, synckitdExecut
 		Args:    []string{syncHelperArgument, synckitdExecutable},
 		Env:     environment,
 		Session: true,
-		Exec:    daemonkit.ServingSameUser(),
 	}, daemonkit.ChannelNone, nil)
 	cancel()
 	if err != nil {
@@ -135,6 +133,7 @@ func (s *Server) startSyncHelper(ctx context.Context, executable, synckitdExecut
 	}
 	readyCtx, cancelReady := context.WithTimeout(ctx, syncHelperReadyTimeout)
 	defer cancelReady()
+	defer func() { _ = client.Close(readyCtx) }()
 	ready := make(chan error, 1)
 	go func() {
 		_, err := client.WaitReady(readyCtx)

@@ -72,7 +72,6 @@ func (runtime *workerRuntime) Run(
 		Env:       request.Env,
 		Stdin:     request.Stdin,
 		MaxOutput: workerMaxOutput,
-		Exec:      daemonkit.ServingSameUser(),
 	})
 	observed := workerexec.CommandResult{
 		Stdout: result.Stdout, Stderr: result.Stderr, ExitCode: result.Exit.Code,
