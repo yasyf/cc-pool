@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.70.1] - 2026-10-28
+
+### Fixed
+
+- `brew upgrade cc-pool` installs again. Homebrew's formula sandbox denies the `com.apple.security.syspolicy` lookup that `spctl --assess` needs, so the formula's Gatekeeper check failed with "internal error in Code Signing subsystem" on every install. The formula still verifies the status app with `codesign --verify --deep --strict` and `stapler validate`; release CI keeps the full `spctl` assessment.
+
 ## [0.70.0] - 2026-10-28
 
 ### Changed
