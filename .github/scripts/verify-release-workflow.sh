@@ -3,7 +3,8 @@ set -euo pipefail
 
 workflow=.github/workflows/release.yml
 tag_pin=2281a3ea884422db190de44fad65ce9bc08b19c4
-app_pin=41f8de6765b3b833ef333b0b98f5683f0e46685b
+app_pin=6fcdeeacb07f32bdabb3830d5d0290f8de48c813
+stapler_pin=6fcdeeacb07f32bdabb3830d5d0290f8de48c813
 stage_pin=e4c3108e693681df1a3c666bae80e890bc44cf3e
 draft_pin=54e3e194bda69896894a82c17fcdb2822beefab5
 tap_pin=9525763796fce4d1042cf3393d9479f791908eaa
@@ -14,6 +15,7 @@ if grep -Eq 'yasyf/homebrew-tap/.+@(main|v[0-9]+|swift-v[0-9]+)' "$workflow"; th
 fi
 test "$(grep -Ec "actions/verify-tag-on-main@${tag_pin}$" "$workflow")" = 1
 test "$(grep -Ec "workflows/release-app.yml@${app_pin}$" "$workflow")" = 1
+test "$(grep -Ec "actions/stapler-retry@${stapler_pin}$" "$workflow")" = 2
 test "$(grep -Ec "actions/stage-draft-release@${stage_pin}$" "$workflow")" = 1
 test "$(grep -Ec "actions/publish-draft-release@${draft_pin}$" "$workflow")" = 1
 test "$(grep -Ec "actions/publish@${tap_pin}$" "$workflow")" = 1
@@ -51,7 +53,7 @@ test "$(grep -Fxc "          brew test \"\$audit_tap/cc-pool\"" "$workflow")" = 
 test "$(grep -Fxc '          test ! -e "$target"' "$workflow")" = 2
 test "$(grep -Fxc '          installed_app="$prefix/libexec/CCPoolStatus.app"' "$workflow")" = 1
 test "$(grep -Fxc '          codesign --verify --deep --strict --verbose=2 "$installed_app"' "$workflow")" = 1
-test "$(grep -Fxc '          xcrun stapler validate "$installed_app"' "$workflow")" = 1
+test "$(grep -Fxc '          stapler-retry.sh validate "$installed_app"' "$workflow")" = 1
 test "$(grep -Fxc '          spctl --assess --type execute --verbose=4 "$installed_app"' "$workflow")" = 1
 if grep -Eq 'package (install|uninstall)' "$workflow"; then
   echo "headless release publication must not activate the signed runtime" >&2

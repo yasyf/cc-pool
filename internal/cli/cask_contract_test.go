@@ -34,7 +34,7 @@ func TestReleasePreservesGatekeeperAndPinsAppResourceDigestIntoFormula(t *testin
 		"internal/version.StatusAppVersion=${{ needs.version.outputs.marketing }}",
 		"__SHA_APP__=${{ needs.release-app.outputs.sha256 }}",
 		"bash \"$GITHUB_WORKSPACE/scripts/assert-signed-topology.sh\"",
-		"xcrun stapler validate app/CCPoolStatus.app",
+		"stapler-retry.sh validate app/CCPoolStatus.app",
 		"spctl --assess --type execute --verbose=4 app/CCPoolStatus.app",
 	} {
 		if !strings.Contains(release, required) {

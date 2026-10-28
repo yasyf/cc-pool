@@ -35,12 +35,13 @@ func TestPureGoCLIDoesNotEmbedSwiftOwnedContainerIdentity(t *testing.T) {
 const (
 	// releaseAppWorkflowCommit is an immutable Git commit, not a credential.
 	//nolint:gosec // G101 cannot distinguish the pinned commit from a secret.
-	releaseAppWorkflowCommit        = "41f8de6765b3b833ef333b0b98f5683f0e46685b"
+	releaseAppWorkflowCommit        = "6fcdeeacb07f32bdabb3830d5d0290f8de48c813"
 	releaseActionCommit             = "19c3d5013032ad9c88f9a8f1170d1f366c19b8d9"
 	releaseVerifyTagActionCommit    = "2281a3ea884422db190de44fad65ce9bc08b19c4"
 	releaseStageDraftActionCommit   = "e4c3108e693681df1a3c666bae80e890bc44cf3e"
 	releasePublishDraftActionCommit = "54e3e194bda69896894a82c17fcdb2822beefab5"
 	releasePublishCommit            = "9525763796fce4d1042cf3393d9479f791908eaa"
+	releaseStaplerRetryCommit       = "6fcdeeacb07f32bdabb3830d5d0290f8de48c813"
 )
 
 func TestReleaseCLIFailsClosedBeforeArtifactPublication(t *testing.T) {
@@ -178,7 +179,7 @@ func TestReleaseTapUsesExactVerifiedPublishedBytes(t *testing.T) {
 		`[ "$(shasum -a 256 "$APP_ASSET" | awk '{print $1}')" = "$APP_SHA256" ]`,
 		"codesign --verify --strict --verbose=2 cli/cc-pool",
 		"scripts/assert-signed-topology.sh",
-		"xcrun stapler validate app/CCPoolStatus.app",
+		"stapler-retry.sh validate app/CCPoolStatus.app",
 		"spctl --assess --type execute --verbose=4 app/CCPoolStatus.app",
 		"__SHA_APP__=${{ needs.release-app.outputs.sha256 }}",
 		"Publish the CLI formula to the tap",
@@ -216,6 +217,10 @@ func TestReleaseTapUsesExactVerifiedPublishedBytes(t *testing.T) {
 		case strings.Contains(line, "actions/publish-draft-release@"):
 			if !strings.Contains(line, "@"+releasePublishDraftActionCommit) {
 				t.Fatalf("release uses a mixed or mutable draft-publish action reference: %s", line)
+			}
+		case strings.Contains(line, "actions/stapler-retry@"):
+			if !strings.Contains(line, "@"+releaseStaplerRetryCommit) {
+				t.Fatalf("release uses a mixed or mutable stapler-retry action reference: %s", line)
 			}
 		case strings.Contains(line, "yasyf/homebrew-tap/.github/actions/publish@"):
 			if !strings.Contains(line, "@"+releasePublishCommit) {
