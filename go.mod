@@ -2,7 +2,7 @@ module github.com/yasyf/cc-pool
 
 go 1.26.5
 
-toolchain go1.26.6
+toolchain go1.26.10
 
 require (
 	github.com/charmbracelet/bubbletea v1.3.10
@@ -12,9 +12,9 @@ require (
 	github.com/descope/go-free-email-providers v0.0.0-20260427134210-d71f4c2c7632
 	github.com/muesli/cancelreader v0.2.2
 	github.com/spf13/cobra v1.10.2
-	github.com/yasyf/daemonkit v0.34.1-0.20261028043932-567e3df37f44
-	github.com/yasyf/fusekit v1.20.4-0.20261028045624-5d425ff2c271
-	github.com/yasyf/synckit v0.46.1-0.20261028042517-18536ed9b209
+	github.com/yasyf/daemonkit v0.35.2
+	github.com/yasyf/fusekit v1.21.0
+	github.com/yasyf/synckit v0.47.0
 	golang.org/x/net v0.56.0
 	golang.org/x/sync v0.22.0
 	golang.org/x/sys v0.47.0
