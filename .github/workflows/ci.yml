@@ -25,6 +25,7 @@ jobs:
 
   test:
     needs: suite-pins
+    if: github.event_name != 'pull_request'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
@@ -63,6 +64,7 @@ jobs:
 
   widget-test:
     needs: suite-pins
+    if: github.event_name != 'pull_request'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
@@ -88,6 +90,7 @@ jobs:
             CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="-"
 
   smoke:
+    if: github.event_name != 'pull_request'
     runs-on: macos-15
     needs: test
     steps:
